@@ -202,3 +202,28 @@ Additional_repositories: https://example.com/repo,
         "DESCRIPTION was: {description}"
     );
 }
+
+#[test]
+fn relocks_automatically_when_adding_repo_with_existing_lockfile() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-repo-relock";
+    create_package_project(&container, project_path);
+
+    let setup_command = format!("cd {project_path} && rpx add digest");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &setup_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let add_command = format!("cd {project_path} && rpx repo add posit");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &add_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let lockfile = read_project_file(&container, project_path, "rpx.lock");
+    assert!(
+        lockfile.contains("https://packagemanager.posit.co/cran/latest"),
+        "lockfile was: {lockfile}"
+    );
+
+    let sync_command = format!("cd {project_path} && rpx sync");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &sync_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+}

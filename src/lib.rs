@@ -9,8 +9,8 @@ mod r;
 mod repo;
 
 use cli::{Cli, Commands, RepoCommands};
-use description::{DescriptionExt, read_description, write_description};
-use lockfile::{Lockfile, read_lockfile, write_lockfile};
+use description::{read_description, write_description, DescriptionExt};
+use lockfile::{read_lockfile, write_lockfile, Lockfile};
 use project::lockfile_path;
 use r::{
     install_exact_repository_package, install_package, install_requirements, installed_packages,
@@ -18,7 +18,7 @@ use r::{
     remove_installed_packages, to_locked_package,
 };
 use repo::{
-    DEFAULT_REPOSITORY_URL, alias_for_repository, effective_repositories, expand_repo_spec,
+    alias_for_repository, effective_repositories, expand_repo_spec, DEFAULT_REPOSITORY_URL,
 };
 
 pub fn run() {
@@ -80,16 +80,26 @@ fn cmd_repo(command: RepoCommands) {
 
 fn cmd_repo_add(repo: &str) {
     let repositories = expand_repo_spec(repo).expect("failed to expand repository alias");
+    let should_relock = lockfile_path().exists();
     let mut project = read_description().expect("failed to read DESCRIPTION");
     project.add_repositories(&repositories);
     write_description(&project);
+
+    if should_relock {
+        lock_from_description();
+    }
 }
 
 fn cmd_repo_remove(repo: &str) {
     let repositories = expand_repo_spec(repo).unwrap_or_else(|_| vec![repo.to_string()]);
+    let should_relock = lockfile_path().exists();
     let mut project = read_description().expect("failed to read DESCRIPTION");
     project.remove_repositories(&repositories);
     write_description(&project);
+
+    if should_relock {
+        lock_from_description();
+    }
 }
 
 fn cmd_repo_list() {

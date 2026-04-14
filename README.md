@@ -22,11 +22,26 @@ rpx sync   # install the exact locked package set into the project library
 rpx run R  # start an R shell with the project library activated
 ```
 
+Add additional CRAN-like repositories with either a known alias or a URL:
+
+```bash
+rpx repo add posit
+rpx repo add bioconductor
+rpx repo add https://my-company.example.com/r
+```
+
+Common aliases:
+
+- `posit`
+- `bioconductor`
+- `r-forge`
+
 ## Notes
 
 - `DESCRIPTION` is required.
-- `rpx.lock` records the resolved package set.
+- `rpx.lock` records the resolved package set and effective repositories.
 - `rpx` manages an isolated library for each project.
+- `rpx repo add` and `rpx repo remove` update `DESCRIPTION` and refresh `rpx.lock` when one already exists.
 
 ## Local Development
 

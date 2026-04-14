@@ -1,4 +1,4 @@
-use crate::project::{LOCKFILE_NAME, lockfile_path};
+use crate::project::{lockfile_path, LOCKFILE_NAME};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs};
 

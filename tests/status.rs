@@ -59,7 +59,9 @@ fn runs_rpx_status_for_repository_drift() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &setup_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
-    let mutate_command = format!("cd {project_path} && rpx repo add posit");
+    let mutate_command = format!(
+        "cd {project_path} && cat >> DESCRIPTION <<'EOF'\nAdditional_repositories: https://packagemanager.posit.co/cran/latest\nEOF"
+    );
     let (exit_code, stdout, stderr) = run_shell_command(&container, &mutate_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
