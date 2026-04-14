@@ -9,7 +9,13 @@ pub trait DescriptionExt {
     fn requirements(&self) -> Vec<String>;
 }
 
-pub fn read_description() -> Result<RDescription, String> {
+#[derive(Debug)]
+pub struct ProjectDescription {
+    pub description: RDescription,
+    pub additional_repositories: Vec<String>,
+}
+
+pub fn read_description() -> Result<ProjectDescription, String> {
     let path = description_path();
     let contents = fs::read_to_string(&path).map_err(|error| error.to_string())?;
     let description = RDescription::from_str(&contents).map_err(|error| error.to_string())?;
@@ -18,18 +24,50 @@ pub fn read_description() -> Result<RDescription, String> {
         return Err("DESCRIPTION is missing Package".to_string());
     }
 
-    Ok(description)
+    Ok(ProjectDescription {
+        description,
+        additional_repositories: parse_additional_repositories(&contents),
+    })
 }
 
-pub fn write_description(description: &RDescription) {
-    fs::write(description_path(), format!("{description}")).expect("failed to write DESCRIPTION");
+pub fn write_description(project: &ProjectDescription) {
+    let mut contents = format!("{}", project.description).trim_end().to_string();
+
+    if !project.additional_repositories.is_empty() {
+        contents.push_str("\nAdditional_repositories: ");
+        contents.push_str(&project.additional_repositories.join(",\n "));
+    }
+
+    contents.push('\n');
+    fs::write(description_path(), contents).expect("failed to write DESCRIPTION");
+}
+
+impl ProjectDescription {
+    pub fn add_repositories(&mut self, repositories: &[String]) {
+        for repository in repositories {
+            if !self.additional_repositories.contains(repository) {
+                self.additional_repositories.push(repository.clone());
+            }
+        }
+    }
+
+    pub fn remove_repositories(&mut self, repositories: &[String]) {
+        self.additional_repositories
+            .retain(|repository| !repositories.contains(repository));
+    }
 }
 
 impl DescriptionExt for RDescription {
     fn add_to_imports(&mut self, package: &str) {
         let mut imports = self.imports.clone().unwrap_or_default();
 
-        if imports.iter().any(|entry| entry.name == package) {
+        let already_present_in_depends = self
+            .depends
+            .as_ref()
+            .map(|depends| depends.iter().any(|entry| entry.name == package))
+            .unwrap_or(false);
+
+        if imports.iter().any(|entry| entry.name == package) || already_present_in_depends {
             return;
         }
 
@@ -98,4 +136,37 @@ impl DescriptionExt for RDescription {
 
         requirements.into_iter().collect()
     }
+}
+
+fn parse_additional_repositories(contents: &str) -> Vec<String> {
+    let mut value = None::<String>;
+    let mut current_field = None::<String>;
+
+    for line in contents.lines() {
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if current_field.as_deref() == Some("Additional_repositories") {
+                let current = value.get_or_insert_with(String::new);
+                if !current.is_empty() {
+                    current.push('\n');
+                }
+                current.push_str(line.trim());
+            }
+            continue;
+        }
+
+        if let Some((field, rest)) = line.split_once(':') {
+            current_field = Some(field.trim().to_string());
+            if field.trim() == "Additional_repositories" {
+                value = Some(rest.trim().to_string());
+            }
+        }
+    }
+
+    value
+        .unwrap_or_default()
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|repository| !repository.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }

@@ -6,15 +6,19 @@ mod description;
 mod lockfile;
 mod project;
 mod r;
+mod repo;
 
-use cli::{Cli, Commands};
+use cli::{Cli, Commands, RepoCommands};
 use description::{read_description, write_description, DescriptionExt};
 use lockfile::{read_lockfile, write_lockfile, Lockfile};
 use project::lockfile_path;
 use r::{
-    install_exact_cran_package, install_requirements, installed_packages,
+    install_exact_repository_package, install_package, install_requirements, installed_packages,
     installed_packages_by_name, project_command, remove_installed_package_dir,
     remove_installed_packages, to_locked_package,
+};
+use repo::{
+    alias_for_repository, effective_repositories, expand_repo_spec, DEFAULT_REPOSITORY_URL,
 };
 
 pub fn run() {
@@ -23,6 +27,7 @@ pub fn run() {
     match cli.command {
         Commands::Add { package } => cmd_add(&package),
         Commands::Remove { package } => cmd_remove(&package),
+        Commands::Repo { command } => cmd_repo(command),
         Commands::Run { command } => cmd_run(&command),
         Commands::Lock => cmd_lock(),
         Commands::Status => cmd_status(),
@@ -35,17 +40,12 @@ fn cmd_add(package: &str) {
         sync_from_lockfile();
     }
 
-    let mut description = read_description().expect("failed to read DESCRIPTION");
-    description.add_to_imports(package);
-    write_description(&description);
+    let mut project = read_description().expect("failed to read DESCRIPTION");
+    project.description.add_to_imports(package);
+    write_description(&project);
 
-    let status = project_command("Rscript")
-        .arg("-e")
-        .arg(format!("install.packages('{package}')"))
-        .status()
-        .expect("failed to run Rscript");
-
-    exit_with_status(status.code());
+    let repositories = effective_repositories(&project.additional_repositories);
+    install_package(package, &repositories);
     lock_from_description();
 }
 
@@ -54,10 +54,10 @@ fn cmd_remove(package: &str) {
         sync_from_lockfile();
     }
 
-    let mut description = read_description().expect("failed to read DESCRIPTION");
-    description.remove_from_field("Imports", package);
-    description.remove_from_field("Depends", package);
-    write_description(&description);
+    let mut project = read_description().expect("failed to read DESCRIPTION");
+    project.description.remove_from_field("Imports", package);
+    project.description.remove_from_field("Depends", package);
+    write_description(&project);
 
     let status = project_command("Rscript")
         .arg("-e")
@@ -68,6 +68,50 @@ fn cmd_remove(package: &str) {
     exit_with_status(status.code());
     remove_installed_package_dir(package);
     lock_from_description();
+}
+
+fn cmd_repo(command: RepoCommands) {
+    match command {
+        RepoCommands::Add { repo } => cmd_repo_add(&repo),
+        RepoCommands::Remove { repo } => cmd_repo_remove(&repo),
+        RepoCommands::List => cmd_repo_list(),
+    }
+}
+
+fn cmd_repo_add(repo: &str) {
+    let repositories = expand_repo_spec(repo).expect("failed to expand repository alias");
+    let should_relock = lockfile_path().exists();
+    let mut project = read_description().expect("failed to read DESCRIPTION");
+    project.add_repositories(&repositories);
+    write_description(&project);
+
+    if should_relock {
+        lock_from_description();
+    }
+}
+
+fn cmd_repo_remove(repo: &str) {
+    let repositories = expand_repo_spec(repo).unwrap_or_else(|_| vec![repo.to_string()]);
+    let should_relock = lockfile_path().exists();
+    let mut project = read_description().expect("failed to read DESCRIPTION");
+    project.remove_repositories(&repositories);
+    write_description(&project);
+
+    if should_relock {
+        lock_from_description();
+    }
+}
+
+fn cmd_repo_list() {
+    let project = read_description().expect("failed to read DESCRIPTION");
+
+    println!("CRAN: {DEFAULT_REPOSITORY_URL}");
+    for repository in &project.additional_repositories {
+        match alias_for_repository(repository) {
+            Some(alias) => println!("{alias}: {repository}"),
+            None => println!("repo: {repository}"),
+        }
+    }
 }
 
 fn cmd_run(command: &[String]) {
@@ -92,7 +136,7 @@ fn cmd_sync() {
 }
 
 fn cmd_status() {
-    let description = match read_description() {
+    let project = match read_description() {
         Ok(description) => description,
         Err(error) => {
             eprintln!("Status: drift");
@@ -110,10 +154,12 @@ fn cmd_status() {
         }
     };
 
-    let manifest_requirements = description
+    let manifest_requirements = project
+        .description
         .requirements()
         .into_iter()
         .collect::<BTreeSet<_>>();
+    let manifest_repositories = effective_repositories(&project.additional_repositories);
     let lock_requirements = lockfile
         .requirements
         .iter()
@@ -138,6 +184,7 @@ fn cmd_status() {
         .difference(&manifest_requirements)
         .cloned()
         .collect::<Vec<_>>();
+    let repository_mismatch = manifest_repositories != lockfile.repositories;
     let missing_from_library = locked_names
         .difference(&installed_names)
         .cloned()
@@ -164,11 +211,13 @@ fn cmd_status() {
 
     println!("Manifest requirements: {}", manifest_requirements.len());
     println!("Locked requirements: {}", lockfile.requirements.len());
+    println!("Locked repositories: {}", lockfile.repositories.len());
     println!("Locked packages: {}", lockfile.packages.len());
     println!("Installed packages: {}", installed.len());
 
     if missing_from_lockfile.is_empty()
         && extra_in_lockfile.is_empty()
+        && !repository_mismatch
         && missing_from_library.is_empty()
         && extra_in_library.is_empty()
         && version_mismatches.is_empty()
@@ -190,6 +239,14 @@ fn cmd_status() {
         println!("Extra in lockfile: {}", extra_in_lockfile.join(", "));
     }
 
+    if repository_mismatch {
+        println!(
+            "Repository mismatch: current [{}], locked [{}]",
+            manifest_repositories.join(", "),
+            lockfile.repositories.join(", ")
+        );
+    }
+
     if !missing_from_library.is_empty() {
         println!("Missing from library: {}", missing_from_library.join(", "));
     }
@@ -206,14 +263,15 @@ fn cmd_status() {
 }
 
 fn lock_from_description() {
-    let requirements = read_description()
-        .expect("failed to read DESCRIPTION")
-        .requirements();
+    let project = read_description().expect("failed to read DESCRIPTION");
+    let requirements = project.description.requirements();
+    let repositories = effective_repositories(&project.additional_repositories);
 
-    install_requirements(&requirements);
+    install_requirements(&requirements, &repositories);
     write_lockfile(Lockfile {
-        version: 1,
+        version: 2,
         requirements,
+        repositories,
         packages: installed_packages()
             .into_iter()
             .map(|package| {
@@ -225,9 +283,9 @@ fn lock_from_description() {
 }
 
 fn sync_from_lockfile() {
-    let manifest_requirements = read_description()
-        .expect("failed to read DESCRIPTION")
-        .requirements();
+    let project = read_description().expect("failed to read DESCRIPTION");
+    let manifest_requirements = project.description.requirements();
+    let manifest_repositories = effective_repositories(&project.additional_repositories);
     let lockfile = read_lockfile().expect("failed to read lockfile");
 
     if manifest_requirements != lockfile.requirements {
@@ -235,7 +293,17 @@ fn sync_from_lockfile() {
         std::process::exit(1);
     }
 
-    install_requirements(&lockfile.requirements);
+    if manifest_repositories != lockfile.repositories {
+        eprintln!("lockfile out of date; run rpx lock");
+        eprintln!(
+            "repositories changed: current [{}], locked [{}]",
+            manifest_repositories.join(", "),
+            lockfile.repositories.join(", ")
+        );
+        std::process::exit(1);
+    }
+
+    install_requirements(&lockfile.requirements, &lockfile.repositories);
 
     let installed = installed_packages_by_name();
     let exact_reinstalls = lockfile
@@ -243,12 +311,15 @@ fn sync_from_lockfile() {
         .iter()
         .filter_map(|(name, package)| match installed.get(name) {
             Some(installed_package) if installed_package.version == package.version => None,
-            _ => Some((name.clone(), package.version.clone())),
+            _ => package
+                .repository
+                .clone()
+                .map(|repository| (name.clone(), package.version.clone(), repository)),
         })
         .collect::<Vec<_>>();
 
-    for (name, version) in &exact_reinstalls {
-        install_exact_cran_package(name, version);
+    for (name, version, repository) in &exact_reinstalls {
+        install_exact_repository_package(name, version, repository, &lockfile.repositories);
     }
 
     let extras = installed_packages_by_name()

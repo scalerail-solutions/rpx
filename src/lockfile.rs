@@ -6,6 +6,8 @@ use std::{collections::BTreeMap, fs};
 pub struct Lockfile {
     pub version: u32,
     pub requirements: Vec<String>,
+    #[serde(default)]
+    pub repositories: Vec<String>,
     pub packages: BTreeMap<String, LockedPackage>,
 }
 
