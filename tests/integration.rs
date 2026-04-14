@@ -71,7 +71,8 @@ fn assert_package_state(
     package: &str,
     expected: &str,
 ) {
-    let check = format!("cat('{package}' %in% rownames(installed.packages()))");
+    let check =
+        format!("cat('{package}' %in% rownames(installed.packages(lib.loc = .libPaths()[1])))");
     let command =
         format!("mkdir -p {project_path} && cd {project_path} && rpx run Rscript -e \"{check}\"");
     let (exit_code, stdout, stderr) = run_shell_command(container, &command);

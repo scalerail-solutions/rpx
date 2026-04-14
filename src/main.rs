@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use directories::ProjectDirs;
+use r_description::lossy::{RDescription, Relation, Relations};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet},
@@ -7,6 +8,7 @@ use std::{
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     process::Command,
+    str::FromStr,
 };
 
 const LOCKFILE_NAME: &str = "rpx.lock";
@@ -61,17 +63,6 @@ struct InstalledPackage {
     repository: Option<String>,
 }
 
-#[derive(Debug)]
-struct DescriptionFile {
-    fields: Vec<DescriptionField>,
-}
-
-#[derive(Debug)]
-struct DescriptionField {
-    name: String,
-    value: String,
-}
-
 fn main() {
     let cli = Cli::parse();
 
@@ -121,6 +112,7 @@ fn cmd_remove(package: &str) {
         .expect("failed to run Rscript");
 
     exit_with_status(status.code());
+    remove_installed_package_dir(package);
     lock_from_description();
 }
 
@@ -308,6 +300,14 @@ fn installed_packages() -> Vec<InstalledPackage> {
     parse_installed_packages(&String::from_utf8_lossy(&output.stdout))
 }
 
+fn remove_installed_package_dir(package: &str) {
+    let package_dir = project_library_path().join(package);
+
+    if package_dir.exists() {
+        fs::remove_dir_all(package_dir).expect("failed to remove package directory");
+    }
+}
+
 fn parse_installed_packages(output: &str) -> Vec<InstalledPackage> {
     output
         .lines()
@@ -346,156 +346,100 @@ fn to_locked_package(package: InstalledPackage) -> LockedPackage {
     }
 }
 
-fn read_description() -> Result<DescriptionFile, String> {
+fn read_description() -> Result<RDescription, String> {
     let path = description_path();
     let contents = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-    let description = parse_description(&contents)?;
+    let description = RDescription::from_str(&contents).map_err(|error| error.to_string())?;
 
-    if description.field_value("Package").is_none() {
+    if description.name.trim().is_empty() {
         return Err("DESCRIPTION is missing Package".to_string());
     }
 
     Ok(description)
 }
-
-fn parse_description(contents: &str) -> Result<DescriptionFile, String> {
-    let mut fields: Vec<DescriptionField> = Vec::new();
-
-    for line in contents.lines() {
-        if line.starts_with(' ') || line.starts_with('\t') {
-            let field = fields
-                .last_mut()
-                .ok_or_else(|| "DESCRIPTION continuation without field".to_string())?;
-            field.value.push('\n');
-            field.value.push_str(line.trim_start());
-            continue;
-        }
-
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let (name, value) = line
-            .split_once(':')
-            .ok_or_else(|| format!("invalid DESCRIPTION line: {line}"))?;
-        fields.push(DescriptionField {
-            name: name.to_string(),
-            value: value.trim_start().to_string(),
-        });
-    }
-
-    Ok(DescriptionFile { fields })
+fn write_description(description: &RDescription) {
+    fs::write(description_path(), format!("{description}")).expect("failed to write DESCRIPTION");
 }
 
-fn write_description(description: &DescriptionFile) {
-    let mut contents = String::new();
-
-    for field in &description.fields {
-        let mut lines = field.value.lines();
-        contents.push_str(&field.name);
-        contents.push_str(": ");
-        contents.push_str(lines.next().unwrap_or_default());
-        contents.push('\n');
-
-        for line in lines {
-            contents.push(' ');
-            contents.push_str(line);
-            contents.push('\n');
-        }
-    }
-
-    fs::write(description_path(), contents).expect("failed to write DESCRIPTION");
+trait DescriptionExt {
+    fn add_to_imports(&mut self, package: &str);
+    fn remove_from_field(&mut self, field_name: &str, package: &str);
+    fn requirements(&self) -> Vec<String>;
 }
 
-impl DescriptionFile {
-    fn field_value(&self, name: &str) -> Option<&str> {
-        self.fields
-            .iter()
-            .find(|field| field.name == name)
-            .map(|field| field.value.as_str())
-    }
-
-    fn set_field(&mut self, name: &str, value: String) {
-        if let Some(field) = self.fields.iter_mut().find(|field| field.name == name) {
-            field.value = value;
-            return;
-        }
-
-        self.fields.push(DescriptionField {
-            name: name.to_string(),
-            value,
-        });
-    }
-
-    fn remove_field(&mut self, name: &str) {
-        self.fields.retain(|field| field.name != name);
-    }
-
+impl DescriptionExt for RDescription {
     fn add_to_imports(&mut self, package: &str) {
-        let mut entries = self
-            .field_value("Imports")
-            .map(parse_dependency_entries)
-            .unwrap_or_default();
+        let mut imports = self.imports.clone().unwrap_or_default();
 
-        if entries
-            .iter()
-            .any(|entry| dependency_name(entry) == package)
-        {
+        if imports.iter().any(|entry| entry.name == package) {
             return;
         }
 
-        entries.push(package.to_string());
-        self.set_field("Imports", entries.join(", "));
+        imports.0.push(Relation {
+            name: package.to_string(),
+            version: None,
+        });
+        self.imports = Some(imports);
     }
 
     fn remove_from_field(&mut self, field_name: &str, package: &str) {
-        let Some(value) = self.field_value(field_name) else {
-            return;
-        };
+        match field_name {
+            "Imports" => {
+                let filtered = self
+                    .imports
+                    .clone()
+                    .unwrap_or_default()
+                    .0
+                    .into_iter()
+                    .filter(|entry| entry.name != package)
+                    .collect::<Vec<_>>();
 
-        let entries = parse_dependency_entries(value)
-            .into_iter()
-            .filter(|entry| dependency_name(entry) != package)
-            .collect::<Vec<_>>();
+                self.imports = if filtered.is_empty() {
+                    None
+                } else {
+                    Some(Relations(filtered))
+                };
+            }
+            "Depends" => {
+                let filtered = self
+                    .depends
+                    .clone()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|relation| relation.name != package)
+                    .cloned()
+                    .collect::<Vec<_>>();
 
-        if entries.is_empty() {
-            self.remove_field(field_name);
-            return;
+                self.depends = if filtered.is_empty() {
+                    None
+                } else {
+                    Some(Relations(filtered))
+                };
+            }
+            _ => {}
         }
-
-        self.set_field(field_name, entries.join(", "));
     }
 
     fn requirements(&self) -> Vec<String> {
         let mut requirements = BTreeSet::new();
 
-        for field_name in ["Depends", "Imports"] {
-            if let Some(value) = self.field_value(field_name) {
-                for entry in parse_dependency_entries(value) {
-                    let name = dependency_name(&entry);
-                    if name != "R" {
-                        requirements.insert(name.to_string());
-                    }
+        if let Some(imports) = &self.imports {
+            for relation in imports.iter() {
+                requirements.insert(relation.name.clone());
+            }
+        }
+
+        if let Some(depends) = &self.depends {
+            for relation in depends.iter() {
+                let name = relation.name.clone();
+                if name != "R" {
+                    requirements.insert(name);
                 }
             }
         }
 
         requirements.into_iter().collect()
     }
-}
-
-fn parse_dependency_entries(value: &str) -> Vec<String> {
-    value
-        .replace('\n', " ")
-        .split(',')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-fn dependency_name(entry: &str) -> &str {
-    entry.split([' ', '(']).next().unwrap_or(entry).trim()
 }
 
 fn read_lockfile() -> Result<Lockfile, String> {
