@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 
 use testcontainers::{
+    GenericBuildableImage, ImageExt,
     core::Container,
     core::ExecCommand,
     runners::{SyncBuilder, SyncRunner},
-    GenericBuildableImage, ImageExt,
 };
 
 fn rpx_test_image() -> testcontainers::GenericImage {
@@ -142,6 +142,10 @@ fn runs_rpx_add_inside_custom_r_image() {
 
     let lockfile = read_project_file(&container, project_path, "rpx.lock");
     assert!(lockfile.contains("\"digest\""), "lockfile was: {lockfile}");
+    assert!(
+        lockfile.contains("\"repositories\""),
+        "lockfile was: {lockfile}"
+    );
     assert!(
         lockfile.contains("\"requirements\""),
         "lockfile was: {lockfile}"
@@ -299,7 +303,7 @@ fn runs_rpx_sync_restores_locked_versions() {
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
     let seed_lockfile = format!(
-        "mkdir -p {project_path} && cd {project_path} && cat > rpx.lock <<'EOF'\n{{\n  \"version\": 1,\n  \"requirements\": [\n    \"digest\"\n  ],\n  \"packages\": {{\n    \"digest\": {{\n      \"package\": \"digest\",\n      \"version\": \"0.6.37\",\n      \"source\": \"repository\",\n      \"repository\": \"CRAN\"\n    }}\n  }}\n}}\nEOF"
+        "mkdir -p {project_path} && cd {project_path} && cat > rpx.lock <<'EOF'\n{{\n  \"version\": 2,\n  \"requirements\": [\n    \"digest\"\n  ],\n  \"repositories\": [\n    \"https://cloud.r-project.org\"\n  ],\n  \"packages\": {{\n    \"digest\": {{\n      \"package\": \"digest\",\n      \"version\": \"0.6.37\",\n      \"source\": \"repository\",\n      \"repository\": \"https://cloud.r-project.org\"\n    }}\n  }}\n}}\nEOF"
     );
     let (exit_code, stdout, stderr) = run_shell_command(&container, &seed_lockfile);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
@@ -348,7 +352,7 @@ fn runs_rpx_status_for_lockfile_drift() {
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
     let seed_lockfile = format!(
-        "mkdir -p {project_path} && cd {project_path} && cat > rpx.lock <<'EOF'\n{{\n  \"version\": 1,\n  \"requirements\": [],\n  \"packages\": {{}}\n}}\nEOF"
+        "mkdir -p {project_path} && cd {project_path} && cat > rpx.lock <<'EOF'\n{{\n  \"version\": 2,\n  \"requirements\": [],\n  \"repositories\": [\n    \"https://cloud.r-project.org\"\n  ],\n  \"packages\": {{}}\n}}\nEOF"
     );
     let (exit_code, stdout, stderr) = run_shell_command(&container, &seed_lockfile);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
@@ -362,6 +366,63 @@ fn runs_rpx_status_for_lockfile_drift() {
     );
     assert!(
         stdout.contains("Missing from lockfile: digest"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+}
+
+#[test]
+fn runs_rpx_repo_add_and_list() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-repo-add";
+    create_package_project(&container, project_path);
+
+    let add_command = format!("cd {project_path} && rpx repo add posit");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &add_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let description = read_project_file(&container, project_path, "DESCRIPTION");
+    assert!(
+        description
+            .contains("Additional_repositories: https://packagemanager.posit.co/cran/latest"),
+        "DESCRIPTION was: {description}"
+    );
+
+    let list_command = format!("cd {project_path} && rpx repo list");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &list_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stdout.contains("CRAN: https://cloud.r-project.org"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert!(
+        stdout.contains("posit: https://packagemanager.posit.co/cran/latest"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+}
+
+#[test]
+fn runs_rpx_sync_fails_when_repositories_change() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-repo-drift";
+    create_package_project(&container, project_path);
+
+    let setup_command = format!("cd {project_path} && rpx add digest");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &setup_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let mutate_command = format!("cd {project_path} && rpx repo add posit");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &mutate_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let sync_command = format!("cd {project_path} && rpx sync");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &sync_command);
+    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stderr.contains("lockfile out of date; run rpx lock"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("repositories changed:"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }

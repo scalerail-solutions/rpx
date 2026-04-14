@@ -15,7 +15,7 @@ pub fn project_command(program: impl AsRef<str>) -> Command {
     command
 }
 
-pub fn install_requirements(requirements: &[String]) {
+pub fn install_requirements(requirements: &[String], repositories: &[String]) {
     if requirements.is_empty() {
         return;
     }
@@ -25,7 +25,10 @@ pub fn install_requirements(requirements: &[String]) {
         .map(|package| format!("'{package}'"))
         .collect::<Vec<_>>()
         .join(", ");
-    let expression = format!("install.packages(c({requirements}))");
+    let expression = format!(
+        "install.packages(c({requirements}), repos = {})",
+        r_vector(repositories)
+    );
 
     let status = project_command("Rscript")
         .arg("-e")
@@ -36,20 +39,48 @@ pub fn install_requirements(requirements: &[String]) {
     crate::exit_with_status(status.code());
 }
 
-pub fn install_exact_cran_package(package: &str, version: &str) {
+pub fn install_package(package: &str, repositories: &[String]) {
+    let expression = format!(
+        "install.packages('{package}', repos = {})",
+        r_vector(repositories)
+    );
+
+    let status = project_command("Rscript")
+        .arg("-e")
+        .arg(expression)
+        .status()
+        .expect("failed to run Rscript");
+
+    crate::exit_with_status(status.code());
+}
+
+pub fn install_exact_repository_package(
+    package: &str,
+    version: &str,
+    repository: &str,
+    repositories: &[String],
+) {
+    let repository = repository.trim_end_matches('/');
     let expression = format!(
         concat!(
             "package <- '{package}';",
             "version <- '{version}';",
-            "available <- available.packages(repos = 'https://cloud.r-project.org');",
+            "repository <- '{repository}';",
+            "repos <- unique(c(repository, {}));",
+            "available <- available.packages(repos = repos);",
             "is_current <- package %in% rownames(available) && available[package, 'Version'] == version;",
-            "current <- sprintf('https://cloud.r-project.org/src/contrib/%s_%s.tar.gz', package, version);",
-            "archive <- sprintf('https://cloud.r-project.org/src/contrib/Archive/%s/%s_%s.tar.gz', package, package, version);",
-            "url <- if (is_current) current else archive;",
-            "install.packages(url, repos = NULL, type = 'source')"
+            "current <- sprintf('%s/src/contrib/%s_%s.tar.gz', repository, package, version);",
+            "archive <- sprintf('%s/src/contrib/Archive/%s/%s_%s.tar.gz', repository, package, package, version);",
+            "if (is_current) {{",
+            "  install.packages(package, repos = repos, type = 'source');",
+            "}} else {{",
+            "  install.packages(archive, repos = NULL, type = 'source');",
+            "}}"
         ),
+        r_vector(repositories),
         package = package,
         version = version,
+        repository = repository,
     );
 
     let status = project_command("Rscript")
@@ -155,4 +186,17 @@ fn parse_installed_packages(output: &str) -> Vec<InstalledPackage> {
             })
         })
         .collect()
+}
+
+fn r_vector(values: &[String]) -> String {
+    let values = values
+        .iter()
+        .map(|value| format!("'{}'", escape_r_string(value)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("c({values})")
+}
+
+fn escape_r_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "\\'")
 }

@@ -1,4 +1,4 @@
-use crate::project::{lockfile_path, LOCKFILE_NAME};
+use crate::project::{LOCKFILE_NAME, lockfile_path};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs};
 
@@ -6,6 +6,8 @@ use std::{collections::BTreeMap, fs};
 pub struct Lockfile {
     pub version: u32,
     pub requirements: Vec<String>,
+    #[serde(default)]
+    pub repositories: Vec<String>,
     pub packages: BTreeMap<String, LockedPackage>,
 }
 
