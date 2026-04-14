@@ -26,6 +26,13 @@ fn start_container() -> Container<testcontainers::GenericImage> {
         .expect("container should start")
 }
 
+fn run_shell_command(
+    container: &Container<testcontainers::GenericImage>,
+    command: &str,
+) -> (i64, String, String) {
+    run_command(container, &["sh", "-lc", command])
+}
+
 fn run_command(
     container: &Container<testcontainers::GenericImage>,
     command: &[&str],
@@ -49,11 +56,14 @@ fn run_command(
 
 fn assert_package_state(
     container: &testcontainers::core::Container<testcontainers::GenericImage>,
+    project_path: &str,
     package: &str,
     expected: &str,
 ) {
     let check = format!("cat('{package}' %in% rownames(installed.packages()))");
-    let (exit_code, stdout, stderr) = run_command(container, &["Rscript", "-e", &check]);
+    let command =
+        format!("mkdir -p {project_path} && cd {project_path} && rpx run Rscript -e \"{check}\"");
+    let (exit_code, stdout, stderr) = run_shell_command(container, &command);
 
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
@@ -77,21 +87,42 @@ fn runs_rpx_help_inside_custom_r_image() {
 #[test]
 fn runs_rpx_add_inside_custom_r_image() {
     let container = start_container();
-    let (exit_code, stdout, stderr) = run_command(&container, &["rpx", "add", "digest"]);
+    let project_path = "/tmp/rpx-project-add";
+    let command = format!("mkdir -p {project_path} && cd {project_path} && rpx add digest");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
 
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
-    assert_package_state(&container, "digest", "TRUE");
+    assert_package_state(&container, project_path, "digest", "TRUE");
 }
 
 #[test]
 fn runs_rpx_remove_inside_custom_r_image() {
     let container = start_container();
+    let project_path = "/tmp/rpx-project-remove";
 
-    let (exit_code, stdout, stderr) = run_command(&container, &["rpx", "add", "digest"]);
+    let add_command = format!("mkdir -p {project_path} && cd {project_path} && rpx add digest");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &add_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
-    assert_package_state(&container, "digest", "TRUE");
+    assert_package_state(&container, project_path, "digest", "TRUE");
 
-    let (exit_code, stdout, stderr) = run_command(&container, &["rpx", "remove", "digest"]);
+    let remove_command = format!("cd {project_path} && rpx remove digest");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &remove_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
-    assert_package_state(&container, "digest", "FALSE");
+    assert_package_state(&container, project_path, "digest", "FALSE");
+}
+
+#[test]
+fn runs_rpx_run_with_isolated_library() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-run";
+    let command = format!(
+        "mkdir -p {project_path} && cd {project_path} && rpx run Rscript -e \"cat(.libPaths()[1])\""
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stdout.contains("rpx/libraries/"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
 }
