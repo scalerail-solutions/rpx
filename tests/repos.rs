@@ -57,6 +57,30 @@ fn runs_rpx_repo_add_and_list() {
 }
 
 #[test]
+fn does_not_duplicate_repo_when_added_twice() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-repo-dedupe";
+    create_package_project(&container, project_path);
+
+    let first_add = format!("cd {project_path} && rpx repo add posit");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &first_add);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let second_add = format!("cd {project_path} && rpx repo add posit");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &second_add);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let description = read_project_file(&container, project_path, "DESCRIPTION");
+    assert_eq!(
+        description
+            .matches("https://packagemanager.posit.co/cran/latest")
+            .count(),
+        1,
+        "DESCRIPTION was: {description}"
+    );
+}
+
+#[test]
 fn runs_rpx_repo_add_and_remove_bioconductor() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-repo-bioconductor";
@@ -111,6 +135,27 @@ fn runs_rpx_repo_remove_raw_url_added_by_alias() {
 
     let remove_command =
         format!("cd {project_path} && rpx repo remove https://packagemanager.posit.co/cran/latest");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &remove_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let description = read_project_file(&container, project_path, "DESCRIPTION");
+    assert!(
+        !description.contains("Additional_repositories"),
+        "DESCRIPTION was: {description}"
+    );
+}
+
+#[test]
+fn runs_rpx_repo_remove_alias_added_by_raw_url() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-repo-remove-alias";
+    create_package_project(&container, project_path);
+
+    let add_command = format!("cd {project_path} && rpx repo add https://R-Forge.R-project.org");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &add_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let remove_command = format!("cd {project_path} && rpx repo remove r-forge");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &remove_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
