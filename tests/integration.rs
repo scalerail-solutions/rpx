@@ -72,6 +72,18 @@ fn assert_package_state(
     );
 }
 
+fn read_project_file(
+    container: &testcontainers::core::Container<testcontainers::GenericImage>,
+    project_path: &str,
+    file_name: &str,
+) -> String {
+    let command = format!("cd {project_path} && cat {file_name}");
+    let (exit_code, stdout, stderr) = run_shell_command(container, &command);
+
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    stdout
+}
+
 #[test]
 fn runs_rpx_help_inside_custom_r_image() {
     let container = start_container();
@@ -93,6 +105,17 @@ fn runs_rpx_add_inside_custom_r_image() {
 
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
     assert_package_state(&container, project_path, "digest", "TRUE");
+
+    let lockfile = read_project_file(&container, project_path, "rpx.lock");
+    assert!(lockfile.contains("\"digest\""), "lockfile was: {lockfile}");
+    assert!(
+        lockfile.contains("\"requirements\""),
+        "lockfile was: {lockfile}"
+    );
+    assert!(
+        lockfile.contains("\"packages\""),
+        "lockfile was: {lockfile}"
+    );
 }
 
 #[test]
@@ -109,6 +132,9 @@ fn runs_rpx_remove_inside_custom_r_image() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &remove_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
     assert_package_state(&container, project_path, "digest", "FALSE");
+
+    let lockfile = read_project_file(&container, project_path, "rpx.lock");
+    assert!(!lockfile.contains("\"digest\""), "lockfile was: {lockfile}");
 }
 
 #[test]
@@ -123,6 +149,94 @@ fn runs_rpx_run_with_isolated_library() {
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
         stdout.contains("rpx/libraries/"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+}
+
+#[test]
+fn runs_rpx_lock_from_current_library() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-lock";
+    let install_command = format!(
+        "mkdir -p {project_path} && cd {project_path} && rpx run Rscript -e \"install.packages('digest')\""
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &install_command);
+
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let lock_command = format!("cd {project_path} && rpx lock");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &lock_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let lockfile = read_project_file(&container, project_path, "rpx.lock");
+    assert!(lockfile.contains("\"digest\""), "lockfile was: {lockfile}");
+    assert!(
+        lockfile.contains("\"requirements\": []"),
+        "lockfile was: {lockfile}"
+    );
+}
+
+#[test]
+fn runs_rpx_sync_from_lockfile_without_mutating_it() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-sync";
+    let seed_lockfile = format!(
+        "mkdir -p {project_path} && cd {project_path} && cat > rpx.lock <<'EOF'\n{{\n  \"version\": 1,\n  \"requirements\": [\n    \"digest\"\n  ],\n  \"packages\": {{}}\n}}\nEOF"
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &seed_lockfile);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let before = read_project_file(&container, project_path, "rpx.lock");
+
+    let sync_command = format!("cd {project_path} && rpx sync");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &sync_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    assert_package_state(&container, project_path, "digest", "TRUE");
+
+    let after = read_project_file(&container, project_path, "rpx.lock");
+    assert_eq!(
+        after, before,
+        "lockfile changed during sync\nbefore:\n{before}\nafter:\n{after}"
+    );
+}
+
+#[test]
+fn runs_rpx_status_for_clean_project() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-status-clean";
+    let setup_command = format!("mkdir -p {project_path} && cd {project_path} && rpx add digest");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &setup_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let status_command = format!("cd {project_path} && rpx status");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stdout.contains("Status: ok"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+}
+
+#[test]
+fn runs_rpx_status_for_lockfile_drift() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-status-drift";
+    let seed_lockfile = format!(
+        "mkdir -p {project_path} && cd {project_path} && cat > rpx.lock <<'EOF'\n{{\n  \"version\": 1,\n  \"requirements\": [\n    \"digest\"\n  ],\n  \"packages\": {{}}\n}}\nEOF"
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &seed_lockfile);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let status_command = format!("cd {project_path} && rpx status");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
+    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stdout.contains("Status: drift"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert!(
+        stdout.contains("Missing from lockfile: digest"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }
