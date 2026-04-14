@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use testcontainers::{
+    core::Container,
     core::ExecCommand,
     runners::{SyncBuilder, SyncRunner},
     GenericBuildableImage, ImageExt,
@@ -18,12 +19,17 @@ fn rpx_test_image() -> testcontainers::GenericImage {
         .expect("image should build")
 }
 
-fn run_command(command: &[&str]) -> (i64, String, String) {
-    let container = rpx_test_image()
+fn start_container() -> Container<testcontainers::GenericImage> {
+    rpx_test_image()
         .with_cmd(vec!["sleep", "infinity"])
         .start()
-        .expect("container should start");
+        .expect("container should start")
+}
 
+fn run_command(
+    container: &Container<testcontainers::GenericImage>,
+    command: &[&str],
+) -> (i64, String, String) {
     let mut result = container
         .exec(ExecCommand::new(command.iter().copied()))
         .expect("command should run");
@@ -41,15 +47,25 @@ fn run_command(command: &[&str]) -> (i64, String, String) {
     (exit_code, stdout, stderr)
 }
 
-fn assert_command_runs(command: &[&str]) {
-    let (exit_code, stdout, stderr) = run_command(command);
+fn assert_package_state(
+    container: &testcontainers::core::Container<testcontainers::GenericImage>,
+    package: &str,
+    expected: &str,
+) {
+    let check = format!("cat('{package}' %in% rownames(installed.packages()))");
+    let (exit_code, stdout, stderr) = run_command(container, &["Rscript", "-e", &check]);
 
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stdout.contains(expected),
+        "expected package state {expected}\nstdout was: {stdout}\nstderr was: {stderr}"
+    );
 }
 
 #[test]
 fn runs_rpx_help_inside_custom_r_image() {
-    let (exit_code, stdout, stderr) = run_command(&["rpx", "--help"]);
+    let container = start_container();
+    let (exit_code, stdout, stderr) = run_command(&container, &["rpx", "--help"]);
 
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
@@ -60,10 +76,22 @@ fn runs_rpx_help_inside_custom_r_image() {
 
 #[test]
 fn runs_rpx_add_inside_custom_r_image() {
-    assert_command_runs(&["rpx", "add"]);
+    let container = start_container();
+    let (exit_code, stdout, stderr) = run_command(&container, &["rpx", "add", "digest"]);
+
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert_package_state(&container, "digest", "TRUE");
 }
 
 #[test]
 fn runs_rpx_remove_inside_custom_r_image() {
-    assert_command_runs(&["rpx", "remove"]);
+    let container = start_container();
+
+    let (exit_code, stdout, stderr) = run_command(&container, &["rpx", "add", "digest"]);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert_package_state(&container, "digest", "TRUE");
+
+    let (exit_code, stdout, stderr) = run_command(&container, &["rpx", "remove", "digest"]);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert_package_state(&container, "digest", "FALSE");
 }
