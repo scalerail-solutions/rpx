@@ -84,6 +84,25 @@ fn assert_package_state(
     );
 }
 
+fn assert_package_version(
+    container: &testcontainers::core::Container<testcontainers::GenericImage>,
+    project_path: &str,
+    package: &str,
+    expected: &str,
+) {
+    let check =
+        format!("cat(installed.packages(lib.loc = .libPaths()[1])['{package}', 'Version'])");
+    let command =
+        format!("mkdir -p {project_path} && cd {project_path} && rpx run Rscript -e \"{check}\"");
+    let (exit_code, stdout, stderr) = run_shell_command(container, &command);
+
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stdout.contains(expected),
+        "expected package version {expected}\nstdout was: {stdout}\nstderr was: {stderr}"
+    );
+}
+
 fn read_project_file(
     container: &testcontainers::core::Container<testcontainers::GenericImage>,
     project_path: &str,
@@ -211,18 +230,18 @@ fn runs_rpx_sync_from_lockfile_without_mutating_it() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-sync";
     create_package_project(&container, project_path);
-    let add_dependency =
-        format!("cd {project_path} && cat >> DESCRIPTION <<'EOF'\nImports: digest\nEOF");
-    let (exit_code, stdout, stderr) = run_shell_command(&container, &add_dependency);
+    let add_command = format!("cd {project_path} && rpx add digest");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &add_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
-    let seed_lockfile = format!(
-        "mkdir -p {project_path} && cd {project_path} && cat > rpx.lock <<'EOF'\n{{\n  \"version\": 1,\n  \"requirements\": [\n    \"digest\"\n  ],\n  \"packages\": {{}}\n}}\nEOF"
+    let remove_package_dir = format!(
+        "cd {project_path} && rm -rf \"$(rpx run Rscript -e \"cat(file.path(.libPaths()[1], 'digest'))\")\""
     );
-    let (exit_code, stdout, stderr) = run_shell_command(&container, &seed_lockfile);
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &remove_package_dir);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
     let before = read_project_file(&container, project_path, "rpx.lock");
+    assert_package_state(&container, project_path, "digest", "FALSE");
 
     let sync_command = format!("cd {project_path} && rpx sync");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &sync_command);
@@ -234,6 +253,69 @@ fn runs_rpx_sync_from_lockfile_without_mutating_it() {
     assert_eq!(
         after, before,
         "lockfile changed during sync\nbefore:\n{before}\nafter:\n{after}"
+    );
+}
+
+#[test]
+fn runs_rpx_sync_removes_extra_packages() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-sync-prune";
+    create_package_project(&container, project_path);
+
+    let setup_command = format!("cd {project_path} && rpx add digest");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &setup_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let extra_command =
+        format!("cd {project_path} && rpx run Rscript -e \"install.packages('jsonlite')\"");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &extra_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert_package_state(&container, project_path, "jsonlite", "TRUE");
+
+    let before = read_project_file(&container, project_path, "rpx.lock");
+
+    let sync_command = format!("cd {project_path} && rpx sync");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &sync_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    assert_package_state(&container, project_path, "digest", "TRUE");
+    assert_package_state(&container, project_path, "jsonlite", "FALSE");
+
+    let after = read_project_file(&container, project_path, "rpx.lock");
+    assert_eq!(
+        after, before,
+        "lockfile changed during strict sync\nbefore:\n{before}\nafter:\n{after}"
+    );
+}
+
+#[test]
+fn runs_rpx_sync_restores_locked_versions() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-sync-version";
+    create_package_project(&container, project_path);
+    let add_dependency =
+        format!("cd {project_path} && cat >> DESCRIPTION <<'EOF'\nImports: digest\nEOF");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &add_dependency);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let seed_lockfile = format!(
+        "mkdir -p {project_path} && cd {project_path} && cat > rpx.lock <<'EOF'\n{{\n  \"version\": 1,\n  \"requirements\": [\n    \"digest\"\n  ],\n  \"packages\": {{\n    \"digest\": {{\n      \"package\": \"digest\",\n      \"version\": \"0.6.37\",\n      \"source\": \"repository\",\n      \"repository\": \"CRAN\"\n    }}\n  }}\n}}\nEOF"
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &seed_lockfile);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let before = read_project_file(&container, project_path, "rpx.lock");
+
+    let sync_command = format!("cd {project_path} && rpx sync");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &sync_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    assert_package_version(&container, project_path, "digest", "0.6.37");
+
+    let after = read_project_file(&container, project_path, "rpx.lock");
+    assert_eq!(
+        after, before,
+        "lockfile changed during strict sync\nbefore:\n{before}\nafter:\n{after}"
     );
 }
 

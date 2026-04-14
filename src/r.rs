@@ -1,4 +1,4 @@
-use std::{fs, process::Command};
+use std::{collections::BTreeMap, fs, process::Command};
 
 use crate::{lockfile::LockedPackage, project::project_library_path};
 
@@ -36,6 +36,31 @@ pub fn install_requirements(requirements: &[String]) {
     crate::exit_with_status(status.code());
 }
 
+pub fn install_exact_cran_package(package: &str, version: &str) {
+    let expression = format!(
+        concat!(
+            "package <- '{package}';",
+            "version <- '{version}';",
+            "available <- available.packages(repos = 'https://cloud.r-project.org');",
+            "is_current <- package %in% rownames(available) && available[package, 'Version'] == version;",
+            "current <- sprintf('https://cloud.r-project.org/src/contrib/%s_%s.tar.gz', package, version);",
+            "archive <- sprintf('https://cloud.r-project.org/src/contrib/Archive/%s/%s_%s.tar.gz', package, package, version);",
+            "url <- if (is_current) current else archive;",
+            "install.packages(url, repos = NULL, type = 'source')"
+        ),
+        package = package,
+        version = version,
+    );
+
+    let status = project_command("Rscript")
+        .arg("-e")
+        .arg(expression)
+        .status()
+        .expect("failed to run Rscript");
+
+    crate::exit_with_status(status.code());
+}
+
 pub fn installed_packages() -> Vec<InstalledPackage> {
     let expression = concat!(
         "packages <- installed.packages(lib.loc = .libPaths()[1], fields = 'Repository');",
@@ -53,6 +78,37 @@ pub fn installed_packages() -> Vec<InstalledPackage> {
     crate::exit_with_status(output.status.code());
 
     parse_installed_packages(&String::from_utf8_lossy(&output.stdout))
+}
+
+pub fn installed_packages_by_name() -> BTreeMap<String, InstalledPackage> {
+    installed_packages()
+        .into_iter()
+        .map(|package| (package.package.clone(), package))
+        .collect()
+}
+
+pub fn remove_installed_packages(packages: &[String]) {
+    if packages.is_empty() {
+        return;
+    }
+
+    let package_expression = packages
+        .iter()
+        .map(|package| format!("'{package}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let status = project_command("Rscript")
+        .arg("-e")
+        .arg(format!("remove.packages(c({package_expression}))"))
+        .status()
+        .expect("failed to run Rscript");
+
+    crate::exit_with_status(status.code());
+
+    for package in packages {
+        remove_installed_package_dir(package);
+    }
 }
 
 pub fn remove_installed_package_dir(package: &str) {
