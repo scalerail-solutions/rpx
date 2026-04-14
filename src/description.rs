@@ -61,7 +61,13 @@ impl DescriptionExt for RDescription {
     fn add_to_imports(&mut self, package: &str) {
         let mut imports = self.imports.clone().unwrap_or_default();
 
-        if imports.iter().any(|entry| entry.name == package) {
+        let already_present_in_depends = self
+            .depends
+            .as_ref()
+            .map(|depends| depends.iter().any(|entry| entry.name == package))
+            .unwrap_or(false);
+
+        if imports.iter().any(|entry| entry.name == package) || already_present_in_depends {
             return;
         }
 
