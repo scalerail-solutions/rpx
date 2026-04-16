@@ -6,6 +6,7 @@ mod description;
 mod lockfile;
 mod project;
 mod r;
+mod registry;
 mod repo;
 
 use cli::{Cli, Commands, RepoCommands};
