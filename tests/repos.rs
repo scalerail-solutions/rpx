@@ -219,7 +219,7 @@ fn relocks_automatically_when_adding_repo_with_existing_lockfile() {
 
     let lockfile = read_project_file(&container, project_path, "rpx.lock");
     assert!(
-        lockfile.contains("https://packagemanager.posit.co/cran/latest"),
+        lockfile.contains("\"registry\": \"https://packagemanager.posit.co/cran/latest\""),
         "lockfile was: {lockfile}"
     );
 

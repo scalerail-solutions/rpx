@@ -61,7 +61,7 @@ fn runs_rpx_add_inside_custom_r_image() {
     let lockfile = read_project_file(&container, project_path, "rpx.lock");
     assert!(lockfile.contains("\"digest\""), "lockfile was: {lockfile}");
     assert!(
-        lockfile.contains("\"repositories\""),
+        lockfile.contains("\"registry\""),
         "lockfile was: {lockfile}"
     );
     assert!(

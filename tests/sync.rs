@@ -162,7 +162,7 @@ fn runs_rpx_sync_restores_locked_versions() {
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
     let seed_lockfile = format!(
-        "mkdir -p {project_path} && cd {project_path} && cat > rpx.lock <<'EOF'\n{{\n  \"version\": 2,\n  \"requirements\": [\n    \"digest\"\n  ],\n  \"repositories\": [\n    \"https://cloud.r-project.org\"\n  ],\n  \"packages\": {{\n    \"digest\": {{\n      \"package\": \"digest\",\n      \"version\": \"0.6.37\",\n      \"source\": \"repository\",\n      \"repository\": \"https://cloud.r-project.org\"\n    }}\n  }}\n}}\nEOF"
+        "mkdir -p {project_path} && cd {project_path} && cat > rpx.lock <<'EOF'\n{{\n  \"version\": 2,\n  \"requirements\": [\n    \"digest\"\n  ],\n  \"registry\": \"https://cloud.r-project.org\",\n  \"packages\": {{\n    \"digest\": {{\n      \"package\": \"digest\",\n      \"version\": \"0.6.37\",\n      \"source\": \"registry\",\n      \"source_url\": \"https://cloud.r-project.org/src/contrib/Archive/digest/digest_0.6.37.tar.gz\"\n    }}\n  }}\n}}\nEOF"
     );
     let (exit_code, stdout, stderr) = run_shell_command(&container, &seed_lockfile);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
@@ -241,7 +241,7 @@ fn runs_rpx_sync_fails_when_repositories_change() {
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert!(
-        stderr.contains("repositories changed:"),
+        stderr.contains("registry changed:"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }

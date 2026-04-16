@@ -11,16 +11,16 @@ mod repo;
 mod resolver;
 
 use cli::{Cli, Commands, RepoCommands};
-use description::{read_description, write_description, DescriptionExt};
-use lockfile::{read_lockfile, write_lockfile, Lockfile};
+use description::{DescriptionExt, read_description, write_description};
+use lockfile::{Lockfile, read_lockfile, write_lockfile};
 use project::lockfile_path;
 use r::{
-    install_exact_repository_package, install_package, install_requirements, installed_packages,
+    install_package, install_requirements, install_source_package, installed_packages,
     installed_packages_by_name, project_command, remove_installed_package_dir,
     remove_installed_packages, to_locked_package,
 };
 use repo::{
-    alias_for_repository, effective_repositories, expand_repo_spec, DEFAULT_REPOSITORY_URL,
+    DEFAULT_REPOSITORY_URL, alias_for_repository, effective_repositories, expand_repo_spec,
 };
 
 pub fn run() {
@@ -162,6 +162,7 @@ fn cmd_status() {
         .into_iter()
         .collect::<BTreeSet<_>>();
     let manifest_repositories = effective_repositories(&project.additional_repositories);
+    let manifest_registry = manifest_registry(&manifest_repositories);
     let lock_requirements = lockfile
         .requirements
         .iter()
@@ -186,7 +187,7 @@ fn cmd_status() {
         .difference(&manifest_requirements)
         .cloned()
         .collect::<Vec<_>>();
-    let repository_mismatch = manifest_repositories != lockfile.repositories;
+    let registry_mismatch = manifest_registry != lockfile.registry;
     let missing_from_library = locked_names
         .difference(&installed_names)
         .cloned()
@@ -213,13 +214,13 @@ fn cmd_status() {
 
     println!("Manifest requirements: {}", manifest_requirements.len());
     println!("Locked requirements: {}", lockfile.requirements.len());
-    println!("Locked repositories: {}", lockfile.repositories.len());
+    println!("Locked registry: {}", lockfile.registry);
     println!("Locked packages: {}", lockfile.packages.len());
     println!("Installed packages: {}", installed.len());
 
     if missing_from_lockfile.is_empty()
         && extra_in_lockfile.is_empty()
-        && !repository_mismatch
+        && !registry_mismatch
         && missing_from_library.is_empty()
         && extra_in_library.is_empty()
         && version_mismatches.is_empty()
@@ -241,11 +242,10 @@ fn cmd_status() {
         println!("Extra in lockfile: {}", extra_in_lockfile.join(", "));
     }
 
-    if repository_mismatch {
+    if registry_mismatch {
         println!(
-            "Repository mismatch: current [{}], locked [{}]",
-            manifest_repositories.join(", "),
-            lockfile.repositories.join(", ")
+            "Registry mismatch: current [{}], locked [{}]",
+            manifest_registry, lockfile.registry
         );
     }
 
@@ -268,12 +268,13 @@ fn lock_from_description() {
     let project = read_description().expect("failed to read DESCRIPTION");
     let requirements = project.description.requirements();
     let repositories = effective_repositories(&project.additional_repositories);
+    let registry = manifest_registry(&repositories);
 
     install_requirements(&requirements, &repositories);
     write_lockfile(Lockfile {
         version: 2,
         requirements,
-        repositories,
+        registry,
         packages: installed_packages()
             .into_iter()
             .map(|package| {
@@ -288,6 +289,7 @@ fn sync_from_lockfile() {
     let project = read_description().expect("failed to read DESCRIPTION");
     let manifest_requirements = project.description.requirements();
     let manifest_repositories = effective_repositories(&project.additional_repositories);
+    let manifest_registry = manifest_registry(&manifest_repositories);
     let lockfile = read_lockfile().expect("failed to read lockfile");
 
     if manifest_requirements != lockfile.requirements {
@@ -295,17 +297,16 @@ fn sync_from_lockfile() {
         std::process::exit(1);
     }
 
-    if manifest_repositories != lockfile.repositories {
+    if manifest_registry != lockfile.registry {
         eprintln!("lockfile out of date; run rpx lock");
         eprintln!(
-            "repositories changed: current [{}], locked [{}]",
-            manifest_repositories.join(", "),
-            lockfile.repositories.join(", ")
+            "registry changed: current [{}], locked [{}]",
+            manifest_registry, lockfile.registry
         );
         std::process::exit(1);
     }
 
-    install_requirements(&lockfile.requirements, &lockfile.repositories);
+    install_requirements(&lockfile.requirements, &[lockfile.registry.clone()]);
 
     let installed = installed_packages_by_name();
     let exact_reinstalls = lockfile
@@ -313,15 +314,12 @@ fn sync_from_lockfile() {
         .iter()
         .filter_map(|(name, package)| match installed.get(name) {
             Some(installed_package) if installed_package.version == package.version => None,
-            _ => package
-                .repository
-                .clone()
-                .map(|repository| (name.clone(), package.version.clone(), repository)),
+            _ => package.source_url.clone(),
         })
         .collect::<Vec<_>>();
 
-    for (name, version, repository) in &exact_reinstalls {
-        install_exact_repository_package(name, version, repository, &lockfile.repositories);
+    for source_url in &exact_reinstalls {
+        install_source_package(source_url);
     }
 
     let extras = installed_packages_by_name()
@@ -384,4 +382,11 @@ pub(crate) fn exit_with_status(code: Option<i32>) {
     if code != Some(0) {
         std::process::exit(code.unwrap_or(1));
     }
+}
+
+fn manifest_registry(repositories: &[String]) -> String {
+    repositories
+        .last()
+        .cloned()
+        .expect("effective repositories should always include the default repository")
 }

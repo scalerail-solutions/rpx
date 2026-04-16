@@ -54,33 +54,10 @@ pub fn install_package(package: &str, repositories: &[String]) {
     crate::exit_with_status(status.code());
 }
 
-pub fn install_exact_repository_package(
-    package: &str,
-    version: &str,
-    repository: &str,
-    repositories: &[String],
-) {
-    let repository = repository.trim_end_matches('/');
+pub fn install_source_package(source_url: &str) {
     let expression = format!(
-        concat!(
-            "package <- '{package}';",
-            "version <- '{version}';",
-            "repository <- '{repository}';",
-            "repos <- unique(c(repository, {}));",
-            "available <- available.packages(repos = repos);",
-            "is_current <- package %in% rownames(available) && available[package, 'Version'] == version;",
-            "current <- sprintf('%s/src/contrib/%s_%s.tar.gz', repository, package, version);",
-            "archive <- sprintf('%s/src/contrib/Archive/%s/%s_%s.tar.gz', repository, package, package, version);",
-            "if (is_current) {{",
-            "  install.packages(package, repos = repos, type = 'source');",
-            "}} else {{",
-            "  install.packages(archive, repos = NULL, type = 'source');",
-            "}}"
-        ),
-        r_vector(repositories),
-        package = package,
-        version = version,
-        repository = repository,
+        "install.packages('{}', repos = NULL, type = 'source')",
+        escape_r_string(source_url)
     );
 
     let status = project_command("Rscript")
@@ -151,17 +128,21 @@ pub fn remove_installed_package_dir(package: &str) {
 }
 
 pub fn to_locked_package(package: InstalledPackage) -> LockedPackage {
-    let source = package
-        .repository
-        .as_ref()
-        .map(|_| "repository".to_string());
+    let source = package.repository.as_ref().map(|_| "registry".to_string());
 
     LockedPackage {
-        package: package.package,
-        version: package.version,
+        package: package.package.clone(),
+        version: package.version.clone(),
         source,
-        repository: package.repository,
+        source_url: package.repository.map(|repository| {
+            repository_source_url(&repository, &package.package, &package.version)
+        }),
     }
+}
+
+fn repository_source_url(repository: &str, package: &str, version: &str) -> String {
+    let repository = repository.trim_end_matches('/');
+    format!("{repository}/src/contrib/{package}_{version}.tar.gz")
 }
 
 fn parse_installed_packages(output: &str) -> Vec<InstalledPackage> {
