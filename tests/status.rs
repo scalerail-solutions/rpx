@@ -50,7 +50,7 @@ fn runs_rpx_status_for_lockfile_drift() {
 }
 
 #[test]
-fn runs_rpx_status_for_repository_drift() {
+fn runs_rpx_status_ignores_additional_repositories() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-status-repo-drift";
     create_package_project(&container, project_path);

@@ -11,18 +11,18 @@ mod repo;
 mod resolver;
 
 use cli::{Cli, Commands, RepoCommands};
-use description::{DescriptionExt, read_description, write_description};
-use lockfile::{Lockfile, read_lockfile, write_lockfile};
+use description::{read_description, write_description, DescriptionExt};
+use lockfile::{read_lockfile, write_lockfile, Lockfile};
 use project::lockfile_path;
 use r::{
     install_package, install_source_package, installed_packages, installed_packages_by_name,
     project_command, remove_installed_package_dir, remove_installed_packages,
 };
-use registry::{ClosureRequest, DEFAULT_REGISTRY_BASE_URL, DownloadedArtifact, RegistryClient};
+use registry::{ClosureRequest, DownloadedArtifact, RegistryClient, DEFAULT_REGISTRY_BASE_URL};
 use repo::{
-    DEFAULT_REPOSITORY_URL, alias_for_repository, effective_repositories, expand_repo_spec,
+    alias_for_repository, effective_repositories, expand_repo_spec, DEFAULT_REPOSITORY_URL,
 };
-use resolver::{ResolvedPackage, resolve_from_closure};
+use resolver::{resolve_from_closure, ResolvedPackage};
 
 pub fn run() {
     let cli = Cli::parse();
@@ -162,7 +162,6 @@ fn cmd_status() {
         .requirements()
         .into_iter()
         .collect::<BTreeSet<_>>();
-    let manifest_registry = registry_base_url();
     let lock_requirements = lockfile
         .requirements
         .iter()
@@ -187,7 +186,6 @@ fn cmd_status() {
         .difference(&manifest_requirements)
         .cloned()
         .collect::<Vec<_>>();
-    let registry_mismatch = manifest_registry != lockfile.registry;
     let missing_from_library = locked_names
         .difference(&installed_names)
         .cloned()
@@ -220,7 +218,6 @@ fn cmd_status() {
 
     if missing_from_lockfile.is_empty()
         && extra_in_lockfile.is_empty()
-        && !registry_mismatch
         && missing_from_library.is_empty()
         && extra_in_library.is_empty()
         && version_mismatches.is_empty()
@@ -240,13 +237,6 @@ fn cmd_status() {
 
     if !extra_in_lockfile.is_empty() {
         println!("Extra in lockfile: {}", extra_in_lockfile.join(", "));
-    }
-
-    if registry_mismatch {
-        println!(
-            "Registry mismatch: current [{}], locked [{}]",
-            manifest_registry, lockfile.registry
-        );
     }
 
     if !missing_from_library.is_empty() {
