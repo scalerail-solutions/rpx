@@ -149,7 +149,12 @@ fn add_dependency_constraints(
         constraints
             .entry(dependency.dependency_name.clone())
             .or_default()
-            .push(dependency.constraint_raw.clone());
+            .push(
+                dependency
+                    .constraint_raw
+                    .clone()
+                    .unwrap_or_else(|| "*".to_string()),
+            );
 
         if let Some(assigned) = assignments.get(&dependency.dependency_name) {
             let dependency_constraints = constraints
@@ -470,7 +475,7 @@ mod tests {
         ClosureDependency {
             dependency_name: name.to_string(),
             dependency_kind: kind.to_string(),
-            constraint_raw: constraint.to_string(),
+            constraint_raw: Some(constraint.to_string()),
         }
     }
 

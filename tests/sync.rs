@@ -81,9 +81,12 @@ fn runs_rpx_lock_from_current_library() {
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
     let lockfile = read_project_file(&container, project_path, "rpx.lock");
-    assert!(lockfile.contains("\"digest\""), "lockfile was: {lockfile}");
     assert!(
         lockfile.contains("\"requirements\": []"),
+        "lockfile was: {lockfile}"
+    );
+    assert!(
+        lockfile.contains("\"packages\": {}"),
         "lockfile was: {lockfile}"
     );
 }
@@ -162,7 +165,7 @@ fn runs_rpx_sync_restores_locked_versions() {
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
     let seed_lockfile = format!(
-        "mkdir -p {project_path} && cd {project_path} && cat > rpx.lock <<'EOF'\n{{\n  \"version\": 2,\n  \"requirements\": [\n    \"digest\"\n  ],\n  \"registry\": \"https://cloud.r-project.org\",\n  \"packages\": {{\n    \"digest\": {{\n      \"package\": \"digest\",\n      \"version\": \"0.6.37\",\n      \"source\": \"registry\",\n      \"source_url\": \"https://cloud.r-project.org/src/contrib/Archive/digest/digest_0.6.37.tar.gz\"\n    }}\n  }}\n}}\nEOF"
+        "mkdir -p {project_path} && cd {project_path} && cat > rpx.lock <<'EOF'\n{{\n  \"version\": 2,\n  \"requirements\": [\n    \"digest\"\n  ],\n  \"registry\": \"https://api.rrepo.org\",\n  \"packages\": {{\n    \"digest\": {{\n      \"package\": \"digest\",\n      \"version\": \"0.6.37\",\n      \"source\": \"registry\",\n      \"source_url\": \"https://cran.r-project.org/src/contrib/Archive/digest/digest_0.6.37.tar.gz\"\n    }}\n  }}\n}}\nEOF"
     );
     let (exit_code, stdout, stderr) = run_shell_command(&container, &seed_lockfile);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
@@ -218,7 +221,7 @@ Imports: digest, jsonlite",
 }
 
 #[test]
-fn runs_rpx_sync_fails_when_repositories_change() {
+fn runs_rpx_sync_ignores_repository_changes() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-repo-drift";
     create_package_project(&container, project_path);
@@ -235,13 +238,5 @@ fn runs_rpx_sync_fails_when_repositories_change() {
 
     let sync_command = format!("cd {project_path} && rpx sync");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &sync_command);
-    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
-    assert!(
-        stderr.contains("lockfile out of date; run rpx lock"),
-        "stdout was: {stdout}\nstderr was: {stderr}"
-    );
-    assert!(
-        stderr.contains("registry changed:"),
-        "stdout was: {stdout}\nstderr was: {stderr}"
-    );
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 }

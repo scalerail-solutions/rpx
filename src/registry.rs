@@ -9,7 +9,7 @@ pub struct ClosureRequest {
     pub roots: Vec<ClosureRoot>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ClosureRoot {
     pub name: String,
     pub constraint: String,
@@ -76,7 +76,7 @@ pub struct ClosureDependency {
     #[serde(rename = "dependencyKind")]
     pub dependency_kind: String,
     #[serde(rename = "constraintRaw")]
-    pub constraint_raw: String,
+    pub constraint_raw: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +128,10 @@ impl RegistryClient {
             client: reqwest::blocking::Client::new(),
             poll_config,
         }
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     pub fn fetch_closure_with_retry(

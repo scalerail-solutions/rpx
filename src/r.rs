@@ -1,12 +1,11 @@
 use std::{collections::BTreeMap, fs, process::Command};
 
-use crate::{lockfile::LockedPackage, project::project_library_path};
+use crate::project::project_library_path;
 
 #[derive(Debug)]
 pub struct InstalledPackage {
     pub package: String,
     pub version: String,
-    pub repository: Option<String>,
 }
 
 pub fn project_command(program: impl AsRef<str>) -> Command {
@@ -71,9 +70,9 @@ pub fn install_source_package(source_url: &str) {
 
 pub fn installed_packages() -> Vec<InstalledPackage> {
     let expression = concat!(
-        "packages <- installed.packages(lib.loc = .libPaths()[1], fields = 'Repository');",
+        "packages <- installed.packages(lib.loc = .libPaths()[1]);",
         "if (nrow(packages) == 0) quit(save = 'no', status = 0);",
-        "write.table(packages[, c('Package', 'Version', 'Repository'), drop = FALSE], ",
+        "write.table(packages[, c('Package', 'Version'), drop = FALSE], ",
         "sep = '\t', row.names = FALSE, col.names = TRUE, quote = FALSE)"
     );
 
@@ -127,24 +126,6 @@ pub fn remove_installed_package_dir(package: &str) {
     }
 }
 
-pub fn to_locked_package(package: InstalledPackage) -> LockedPackage {
-    let source = package.repository.as_ref().map(|_| "registry".to_string());
-
-    LockedPackage {
-        package: package.package.clone(),
-        version: package.version.clone(),
-        source,
-        source_url: package.repository.map(|repository| {
-            repository_source_url(&repository, &package.package, &package.version)
-        }),
-    }
-}
-
-fn repository_source_url(repository: &str, package: &str, version: &str) -> String {
-    let repository = repository.trim_end_matches('/');
-    format!("{repository}/src/contrib/{package}_{version}.tar.gz")
-}
-
 fn parse_installed_packages(output: &str) -> Vec<InstalledPackage> {
     output
         .lines()
@@ -154,17 +135,8 @@ fn parse_installed_packages(output: &str) -> Vec<InstalledPackage> {
             let mut parts = line.split('\t');
             let package = parts.next()?.trim().to_string();
             let version = parts.next()?.trim().to_string();
-            let repository = parts
-                .next()
-                .map(str::trim)
-                .filter(|value| !value.is_empty() && *value != "NA")
-                .map(ToOwned::to_owned);
 
-            Some(InstalledPackage {
-                package,
-                version,
-                repository,
-            })
+            Some(InstalledPackage { package, version })
         })
         .collect()
 }

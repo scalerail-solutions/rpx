@@ -2,10 +2,12 @@ use r_description::lossy::{RDescription, Relation, Relations};
 use std::{collections::BTreeSet, fs, str::FromStr};
 
 use crate::project::description_path;
+use crate::registry::ClosureRoot;
 
 pub trait DescriptionExt {
     fn add_to_imports(&mut self, package: &str);
     fn remove_from_field(&mut self, field_name: &str, package: &str);
+    fn closure_roots(&self) -> Vec<ClosureRoot>;
     fn requirements(&self) -> Vec<String>;
 }
 
@@ -116,6 +118,26 @@ impl DescriptionExt for RDescription {
         }
     }
 
+    fn closure_roots(&self) -> Vec<ClosureRoot> {
+        let mut roots = BTreeSet::new();
+
+        if let Some(imports) = &self.imports {
+            for relation in imports.iter() {
+                roots.insert(closure_root_from_relation(relation));
+            }
+        }
+
+        if let Some(depends) = &self.depends {
+            for relation in depends.iter() {
+                if relation.name != "R" {
+                    roots.insert(closure_root_from_relation(relation));
+                }
+            }
+        }
+
+        roots.into_iter().collect()
+    }
+
     fn requirements(&self) -> Vec<String> {
         let mut requirements = BTreeSet::new();
 
@@ -135,6 +157,19 @@ impl DescriptionExt for RDescription {
         }
 
         requirements.into_iter().collect()
+    }
+}
+
+fn closure_root_from_relation(relation: &Relation) -> ClosureRoot {
+    let constraint = relation
+        .version
+        .as_ref()
+        .map(|(operator, version)| format!("{operator} {version}"))
+        .unwrap_or_else(|| "*".to_string());
+
+    ClosureRoot {
+        name: relation.name.clone(),
+        constraint,
     }
 }
 
