@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 
 use testcontainers::{
+    GenericBuildableImage, ImageExt,
     core::Container,
     core::ExecCommand,
     runners::{SyncBuilder, SyncRunner},
-    GenericBuildableImage, ImageExt,
 };
 
 pub fn rpx_test_image() -> testcontainers::GenericImage {

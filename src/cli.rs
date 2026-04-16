@@ -10,15 +10,12 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    Init,
     Add {
         package: String,
     },
     Remove {
         package: String,
-    },
-    Repo {
-        #[command(subcommand)]
-        command: RepoCommands,
     },
     Run {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
@@ -27,11 +24,4 @@ pub enum Commands {
     Lock,
     Status,
     Sync,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum RepoCommands {
-    Add { repo: String },
-    Remove { repo: String },
-    List,
 }

@@ -31,7 +31,7 @@ fn runs_rpx_status_for_lockfile_drift() {
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
     let seed_lockfile = format!(
-        "mkdir -p {project_path} && cd {project_path} && cat > rpx.lock <<'EOF'\n{{\n  \"version\": 2,\n  \"requirements\": [],\n  \"repositories\": [\n    \"https://cloud.r-project.org\"\n  ],\n  \"packages\": {{}}\n}}\nEOF"
+        "mkdir -p {project_path} && cd {project_path} && cat > rpx.lock <<'EOF'\n{{\n  \"version\": 2,\n  \"requirements\": [],\n  \"registry\": \"https://api.rrepo.org\",\n  \"packages\": {{}}\n}}\nEOF"
     );
     let (exit_code, stdout, stderr) = run_shell_command(&container, &seed_lockfile);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
@@ -50,7 +50,7 @@ fn runs_rpx_status_for_lockfile_drift() {
 }
 
 #[test]
-fn runs_rpx_status_for_repository_drift() {
+fn runs_rpx_status_ignores_additional_repositories() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-status-repo-drift";
     create_package_project(&container, project_path);
@@ -67,9 +67,9 @@ fn runs_rpx_status_for_repository_drift() {
 
     let status_command = format!("cd {project_path} && rpx status");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
-    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stdout.contains("Repository mismatch:"),
+        stdout.contains("Status: ok"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }

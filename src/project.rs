@@ -9,6 +9,10 @@ use std::{
 pub const LOCKFILE_NAME: &str = "rpx.lock";
 pub const DESCRIPTION_NAME: &str = "DESCRIPTION";
 
+pub fn current_description_path() -> PathBuf {
+    current_dir().join(DESCRIPTION_NAME)
+}
+
 pub fn description_path() -> PathBuf {
     project_root().join(DESCRIPTION_NAME)
 }
@@ -32,7 +36,7 @@ pub fn project_library_path() -> PathBuf {
 }
 
 pub fn project_root() -> PathBuf {
-    let current_dir = env::current_dir().expect("failed to get current directory");
+    let current_dir = current_dir();
     let current_dir = current_dir
         .canonicalize()
         .unwrap_or_else(|_| current_dir.clone());
@@ -44,6 +48,10 @@ pub fn project_root() -> PathBuf {
     }
 
     panic!("{DESCRIPTION_NAME} not found in current directory or any parent directory");
+}
+
+fn current_dir() -> PathBuf {
+    env::current_dir().expect("failed to get current directory")
 }
 
 fn hash_path(path: &Path) -> String {

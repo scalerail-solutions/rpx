@@ -61,7 +61,7 @@ fn runs_rpx_add_inside_custom_r_image() {
     let lockfile = read_project_file(&container, project_path, "rpx.lock");
     assert!(lockfile.contains("\"digest\""), "lockfile was: {lockfile}");
     assert!(
-        lockfile.contains("\"repositories\""),
+        lockfile.contains("\"registry\""),
         "lockfile was: {lockfile}"
     );
     assert!(
@@ -103,6 +103,40 @@ fn runs_rpx_remove_inside_custom_r_image() {
     assert!(
         !description.contains("digest"),
         "DESCRIPTION was: {description}"
+    );
+}
+
+#[test]
+fn runs_rpx_lock_without_installing_packages() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-lock";
+    write_description(
+        &container,
+        project_path,
+        "Package: testpkg
+Version: 0.1.0
+Title: Test Package
+Description: Test package for rpx integration tests.
+License: MIT
+Author: Test Author
+Maintainer: Test Author <test@example.com>
+Imports: digest",
+    );
+
+    let command = format!("cd {project_path} && rpx lock");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert_package_state(&container, project_path, "digest", "FALSE");
+
+    let lockfile = read_project_file(&container, project_path, "rpx.lock");
+    assert!(
+        lockfile.contains("\"registry\": \"https://api.rrepo.org\""),
+        "lockfile was: {lockfile}"
+    );
+    assert!(
+        lockfile.contains("https://cran.r-project.org/src/contrib/"),
+        "lockfile was: {lockfile}"
     );
 }
 

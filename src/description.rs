@@ -1,18 +1,19 @@
-use r_description::lossy::{RDescription, Relation, Relations};
+use r_description::{Version, lossy::RDescription, lossy::Relation, lossy::Relations};
 use std::{collections::BTreeSet, fs, str::FromStr};
 
-use crate::project::description_path;
+use crate::project::{current_description_path, description_path};
+use crate::registry::ClosureRoot;
 
 pub trait DescriptionExt {
     fn add_to_imports(&mut self, package: &str);
     fn remove_from_field(&mut self, field_name: &str, package: &str);
+    fn closure_roots(&self) -> Vec<ClosureRoot>;
     fn requirements(&self) -> Vec<String>;
 }
 
 #[derive(Debug)]
 pub struct ProjectDescription {
     pub description: RDescription,
-    pub additional_repositories: Vec<String>,
 }
 
 pub fn read_description() -> Result<ProjectDescription, String> {
@@ -24,37 +25,33 @@ pub fn read_description() -> Result<ProjectDescription, String> {
         return Err("DESCRIPTION is missing Package".to_string());
     }
 
-    Ok(ProjectDescription {
-        description,
-        additional_repositories: parse_additional_repositories(&contents),
-    })
+    Ok(ProjectDescription { description })
 }
 
 pub fn write_description(project: &ProjectDescription) {
     let mut contents = format!("{}", project.description).trim_end().to_string();
-
-    if !project.additional_repositories.is_empty() {
-        contents.push_str("\nAdditional_repositories: ");
-        contents.push_str(&project.additional_repositories.join(",\n "));
-    }
-
     contents.push('\n');
     fs::write(description_path(), contents).expect("failed to write DESCRIPTION");
 }
 
-impl ProjectDescription {
-    pub fn add_repositories(&mut self, repositories: &[String]) {
-        for repository in repositories {
-            if !self.additional_repositories.contains(repository) {
-                self.additional_repositories.push(repository.clone());
-            }
-        }
+pub fn init_description() -> Result<String, String> {
+    let path = current_description_path();
+    if path.exists() {
+        return Err("DESCRIPTION already exists".to_string());
     }
 
-    pub fn remove_repositories(&mut self, repositories: &[String]) {
-        self.additional_repositories
-            .retain(|repository| !repositories.contains(repository));
-    }
+    let package_name = package_name_from_current_directory()?;
+    let description = ProjectDescription {
+        description: initial_description(&package_name),
+    };
+
+    let mut contents = format!("{}", description.description)
+        .trim_end()
+        .to_string();
+    contents.push('\n');
+    fs::write(&path, contents).map_err(|error| error.to_string())?;
+
+    Ok(path.display().to_string())
 }
 
 impl DescriptionExt for RDescription {
@@ -116,6 +113,26 @@ impl DescriptionExt for RDescription {
         }
     }
 
+    fn closure_roots(&self) -> Vec<ClosureRoot> {
+        let mut roots = BTreeSet::new();
+
+        if let Some(imports) = &self.imports {
+            for relation in imports.iter() {
+                roots.insert(closure_root_from_relation(relation));
+            }
+        }
+
+        if let Some(depends) = &self.depends {
+            for relation in depends.iter() {
+                if relation.name != "R" {
+                    roots.insert(closure_root_from_relation(relation));
+                }
+            }
+        }
+
+        roots.into_iter().collect()
+    }
+
     fn requirements(&self) -> Vec<String> {
         let mut requirements = BTreeSet::new();
 
@@ -138,35 +155,124 @@ impl DescriptionExt for RDescription {
     }
 }
 
-fn parse_additional_repositories(contents: &str) -> Vec<String> {
-    let mut value = None::<String>;
-    let mut current_field = None::<String>;
+fn closure_root_from_relation(relation: &Relation) -> ClosureRoot {
+    let constraint = relation
+        .version
+        .as_ref()
+        .map(|(operator, version)| format!("{operator} {version}"))
+        .unwrap_or_else(|| "*".to_string());
 
-    for line in contents.lines() {
-        if line.starts_with(' ') || line.starts_with('\t') {
-            if current_field.as_deref() == Some("Additional_repositories") {
-                let current = value.get_or_insert_with(String::new);
-                if !current.is_empty() {
-                    current.push('\n');
+    ClosureRoot {
+        name: relation.name.clone(),
+        constraint,
+    }
+}
+
+fn initial_description(package_name: &str) -> RDescription {
+    RDescription {
+        name: package_name.to_string(),
+        description: "Add a package description.".to_string(),
+        title: title_from_package_name(package_name),
+        maintainer: Some("Your Name <you@example.com>".to_string()),
+        author: Some("Your Name".to_string()),
+        authors: None,
+        version: "0.1.0".parse::<Version>().expect("version should parse"),
+        encoding: None,
+        license: "MIT".to_string(),
+        url: None,
+        bug_reports: None,
+        imports: None,
+        suggests: None,
+        depends: None,
+        linking_to: None,
+        lazy_data: None,
+        collate: None,
+        vignette_builder: None,
+        system_requirements: None,
+        date: None,
+        language: None,
+        repository: None,
+    }
+}
+
+fn package_name_from_current_directory() -> Result<String, String> {
+    let current_dir = std::env::current_dir().map_err(|error| error.to_string())?;
+    let directory_name = current_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "failed to derive package name from current directory".to_string())?;
+
+    sanitize_package_name(directory_name)
+}
+
+fn sanitize_package_name(directory_name: &str) -> Result<String, String> {
+    let mut package_name = String::new();
+
+    for character in directory_name.chars() {
+        match character {
+            'a'..='z' | 'A'..='Z' | '0'..='9' => package_name.push(character),
+            '-' | '_' | ' ' | '.' => {
+                if !package_name.ends_with('.') {
+                    package_name.push('.');
                 }
-                current.push_str(line.trim());
             }
-            continue;
-        }
-
-        if let Some((field, rest)) = line.split_once(':') {
-            current_field = Some(field.trim().to_string());
-            if field.trim() == "Additional_repositories" {
-                value = Some(rest.trim().to_string());
-            }
+            _ => {}
         }
     }
 
-    value
-        .unwrap_or_default()
-        .split([',', '\n'])
-        .map(str::trim)
-        .filter(|repository| !repository.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
+    let package_name = package_name.trim_matches('.').to_string();
+    let Some(first) = package_name.chars().next() else {
+        return Err("current directory does not produce a valid package name".to_string());
+    };
+
+    if !first.is_ascii_alphabetic() {
+        return Err("package name must start with a letter".to_string());
+    }
+
+    Ok(package_name)
+}
+
+fn title_from_package_name(package_name: &str) -> String {
+    package_name
+        .split('.')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut characters = part.chars();
+            let Some(first) = characters.next() else {
+                return String::new();
+            };
+
+            format!("{}{}", first.to_ascii_uppercase(), characters.as_str())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sanitize_package_name, title_from_package_name};
+
+    #[test]
+    fn sanitizes_directory_name_to_package_name() {
+        assert_eq!(
+            sanitize_package_name("my-package_name").unwrap(),
+            "my.package.name"
+        );
+    }
+
+    #[test]
+    fn rejects_package_name_without_leading_letter() {
+        assert_eq!(
+            sanitize_package_name("123pkg").unwrap_err(),
+            "package name must start with a letter"
+        );
+    }
+
+    #[test]
+    fn derives_title_from_package_name() {
+        assert_eq!(
+            title_from_package_name("my.package.name"),
+            "My Package Name"
+        );
+    }
 }
