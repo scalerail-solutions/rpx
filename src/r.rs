@@ -14,21 +14,6 @@ pub fn project_command(program: impl AsRef<str>) -> Command {
     command
 }
 
-pub fn install_package(package: &str, repositories: &[String]) {
-    let expression = format!(
-        "install.packages('{package}', repos = {})",
-        r_vector(repositories)
-    );
-
-    let status = project_command("Rscript")
-        .arg("-e")
-        .arg(expression)
-        .status()
-        .expect("failed to run Rscript");
-
-    crate::exit_with_status(status.code());
-}
-
 pub fn install_source_package(source_path: &Path) {
     let source_path = source_path
         .to_str()
@@ -118,15 +103,6 @@ fn parse_installed_packages(output: &str) -> Vec<InstalledPackage> {
             Some(InstalledPackage { package, version })
         })
         .collect()
-}
-
-fn r_vector(values: &[String]) -> String {
-    let values = values
-        .iter()
-        .map(|value| format!("'{}'", escape_r_string(value)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("c({values})")
 }
 
 fn escape_r_string(value: &str) -> String {

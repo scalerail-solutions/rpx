@@ -16,10 +16,6 @@ pub enum Commands {
     Remove {
         package: String,
     },
-    Repo {
-        #[command(subcommand)]
-        command: RepoCommands,
-    },
     Run {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
@@ -27,11 +23,4 @@ pub enum Commands {
     Lock,
     Status,
     Sync,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum RepoCommands {
-    Add { repo: String },
-    Remove { repo: String },
-    List,
 }

@@ -7,22 +7,18 @@ mod lockfile;
 mod project;
 mod r;
 mod registry;
-mod repo;
 mod resolver;
 
-use cli::{Cli, Commands, RepoCommands};
-use description::{read_description, write_description, DescriptionExt};
-use lockfile::{read_lockfile, write_lockfile, Lockfile};
+use cli::{Cli, Commands};
+use description::{DescriptionExt, read_description, write_description};
+use lockfile::{Lockfile, read_lockfile, write_lockfile};
 use project::lockfile_path;
 use r::{
-    install_package, install_source_package, installed_packages, installed_packages_by_name,
-    project_command, remove_installed_package_dir, remove_installed_packages,
+    install_source_package, installed_packages, installed_packages_by_name, project_command,
+    remove_installed_package_dir, remove_installed_packages,
 };
-use registry::{ClosureRequest, DownloadedArtifact, RegistryClient, DEFAULT_REGISTRY_BASE_URL};
-use repo::{
-    alias_for_repository, effective_repositories, expand_repo_spec, DEFAULT_REPOSITORY_URL,
-};
-use resolver::{resolve_from_closure, ResolvedPackage};
+use registry::{ClosureRequest, DEFAULT_REGISTRY_BASE_URL, DownloadedArtifact, RegistryClient};
+use resolver::{ResolvedPackage, resolve_from_closure};
 
 pub fn run() {
     let cli = Cli::parse();
@@ -30,7 +26,6 @@ pub fn run() {
     match cli.command {
         Commands::Add { package } => cmd_add(&package),
         Commands::Remove { package } => cmd_remove(&package),
-        Commands::Repo { command } => cmd_repo(command),
         Commands::Run { command } => cmd_run(&command),
         Commands::Lock => cmd_lock(),
         Commands::Status => cmd_status(),
@@ -46,10 +41,8 @@ fn cmd_add(package: &str) {
     let mut project = read_description().expect("failed to read DESCRIPTION");
     project.description.add_to_imports(package);
     write_description(&project);
-
-    let repositories = effective_repositories(&project.additional_repositories);
-    install_package(package, &repositories);
     lock_from_description();
+    sync_from_lockfile();
 }
 
 fn cmd_remove(package: &str) {
@@ -71,50 +64,6 @@ fn cmd_remove(package: &str) {
     exit_with_status(status.code());
     remove_installed_package_dir(package);
     lock_from_description();
-}
-
-fn cmd_repo(command: RepoCommands) {
-    match command {
-        RepoCommands::Add { repo } => cmd_repo_add(&repo),
-        RepoCommands::Remove { repo } => cmd_repo_remove(&repo),
-        RepoCommands::List => cmd_repo_list(),
-    }
-}
-
-fn cmd_repo_add(repo: &str) {
-    let repositories = expand_repo_spec(repo).expect("failed to expand repository alias");
-    let should_relock = lockfile_path().exists();
-    let mut project = read_description().expect("failed to read DESCRIPTION");
-    project.add_repositories(&repositories);
-    write_description(&project);
-
-    if should_relock {
-        lock_from_description();
-    }
-}
-
-fn cmd_repo_remove(repo: &str) {
-    let repositories = expand_repo_spec(repo).unwrap_or_else(|_| vec![repo.to_string()]);
-    let should_relock = lockfile_path().exists();
-    let mut project = read_description().expect("failed to read DESCRIPTION");
-    project.remove_repositories(&repositories);
-    write_description(&project);
-
-    if should_relock {
-        lock_from_description();
-    }
-}
-
-fn cmd_repo_list() {
-    let project = read_description().expect("failed to read DESCRIPTION");
-
-    println!("CRAN: {DEFAULT_REPOSITORY_URL}");
-    for repository in &project.additional_repositories {
-        match alias_for_repository(repository) {
-            Some(alias) => println!("{alias}: {repository}"),
-            None => println!("repo: {repository}"),
-        }
-    }
 }
 
 fn cmd_run(command: &[String]) {
