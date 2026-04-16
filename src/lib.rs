@@ -8,6 +8,7 @@ mod project;
 mod r;
 mod registry;
 mod repo;
+mod resolver;
 
 use cli::{Cli, Commands, RepoCommands};
 use description::{read_description, write_description, DescriptionExt};
