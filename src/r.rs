@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fs, process::Command};
+use std::{collections::BTreeMap, fs, path::Path, process::Command};
 
 use crate::project::project_library_path;
 
@@ -53,10 +53,13 @@ pub fn install_package(package: &str, repositories: &[String]) {
     crate::exit_with_status(status.code());
 }
 
-pub fn install_source_package(source_url: &str) {
+pub fn install_source_package(source_path: &Path) {
+    let source_path = source_path
+        .to_str()
+        .expect("source package path should be valid utf-8");
     let expression = format!(
         "install.packages('{}', repos = NULL, type = 'source')",
-        escape_r_string(source_url)
+        escape_r_string(source_path)
     );
 
     let status = project_command("Rscript")

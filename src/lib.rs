@@ -19,7 +19,7 @@ use r::{
     installed_packages_by_name, project_command, remove_installed_package_dir,
     remove_installed_packages,
 };
-use registry::{ClosureRequest, DEFAULT_REGISTRY_BASE_URL, RegistryClient};
+use registry::{ClosureRequest, DEFAULT_REGISTRY_BASE_URL, DownloadedArtifact, RegistryClient};
 use repo::{
     DEFAULT_REPOSITORY_URL, alias_for_repository, effective_repositories, expand_repo_spec,
 };
@@ -320,12 +320,20 @@ fn sync_from_lockfile() {
         .iter()
         .filter_map(|(name, package)| match installed.get(name) {
             Some(installed_package) if installed_package.version == package.version => None,
-            _ => package.source_url.clone(),
+            _ => package
+                .source_url
+                .clone()
+                .map(|source_url| (name.clone(), package.version.clone(), source_url)),
         })
         .collect::<Vec<_>>();
 
-    for source_url in &exact_reinstalls {
-        install_source_package(source_url);
+    let client = RegistryClient::new(&lockfile.registry);
+
+    for (name, version, source_url) in &exact_reinstalls {
+        let artifact = client
+            .download_source_artifact(name, version, source_url)
+            .unwrap_or_else(|error| panic!("failed to download source artifact: {error}"));
+        install_downloaded_artifact(artifact);
     }
 
     let extras = installed_packages_by_name()
@@ -421,6 +429,11 @@ fn lockfile_from_resolution(
             })
             .collect(),
     }
+}
+
+fn install_downloaded_artifact(artifact: DownloadedArtifact) {
+    install_source_package(artifact.path());
+    artifact.cleanup();
 }
 
 #[cfg(test)]

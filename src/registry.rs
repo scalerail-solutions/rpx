@@ -1,6 +1,11 @@
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use std::{thread, time::Duration};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 pub const DEFAULT_REGISTRY_BASE_URL: &str = "https://api.rrepo.org";
 
@@ -189,6 +194,71 @@ impl RegistryClient {
 
         Err(format!("unexpected registry response ({status}): {body}"))
     }
+
+    pub fn download_source_artifact(
+        &self,
+        package: &str,
+        version: &str,
+        source_url: &str,
+    ) -> Result<DownloadedArtifact, String> {
+        let response = self
+            .client
+            .get(source_url)
+            .send()
+            .map_err(|error| format!("failed to download source artifact: {error}"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().unwrap_or_default();
+            let body = body.trim();
+
+            if body.is_empty() {
+                return Err(format!("artifact download failed ({status})"));
+            }
+
+            return Err(format!("artifact download failed ({status}): {body}"));
+        }
+
+        let bytes = response
+            .bytes()
+            .map_err(|error| format!("failed to read source artifact: {error}"))?;
+        let directory = artifact_directory();
+        fs::create_dir_all(&directory)
+            .map_err(|error| format!("failed to create artifact directory: {error}"))?;
+
+        let path = directory.join(format!("{package}_{version}.tar.gz"));
+        fs::write(&path, &bytes)
+            .map_err(|error| format!("failed to write source artifact: {error}"))?;
+
+        Ok(DownloadedArtifact { path })
+    }
+}
+
+#[derive(Debug)]
+pub struct DownloadedArtifact {
+    path: PathBuf,
+}
+
+impl DownloadedArtifact {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn cleanup(self) {
+        let _ = fs::remove_file(&self.path);
+
+        if let Some(parent) = self.path.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+    }
+}
+
+fn artifact_directory() -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!("rpx-artifacts-{}-{unique}", std::process::id()))
 }
 
 #[cfg(test)]
@@ -391,5 +461,54 @@ mod tests {
 
         mock.assert();
         assert!(error.contains("registry error (500 Internal Server Error): registry exploded"));
+    }
+
+    #[test]
+    fn downloads_source_artifact_to_a_local_file() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/packages/digest/versions/0.6.37/source")
+            .with_status(200)
+            .with_header("content-type", "application/gzip")
+            .with_body("fake-tarball")
+            .create();
+
+        let client = RegistryClient::new(server.url());
+        let artifact = client
+            .download_source_artifact(
+                "digest",
+                "0.6.37",
+                &format!("{}/packages/digest/versions/0.6.37/source", server.url()),
+            )
+            .expect("download should succeed");
+
+        mock.assert();
+        let contents = fs::read(artifact.path()).expect("artifact should exist");
+        assert_eq!(contents, b"fake-tarball");
+        artifact.cleanup();
+    }
+
+    #[test]
+    fn surfaces_source_artifact_download_errors() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/packages/digest/versions/0.6.37/source")
+            .with_status(500)
+            .with_body("tarball missing")
+            .create();
+
+        let client = RegistryClient::new(server.url());
+        let error = client
+            .download_source_artifact(
+                "digest",
+                "0.6.37",
+                &format!("{}/packages/digest/versions/0.6.37/source", server.url()),
+            )
+            .expect_err("download should fail");
+
+        mock.assert();
+        assert!(
+            error.contains("artifact download failed (500 Internal Server Error): tarball missing")
+        );
     }
 }
