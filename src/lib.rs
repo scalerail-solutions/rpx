@@ -10,7 +10,7 @@ mod registry;
 mod resolver;
 
 use cli::{Cli, Commands};
-use description::{DescriptionExt, read_description, write_description};
+use description::{DescriptionExt, init_description, read_description, write_description};
 use lockfile::{Lockfile, read_lockfile, write_lockfile};
 use project::lockfile_path;
 use r::{
@@ -24,6 +24,7 @@ pub fn run() {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Init => cmd_init(),
         Commands::Add { package } => cmd_add(&package),
         Commands::Remove { package } => cmd_remove(&package),
         Commands::Run { command } => cmd_run(&command),
@@ -31,6 +32,13 @@ pub fn run() {
         Commands::Status => cmd_status(),
         Commands::Sync => cmd_sync(),
     }
+}
+
+fn cmd_init() {
+    let path =
+        init_description().unwrap_or_else(|error| panic!("failed to initialize project: {error}"));
+    println!("Initialized project at {path}");
+    println!("Next: run `rpx add <package>` or `rpx lock`");
 }
 
 fn cmd_add(package: &str) {

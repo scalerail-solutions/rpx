@@ -10,6 +10,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    Init,
     Add {
         package: String,
     },

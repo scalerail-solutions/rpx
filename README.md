@@ -6,7 +6,7 @@ It uses `DESCRIPTION` as the manifest, keeps a resolved `rpx.lock` in the projec
 
 `rpx` resolves and installs packages through `https://api.rrepo.org`.
 
-`rpx` works with R package projects. A `DESCRIPTION` file is required.
+`rpx` works with R package projects. Use `rpx init` to create a `DESCRIPTION` file for a new project.
 
 ## Usage
 
@@ -14,6 +14,13 @@ Install from GitHub:
 
 ```bash
 cargo install --git https://github.com/scalerail-solutions/rpx.git
+```
+
+Example workflow for a new project:
+
+```bash
+rpx init   # create a DESCRIPTION in the current directory
+rpx add digest
 ```
 
 Example workflow for an existing package project with a `DESCRIPTION` file and no `rpx.lock` yet:
