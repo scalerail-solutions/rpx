@@ -104,6 +104,7 @@ impl Default for PollConfig {
 }
 
 impl PollConfig {
+    #[cfg(test)]
     pub fn from_delays(delays: Vec<Duration>) -> Self {
         Self { delays }
     }

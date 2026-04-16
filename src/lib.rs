@@ -15,9 +15,8 @@ use description::{DescriptionExt, read_description, write_description};
 use lockfile::{Lockfile, read_lockfile, write_lockfile};
 use project::lockfile_path;
 use r::{
-    install_package, install_requirements, install_source_package, installed_packages,
-    installed_packages_by_name, project_command, remove_installed_package_dir,
-    remove_installed_packages,
+    install_package, install_source_package, installed_packages, installed_packages_by_name,
+    project_command, remove_installed_package_dir, remove_installed_packages,
 };
 use registry::{ClosureRequest, DEFAULT_REGISTRY_BASE_URL, DownloadedArtifact, RegistryClient};
 use repo::{
@@ -295,7 +294,6 @@ fn lock_from_description() {
 fn sync_from_lockfile() {
     let project = read_description().expect("failed to read DESCRIPTION");
     let manifest_requirements = project.description.requirements();
-    let manifest_registry = registry_base_url();
     let lockfile = read_lockfile().expect("failed to read lockfile");
 
     if manifest_requirements != lockfile.requirements {
@@ -303,33 +301,26 @@ fn sync_from_lockfile() {
         std::process::exit(1);
     }
 
-    if manifest_registry != lockfile.registry {
-        eprintln!("lockfile out of date; run rpx lock");
-        eprintln!(
-            "registry changed: current [{}], locked [{}]",
-            manifest_registry, lockfile.registry
-        );
-        std::process::exit(1);
-    }
-
-    install_requirements(&lockfile.requirements, &[lockfile.registry.clone()]);
-
     let installed = installed_packages_by_name();
     let exact_reinstalls = lockfile
         .packages
         .iter()
         .filter_map(|(name, package)| match installed.get(name) {
             Some(installed_package) if installed_package.version == package.version => None,
-            _ => package
-                .source_url
-                .clone()
-                .map(|source_url| (name.clone(), package.version.clone(), source_url)),
+            _ => Some((
+                name.clone(),
+                package.version.clone(),
+                package.source_url.clone(),
+            )),
         })
         .collect::<Vec<_>>();
 
     let client = RegistryClient::new(&lockfile.registry);
 
     for (name, version, source_url) in &exact_reinstalls {
+        let source_url = source_url
+            .as_ref()
+            .unwrap_or_else(|| panic!("lockfile package {name}@{version} is missing source_url"));
         let artifact = client
             .download_source_artifact(name, version, source_url)
             .unwrap_or_else(|error| panic!("failed to download source artifact: {error}"));

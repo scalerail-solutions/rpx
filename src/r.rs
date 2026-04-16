@@ -14,30 +14,6 @@ pub fn project_command(program: impl AsRef<str>) -> Command {
     command
 }
 
-pub fn install_requirements(requirements: &[String], repositories: &[String]) {
-    if requirements.is_empty() {
-        return;
-    }
-
-    let requirements = requirements
-        .iter()
-        .map(|package| format!("'{package}'"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let expression = format!(
-        "install.packages(c({requirements}), repos = {})",
-        r_vector(repositories)
-    );
-
-    let status = project_command("Rscript")
-        .arg("-e")
-        .arg(expression)
-        .status()
-        .expect("failed to run Rscript");
-
-    crate::exit_with_status(status.code());
-}
-
 pub fn install_package(package: &str, repositories: &[String]) {
     let expression = format!(
         "install.packages('{package}', repos = {})",
