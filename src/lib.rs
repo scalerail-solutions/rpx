@@ -1,5 +1,5 @@
 use clap::Parser;
-use std::{collections::BTreeSet, env};
+use std::{collections::{BTreeMap, BTreeSet}, env};
 
 mod cli;
 mod description;
@@ -11,13 +11,13 @@ mod resolver;
 
 use cli::{Cli, Commands};
 use description::{DescriptionExt, init_description, read_description, write_description};
-use lockfile::{Lockfile, read_lockfile, write_lockfile};
+use lockfile::{Lockfile, read_lockfile, read_lockfile_optional, write_lockfile};
 use project::lockfile_path;
 use r::{
     install_source_package, installed_packages, installed_packages_by_name, project_command,
     remove_installed_package_dir, remove_installed_packages,
 };
-use registry::{ClosureRequest, DEFAULT_REGISTRY_BASE_URL, DownloadedArtifact, RegistryClient};
+use registry::{ClosureRequest, ClosureRoot, DEFAULT_REGISTRY_BASE_URL, DownloadedArtifact, RegistryClient};
 use resolver::{ResolvedPackage, resolve_from_closure};
 
 pub fn run() {
@@ -47,9 +47,30 @@ fn cmd_add(package: &str) {
     }
 
     let mut project = read_description().expect("failed to read DESCRIPTION");
-    project.description.add_to_imports(package);
+    let lockfile = read_lockfile_optional().expect("failed to read lockfile");
+
+    if project.description.has_dependency(package) {
+        project.description.add_to_imports(package);
+        write_description(&project);
+        lock_from_description();
+        sync_from_lockfile();
+        return;
+    }
+
+    let registry = registry_base_url();
+    let client = RegistryClient::new(&registry);
+    let resolved_addition = resolve_addition_from_latest(&project.description, lockfile.as_ref(), package, &client)
+        .unwrap_or_else(|error| panic!("failed to add package from registry: {error}"));
+
+    project
+        .description
+        .add_to_imports_with_constraints(package, &resolved_addition.constraints);
     write_description(&project);
-    lock_from_description();
+    write_lockfile(lockfile_from_resolution(
+        project.description.requirements(),
+        client.base_url(),
+        &resolved_addition.resolved,
+    ));
     sync_from_lockfile();
 }
 
@@ -211,6 +232,144 @@ fn cmd_status() {
     std::process::exit(1);
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct AddResolution {
+    constraints: Vec<String>,
+    resolved: Vec<ResolvedPackage>,
+}
+
+fn resolve_addition_from_latest(
+    description: &r_description::lossy::RDescription,
+    lockfile: Option<&Lockfile>,
+    package: &str,
+    client: &RegistryClient,
+) -> Result<AddResolution, String> {
+    let latest = client.fetch_latest_version_with_retry(package)?;
+    let constraints = semver_add_constraints(&latest.version)?;
+
+    for constraint in constraints {
+        let request = ClosureRequest {
+            roots: add_closure_roots(description, lockfile, package, &constraint),
+        };
+
+        let closure = client.fetch_closure_with_retry(&request)?;
+        if let Ok(resolved) = resolve_from_closure(&request, &registry::ClosureResponse::Complete(closure)) {
+            return Ok(AddResolution {
+                constraints: persisted_constraints(&constraint),
+                resolved,
+            });
+        }
+    }
+
+    Err(format!("could not resolve a compatible dependency set for {package}"))
+}
+
+fn add_closure_roots(
+    description: &r_description::lossy::RDescription,
+    lockfile: Option<&Lockfile>,
+    new_package: &str,
+    new_constraint: &str,
+) -> Vec<ClosureRoot> {
+    let mut roots = BTreeSet::new();
+    let locked_packages = pinned_existing_roots(description, lockfile, new_package);
+
+    for root in description.closure_roots() {
+        if root.name == new_package || locked_packages.contains_key(&root.name) {
+            continue;
+        }
+
+        roots.insert(root);
+    }
+
+    for (name, version) in locked_packages {
+        roots.insert(ClosureRoot {
+            name,
+            constraint: format!("= {version}"),
+        });
+    }
+
+    roots.insert(ClosureRoot {
+        name: new_package.to_string(),
+        constraint: new_constraint.to_string(),
+    });
+
+    roots.into_iter().collect()
+}
+
+fn pinned_existing_roots(
+    description: &r_description::lossy::RDescription,
+    lockfile: Option<&Lockfile>,
+    excluded_package: &str,
+) -> BTreeMap<String, String> {
+    let Some(lockfile) = lockfile else {
+        return BTreeMap::new();
+    };
+
+    description
+        .requirements()
+        .into_iter()
+        .filter(|name| name != excluded_package)
+        .filter_map(|name| {
+            lockfile
+                .packages
+                .get(&name)
+                .map(|package| (name, package.version.clone()))
+        })
+        .collect()
+}
+
+fn semver_add_constraints(version: &str) -> Result<Vec<String>, String> {
+    let parts = semver_prefixes(version)?;
+    let major = *parts
+        .first()
+        .ok_or_else(|| format!("latest version is not semver-like: {version}"))?;
+    let upper_bound = format!("< {}.0.0", major + 1);
+    let mut constraints = Vec::new();
+
+    constraints.push(format!(">= {version}, {upper_bound}"));
+
+    if parts.len() >= 2 {
+        constraints.push(format!(">= {}.{}, {upper_bound}", parts[0], parts[1]));
+    }
+
+    constraints.push(format!(">= {major}, {upper_bound}"));
+    constraints.push("*".to_string());
+
+    let mut deduped = Vec::new();
+    for constraint in constraints {
+        if !deduped.contains(&constraint) {
+            deduped.push(constraint);
+        }
+    }
+
+    Ok(deduped)
+}
+
+fn semver_prefixes(version: &str) -> Result<Vec<u64>, String> {
+    version
+        .split(['.', '-'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            part.parse::<u64>()
+                .map_err(|_| format!("latest version is not semver-like: {version}"))
+        })
+        .collect()
+}
+
+fn persisted_constraints(constraint: &str) -> Vec<String> {
+    let constraint = constraint.trim();
+    if constraint.is_empty() || constraint == "*" {
+        return vec![];
+    }
+
+    constraint
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
 fn lock_from_description() {
     let project = read_description().expect("failed to read DESCRIPTION");
     let requirements = project.description.requirements();
@@ -361,12 +520,19 @@ fn lockfile_from_resolution(
                         package: package.name.clone(),
                         version: package.version.clone(),
                         source: Some("registry".to_string()),
-                        source_url: Some(package.source_url.clone()),
+                        source_url: Some(registry_source_url(registry, &package.name, &package.version)),
                     },
                 )
             })
             .collect(),
     }
+}
+
+fn registry_source_url(registry: &str, package: &str, version: &str) -> String {
+    format!(
+        "{}/packages/{package}/versions/{version}/source",
+        registry.trim_end_matches('/')
+    )
 }
 
 fn install_downloaded_artifact(artifact: DownloadedArtifact) {
@@ -376,9 +542,18 @@ fn install_downloaded_artifact(artifact: DownloadedArtifact) {
 
 #[cfg(test)]
 mod tests {
-    use super::{lockfile_from_resolution, registry_base_url};
-    use crate::{description::DescriptionExt, registry::ClosureRoot, resolver::ResolvedPackage};
+    use super::{
+        add_closure_roots, lockfile_from_resolution, persisted_constraints, registry_base_url,
+        semver_add_constraints,
+    };
+    use crate::{
+        description::DescriptionExt,
+        lockfile::{LockedPackage, Lockfile},
+        registry::ClosureRoot,
+        resolver::ResolvedPackage,
+    };
     use r_description::lossy::RDescription;
+    use std::collections::BTreeMap;
     use std::{
         env,
         str::FromStr,
@@ -461,5 +636,75 @@ mod tests {
         unsafe {
             env::remove_var("RPX_REGISTRY_BASE_URL");
         }
+    }
+
+    #[test]
+    fn builds_semver_retry_constraints_from_latest_version() {
+        assert_eq!(
+            semver_add_constraints("1.1.4").unwrap(),
+            vec![
+                ">= 1.1.4, < 2.0.0".to_string(),
+                ">= 1.1, < 2.0.0".to_string(),
+                ">= 1, < 2.0.0".to_string(),
+                "*".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn deduplicates_short_semver_retry_constraints() {
+        assert_eq!(
+            semver_add_constraints("1").unwrap(),
+            vec![">= 1, < 2.0.0".to_string(), "*".to_string(),]
+        );
+    }
+
+    #[test]
+    fn splits_persisted_constraints_for_description_entries() {
+        assert_eq!(
+            persisted_constraints(">= 1.1.4, < 2.0.0"),
+            vec![">= 1.1.4".to_string(), "< 2.0.0".to_string()]
+        );
+        assert!(persisted_constraints("*").is_empty());
+    }
+
+    #[test]
+    fn pins_existing_roots_from_lockfile_when_adding_new_package() {
+        let description = RDescription::from_str(
+            "Package: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\nImports: cli\n",
+        )
+        .expect("description should parse");
+        let lockfile = Lockfile {
+            version: 2,
+            requirements: vec!["cli".to_string()],
+            registry: "https://api.rrepo.org".to_string(),
+            packages: BTreeMap::from([(
+                "cli".to_string(),
+                LockedPackage {
+                    package: "cli".to_string(),
+                    version: "3.6.5".to_string(),
+                    source: Some("registry".to_string()),
+                    source_url: Some(
+                        "https://api.rrepo.org/packages/cli/versions/3.6.5/source".to_string(),
+                    ),
+                },
+            )]),
+        };
+
+        let roots = add_closure_roots(&description, Some(&lockfile), "digest", ">= 0.6.37, < 1.0.0");
+
+        assert_eq!(
+            roots,
+            vec![
+                ClosureRoot {
+                    name: "cli".to_string(),
+                    constraint: "= 3.6.5".to_string(),
+                },
+                ClosureRoot {
+                    name: "digest".to_string(),
+                    constraint: ">= 0.6.37, < 1.0.0".to_string(),
+                },
+            ]
+        );
     }
 }

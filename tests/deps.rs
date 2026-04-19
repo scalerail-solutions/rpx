@@ -75,7 +75,9 @@ fn runs_rpx_add_inside_custom_r_image() {
 
     let description = read_project_file(&container, project_path, "DESCRIPTION");
     assert!(
-        description.contains("Imports: digest"),
+        description.contains("Imports:\n    digest")
+            || (description.contains("Imports:\n    digest (>=")
+                && description.contains("digest (<<")),
         "DESCRIPTION was: {description}"
     );
 }
@@ -135,7 +137,7 @@ Imports: digest",
         "lockfile was: {lockfile}"
     );
     assert!(
-        lockfile.contains("https://cran.r-project.org/src/contrib/"),
+        lockfile.contains("https://api.rrepo.org/packages/digest/versions/"),
         "lockfile was: {lockfile}"
     );
 }
@@ -163,7 +165,7 @@ Depends: R (>= 4.3), digest",
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
     let description = read_project_file(&container, project_path, "DESCRIPTION");
     assert!(
-        description.contains("Depends: R (>= 4.3), digest"),
+        description.contains("Depends:\n    R (>= 4.3),\n    digest"),
         "DESCRIPTION was: {description}"
     );
     assert!(
@@ -200,7 +202,7 @@ Depends: R (>= 4.3), digest",
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
     let description = read_project_file(&container, project_path, "DESCRIPTION");
     assert!(
-        description.contains("Depends: R (>= 4.3)"),
+        description.contains("Depends:\n    R (>= 4.3)"),
         "DESCRIPTION was: {description}"
     );
     assert!(
