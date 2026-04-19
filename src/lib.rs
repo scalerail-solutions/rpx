@@ -614,12 +614,12 @@ mod tests {
         let lockfile = lockfile_from_resolution(
             vec![
                 ClosureRoot {
-                    name: "cli".to_string(),
-                    constraint: "= 3.6.5".to_string(),
-                },
-                ClosureRoot {
                     name: "digest".to_string(),
                     constraint: "*".to_string(),
+                },
+                ClosureRoot {
+                    name: "cli".to_string(),
+                    constraint: "= 3.6.5".to_string(),
                 },
             ],
             "https://api.rrepo.org",
@@ -633,6 +633,16 @@ mod tests {
                         package: "R".to_string(),
                         kind: "Depends".to_string(),
                         min_version: Some("4.3".to_string()),
+                        max_version_exclusive: None,
+                    }, ResolvedDependency {
+                        package: "utils".to_string(),
+                        kind: "Imports".to_string(),
+                        min_version: None,
+                        max_version_exclusive: None,
+                    }, ResolvedDependency {
+                        package: "base".to_string(),
+                        kind: "Depends".to_string(),
+                        min_version: None,
                         max_version_exclusive: None,
                     }],
                 },
@@ -648,9 +658,32 @@ mod tests {
 
         assert_eq!(lockfile.registry, "https://api.rrepo.org");
         assert_eq!(lockfile.version, 1);
-        assert_eq!(lockfile.roots[0].constraint, "= 3.6.5");
+        assert_eq!(lockfile.roots[0].package, "digest");
+        assert_eq!(lockfile.roots[1].package, "cli");
         assert_eq!(lockfile.packages["cli"].source.as_deref(), Some("registry"));
-        assert_eq!(lockfile.packages["cli"].dependencies.len(), 1);
+        assert_eq!(
+            lockfile.packages["cli"].dependencies,
+            vec![
+                LockedDependency {
+                    package: "R".to_string(),
+                    kind: "Depends".to_string(),
+                    min_version: Some("4.3".to_string()),
+                    max_version_exclusive: None,
+                },
+                LockedDependency {
+                    package: "utils".to_string(),
+                    kind: "Imports".to_string(),
+                    min_version: None,
+                    max_version_exclusive: None,
+                },
+                LockedDependency {
+                    package: "base".to_string(),
+                    kind: "Depends".to_string(),
+                    min_version: None,
+                    max_version_exclusive: None,
+                },
+            ]
+        );
         assert_eq!(
             lockfile.packages["digest"].source_url.as_deref(),
             Some("https://api.rrepo.org/packages/digest/versions/0.6.37/source")
