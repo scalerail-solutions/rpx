@@ -65,7 +65,7 @@ fn runs_rpx_add_inside_custom_r_image() {
         "lockfile was: {lockfile}"
     );
     assert!(
-        lockfile.contains("\"requirements\""),
+        lockfile.contains("\"roots\""),
         "lockfile was: {lockfile}"
     );
     assert!(
@@ -165,7 +165,7 @@ Depends: R (>= 4.3), digest",
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
     let description = read_project_file(&container, project_path, "DESCRIPTION");
     assert!(
-        description.contains("Depends:\n    R (>= 4.3),\n    digest"),
+        description.contains("Depends:\n    digest,\n    R (>= 4.3)"),
         "DESCRIPTION was: {description}"
     );
     assert!(

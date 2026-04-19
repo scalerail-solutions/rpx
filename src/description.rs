@@ -210,13 +210,45 @@ fn format_description_line(line: &str) -> String {
     let entries = value
         .split(", ")
         .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
         .collect::<Vec<_>>();
 
     if entries.is_empty() {
         return line.to_string();
     }
 
+    let mut entries = entries;
+    entries.sort_by(|left, right| compare_dependency_entries(left, right));
+
     format!("{field}:\n    {}", entries.join(",\n    "))
+}
+
+fn compare_dependency_entries(left: &str, right: &str) -> std::cmp::Ordering {
+    dependency_entry_name(left)
+        .to_ascii_lowercase()
+        .cmp(&dependency_entry_name(right).to_ascii_lowercase())
+        .then_with(|| dependency_entry_name(left).cmp(dependency_entry_name(right)))
+        .then_with(|| dependency_entry_operator_rank(left).cmp(&dependency_entry_operator_rank(right)))
+        .then_with(|| left.cmp(right))
+}
+
+fn dependency_entry_name(entry: &str) -> &str {
+    entry.split_once(" (").map(|(name, _)| name).unwrap_or(entry)
+}
+
+fn dependency_entry_operator_rank(entry: &str) -> u8 {
+    let Some((_, rest)) = entry.split_once(" (") else {
+        return 0;
+    };
+    let operator = rest.trim_end_matches(')').split_whitespace().next().unwrap_or("");
+    match operator {
+        ">=" => 1,
+        ">>" => 2,
+        "=" => 3,
+        "<=" => 4,
+        "<<" => 5,
+        _ => 6,
+    }
 }
 
 fn relation_with_constraint(package: &str, constraint: &str) -> Relation {
@@ -451,7 +483,7 @@ mod tests {
         let formatted = format_description_for_write(&description);
 
         assert!(formatted.contains("Imports:\n    cli (>= 3.6.0),\n    digest"));
-        assert!(formatted.contains("Depends:\n    R (>= 4.3),\n    jsonlite"));
+        assert!(formatted.contains("Depends:\n    jsonlite,\n    R (>= 4.3)"));
     }
 
     #[test]
@@ -469,6 +501,19 @@ mod tests {
         let formatted = format_description_for_write(&description);
 
         assert!(formatted.contains("Imports:\n    dplyr (>= 1.1.4),\n    dplyr (<< 2.0.0)"));
+    }
+
+    #[test]
+    fn sorts_dependency_entries_within_each_field() {
+        let description = RDescription::from_str(
+            "Package: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\nImports: jsonlite, AzureAuth, cli\nDepends: zlib, R (>= 4.3), base\n",
+        )
+        .expect("description should parse");
+
+        let formatted = format_description_for_write(&description);
+
+        assert!(formatted.contains("Imports:\n    AzureAuth,\n    cli,\n    jsonlite"));
+        assert!(formatted.contains("Depends:\n    base,\n    R (>= 4.3),\n    zlib"));
     }
 
     #[test]
