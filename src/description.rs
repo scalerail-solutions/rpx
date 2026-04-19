@@ -33,7 +33,7 @@ pub fn read_description() -> Result<ProjectDescription, String> {
 }
 
 pub fn write_description(project: &ProjectDescription) {
-    let mut contents = format!("{}", project.description).trim_end().to_string();
+    let mut contents = format_description_for_write(&project.description);
     contents.push('\n');
     fs::write(description_path(), contents).expect("failed to write DESCRIPTION");
 }
@@ -49,9 +49,7 @@ pub fn init_description() -> Result<String, String> {
         description: initial_description(&package_name),
     };
 
-    let mut contents = format!("{}", description.description)
-        .trim_end()
-        .to_string();
+    let mut contents = format_description_for_write(&description.description);
     contents.push('\n');
     fs::write(&path, contents).map_err(|error| error.to_string())?;
 
@@ -181,6 +179,44 @@ impl DescriptionExt for RDescription {
 
         requirements.into_iter().collect()
     }
+}
+
+fn format_description_for_write(description: &RDescription) -> String {
+    format!("{description}")
+        .trim_end()
+        .lines()
+        .map(format_description_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_description_line(line: &str) -> String {
+    const MULTILINE_RELATION_FIELDS: &[&str] =
+        &["Imports", "Depends", "Suggests", "Enhances", "LinkingTo"];
+
+    let Some((field, value)) = line.split_once(':') else {
+        return line.to_string();
+    };
+
+    if !MULTILINE_RELATION_FIELDS.contains(&field) {
+        return line.to_string();
+    }
+
+    let value = value.trim();
+    if value.is_empty() {
+        return line.to_string();
+    }
+
+    let entries = value
+        .split(", ")
+        .filter(|entry| !entry.is_empty())
+        .collect::<Vec<_>>();
+
+    if entries.is_empty() {
+        return line.to_string();
+    }
+
+    format!("{field}:\n    {}", entries.join(",\n    "))
 }
 
 fn relation_with_constraint(package: &str, constraint: &str) -> Relation {
@@ -318,8 +354,8 @@ fn title_from_package_name(package_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DescriptionExt, parse_constraint, relation_with_constraint, sanitize_package_name,
-        title_from_package_name,
+        DescriptionExt, format_description_for_write, parse_constraint, relation_with_constraint,
+        sanitize_package_name, title_from_package_name,
     };
     use r_description::{VersionConstraint, lossy::RDescription};
     use std::str::FromStr;
@@ -392,5 +428,35 @@ mod tests {
             relation_with_constraint("dplyr", "< 2.0.0").to_string(),
             "dplyr (<< 2.0.0)"
         );
+    }
+
+    #[test]
+    fn formats_relationship_fields_as_multiline() {
+        let description = RDescription::from_str(
+            "Package: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\nImports: cli (>= 3.6.0), digest\nDepends: R (>= 4.3), jsonlite\n",
+        )
+        .expect("description should parse");
+
+        let formatted = format_description_for_write(&description);
+
+        assert!(formatted.contains("Imports:\n    cli (>= 3.6.0),\n    digest"));
+        assert!(formatted.contains("Depends:\n    R (>= 4.3),\n    jsonlite"));
+    }
+
+    #[test]
+    fn formats_bounded_dependencies_one_per_line() {
+        let mut description = RDescription::from_str(
+            "Package: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\n",
+        )
+        .expect("description should parse");
+
+        description.add_to_imports_with_constraints(
+            "dplyr",
+            &[">= 1.1.4".to_string(), "< 2.0.0".to_string()],
+        );
+
+        let formatted = format_description_for_write(&description);
+
+        assert!(formatted.contains("Imports:\n    dplyr (>= 1.1.4),\n    dplyr (<< 2.0.0)"));
     }
 }
