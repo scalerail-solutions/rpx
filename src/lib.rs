@@ -44,7 +44,7 @@ fn cmd_init() {
 
 fn cmd_add(package: &str) {
     if lockfile_path().exists() {
-        sync_from_lockfile();
+        let _ = sync_from_lockfile();
     }
 
     let mut project = read_description().expect("failed to read DESCRIPTION");
@@ -54,7 +54,8 @@ fn cmd_add(package: &str) {
         project.description.add_to_imports(package);
         write_description(&project);
         lock_from_description();
-        sync_from_lockfile();
+        let _ = sync_from_lockfile();
+        println!("Added {package}");
         return;
     }
 
@@ -72,28 +73,31 @@ fn cmd_add(package: &str) {
         client.base_url(),
         &resolved_addition.resolved,
     ));
-    sync_from_lockfile();
+    let _ = sync_from_lockfile();
+    println!("Added {package}");
 }
 
 fn cmd_remove(package: &str) {
-    if lockfile_path().exists() {
-        sync_from_lockfile();
-    }
-
     let mut project = read_description().expect("failed to read DESCRIPTION");
     project.description.remove_from_field("Imports", package);
     project.description.remove_from_field("Depends", package);
     write_description(&project);
 
-    let status = project_command("Rscript")
-        .arg("-e")
-        .arg(format!("remove.packages('{package}')"))
-        .status()
-        .expect("failed to run Rscript");
+    let was_installed = installed_packages_by_name().contains_key(package);
+    if was_installed {
+        remove_installed_packages(&[package.to_string()]);
+    } else {
+        remove_installed_package_dir(package);
+    }
 
-    exit_with_status(status.code());
-    remove_installed_package_dir(package);
     lock_from_description();
+    let _ = sync_from_lockfile();
+
+    if was_installed {
+        println!("Removed {package}");
+    } else {
+        println!("{package} is already missing from the project library");
+    }
 }
 
 fn cmd_run(command: &[String]) {
@@ -110,19 +114,29 @@ fn cmd_run(command: &[String]) {
 }
 
 fn cmd_lock() {
-    lock_from_description();
+    let outcome = lock_from_description();
+    if outcome.changed {
+        println!("Updated rpx.lock");
+    } else {
+        println!("rpx.lock is already up to date");
+    }
 }
 
 fn cmd_sync() {
-    sync_from_lockfile();
+    let outcome = sync_from_lockfile();
+    if outcome.installed == 0 && outcome.removed == 0 {
+        println!("Project library is already in sync");
+    } else {
+        println!("Synchronized project library");
+    }
 }
 
 fn cmd_status() {
     let project = match read_description() {
         Ok(description) => description,
         Err(error) => {
-            eprintln!("Status: drift");
-            eprintln!("Description: {error}");
+            eprintln!("Could not read DESCRIPTION");
+            eprintln!("{error}");
             std::process::exit(1);
         }
     };
@@ -130,8 +144,9 @@ fn cmd_status() {
     let lockfile = match read_lockfile() {
         Ok(lockfile) => lockfile,
         Err(error) => {
-            eprintln!("Status: drift");
-            eprintln!("Lockfile: {error}");
+            eprintln!("Lockfile is missing or unreadable");
+            eprintln!("Run: rpx lock");
+            eprintln!("{error}");
             std::process::exit(1);
         }
     };
@@ -189,54 +204,80 @@ fn cmd_status() {
         })
         .collect::<Vec<_>>();
 
-    println!("Manifest requirements: {}", manifest_requirements.len());
-    println!("Locked roots: {}", lockfile.roots.len());
-    println!("Locked registry: {}", lockfile.registry);
-    println!("Locked packages: {}", lockfile.packages.len());
-    println!("Installed packages: {}", installed.len());
-
     if missing_from_lockfile.is_empty()
         && extra_in_lockfile.is_empty()
         && missing_from_library.is_empty()
         && extra_in_library.is_empty()
         && version_mismatches.is_empty()
     {
-        println!("Status: ok");
+        println!("Project is in sync");
         return;
     }
 
-    println!("Status: drift");
+    let lockfile_out_of_date = !missing_from_lockfile.is_empty() || !extra_in_lockfile.is_empty();
+    let library_out_of_date = !missing_from_library.is_empty()
+        || !extra_in_library.is_empty()
+        || !version_mismatches.is_empty();
 
-    if !missing_from_lockfile.is_empty() {
-        println!(
-            "Missing from lockfile: {}",
-            missing_from_lockfile.join(", ")
-        );
+    if lockfile_out_of_date && library_out_of_date {
+        println!("Project is out of sync");
+        println!();
+        println!("Run: rpx lock && rpx sync");
+    } else if lockfile_out_of_date {
+        println!("Lockfile is out of date");
+        println!();
+        println!("Run: rpx lock");
+    } else {
+        println!("Project library is out of sync");
+        println!();
+        println!("Run: rpx sync");
     }
 
-    if !extra_in_lockfile.is_empty() {
-        println!("Extra in lockfile: {}", extra_in_lockfile.join(", "));
-    }
-
-    if !missing_from_library.is_empty() {
-        println!("Missing from library: {}", missing_from_library.join(", "));
-    }
-
-    if !extra_in_library.is_empty() {
-        println!("Extra in library: {}", extra_in_library.join(", "));
-    }
-
-    if !version_mismatches.is_empty() {
-        println!("Version mismatch: {}", version_mismatches.join(", "));
-    }
+    print_status_group(
+        "Packages in DESCRIPTION but not locked:",
+        &missing_from_lockfile,
+    );
+    print_status_group(
+        "Packages locked but no longer in DESCRIPTION:",
+        &extra_in_lockfile,
+    );
+    print_status_group("Packages locked but not installed:", &missing_from_library);
+    print_status_group("Packages installed but not locked:", &extra_in_library);
+    print_status_group(
+        "Installed versions that differ from rpx.lock:",
+        &version_mismatches,
+    );
 
     std::process::exit(1);
+}
+
+fn print_status_group(title: &str, items: &[String]) {
+    if items.is_empty() {
+        return;
+    }
+
+    println!();
+    println!("{title}");
+    for item in items {
+        println!("- {item}");
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct AddResolution {
     constraints: Vec<String>,
     resolved: Vec<ResolvedPackage>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LockOutcome {
+    changed: bool,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SyncOutcome {
+    installed: usize,
+    removed: usize,
 }
 
 fn resolve_addition_from_latest(
@@ -371,14 +412,17 @@ fn persisted_constraints(constraint: &str) -> Vec<String> {
         .collect()
 }
 
-fn lock_from_description() {
+fn lock_from_description() -> LockOutcome {
     let project = read_description().expect("failed to read DESCRIPTION");
     let roots = project.description.closure_roots();
     let registry = registry_base_url();
+    let existing_lockfile = read_lockfile_optional().expect("failed to read lockfile");
 
     if roots.is_empty() {
-        write_lockfile(lockfile_from_resolution(vec![], &registry, &[]));
-        return;
+        let lockfile = lockfile_from_resolution(vec![], &registry, &[]);
+        let changed = existing_lockfile.as_ref() != Some(&lockfile);
+        write_lockfile(lockfile);
+        return LockOutcome { changed };
     }
 
     let request = ClosureRequest { roots: roots.clone() };
@@ -389,14 +433,17 @@ fn lock_from_description() {
     let resolved = resolve_from_closure(&request, &registry::ClosureResponse::Complete(closure))
         .unwrap_or_else(|error| panic!("failed to resolve package set from closure: {error}"));
 
-    write_lockfile(lockfile_from_resolution(
+    let lockfile = lockfile_from_resolution(
         roots,
         client.base_url(),
         &resolved,
-    ));
+    );
+    let changed = existing_lockfile.as_ref() != Some(&lockfile);
+    write_lockfile(lockfile);
+    LockOutcome { changed }
 }
 
-fn sync_from_lockfile() {
+fn sync_from_lockfile() -> SyncOutcome {
     let project = read_description().expect("failed to read DESCRIPTION");
     let manifest_requirements = project
         .description
@@ -434,6 +481,7 @@ fn sync_from_lockfile() {
 
     let client = RegistryClient::new(&lockfile.registry);
     let mut ui = SyncUi::new(exact_reinstalls.len());
+    let mut outcome = SyncOutcome::default();
 
     for (index, (name, version, source_url)) in exact_reinstalls.iter().enumerate() {
         let source_url = source_url
@@ -453,6 +501,7 @@ fn sync_from_lockfile() {
             std::process::exit(error.exit_code.unwrap_or(1));
         }
         ui.finish_install(name, version);
+        outcome.installed += 1;
     }
 
     ui.finish();
@@ -461,6 +510,7 @@ fn sync_from_lockfile() {
         .into_keys()
         .filter(|name| !lockfile.packages.contains_key(name))
         .collect::<Vec<_>>();
+    outcome.removed = extras.len();
     remove_installed_packages(&extras);
 
     let final_state = installed_packages_by_name();
@@ -492,7 +542,7 @@ fn sync_from_lockfile() {
         .collect::<Vec<_>>();
 
     if missing.is_empty() && extras.is_empty() && version_mismatches.is_empty() {
-        return;
+        return outcome;
     }
 
     if !missing.is_empty() {
