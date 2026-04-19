@@ -597,16 +597,12 @@ mod tests {
                     version: "3.6.5".to_string(),
                     source_url: "https://api.rrepo.org/packages/cli/versions/3.6.5/source"
                         .to_string(),
-                    source_tarball_key: "src/cli_3.6.5.tar.gz".to_string(),
-                    description_key: "desc/cli_3.6.5".to_string(),
                 },
                 ResolvedPackage {
                     name: "digest".to_string(),
                     version: "0.6.37".to_string(),
                     source_url: "https://api.rrepo.org/packages/digest/versions/0.6.37/source"
                         .to_string(),
-                    source_tarball_key: "src/digest_0.6.37.tar.gz".to_string(),
-                    description_key: "desc/digest_0.6.37".to_string(),
                 },
             ],
         );

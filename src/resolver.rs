@@ -7,8 +7,6 @@ pub struct ResolvedPackage {
     pub name: String,
     pub version: String,
     pub source_url: String,
-    pub source_tarball_key: String,
-    pub description_key: String,
 }
 
 pub fn resolve_from_closure(
@@ -47,8 +45,6 @@ pub fn resolve_from_closure(
             name: resolved.package_name,
             version: resolved.version.version.clone(),
             source_url: resolved.version.source_url.clone(),
-            source_tarball_key: resolved.version.source_tarball_key.clone(),
-            description_key: resolved.version.description_key.clone(),
         })
         .collect())
 }
@@ -149,12 +145,7 @@ fn add_dependency_constraints(
         constraints
             .entry(dependency.dependency_name.clone())
             .or_default()
-            .push(
-                dependency
-                    .constraint_raw
-                    .clone()
-                    .unwrap_or_else(|| "*".to_string()),
-            );
+            .push(constraint_from_dependency(dependency));
 
         if let Some(assigned) = assignments.get(&dependency.dependency_name) {
             let dependency_constraints = constraints
@@ -170,6 +161,20 @@ fn add_dependency_constraints(
     }
 
     true
+}
+
+fn constraint_from_dependency(dependency: &crate::registry::ClosureDependency) -> String {
+    match (
+        dependency.min_version.as_ref(),
+        dependency.max_version_exclusive.as_ref(),
+    ) {
+        (None, None) => "*".to_string(),
+        (Some(min_version), None) => format!(">= {min_version}"),
+        (None, Some(max_version_exclusive)) => format!("< {max_version_exclusive}"),
+        (Some(min_version), Some(max_version_exclusive)) => {
+            format!(">= {min_version}, < {max_version_exclusive}")
+        }
+    }
 }
 
 fn version_satisfies_all(version: &str, constraints: &[String]) -> bool {
@@ -309,6 +314,7 @@ enum VersionPart<'a> {
 mod tests {
     use crate::registry::{
         ClosureDependency, ClosureRoot, CompleteClosureResponse, IngestingResponse,
+        RegistryVersion,
     };
 
     use super::*;
@@ -475,17 +481,52 @@ mod tests {
         ClosureVersion {
             version: version.to_string(),
             source_url: format!("https://api.rrepo.org/packages/pkg/versions/{version}/source"),
-            source_tarball_key: format!("src/pkg_{version}.tar.gz"),
-            description_key: format!("desc/pkg_{version}"),
             dependencies,
         }
     }
 
     fn dependency(name: &str, kind: &str, constraint: &str) -> ClosureDependency {
+        let (min_version, max_version_exclusive) = dependency_bounds(constraint);
+
         ClosureDependency {
             dependency_name: name.to_string(),
             dependency_kind: kind.to_string(),
-            constraint_raw: Some(constraint.to_string()),
+            min_version,
+            max_version_exclusive,
+        }
+    }
+
+    fn dependency_bounds(constraint: &str) -> (Option<RegistryVersion>, Option<RegistryVersion>) {
+        let mut min_version = None;
+        let mut max_version_exclusive = None;
+
+        for part in constraint.split(',').map(str::trim).filter(|part| !part.is_empty()) {
+            if let Some(version) = part.strip_prefix(">=") {
+                min_version = Some(registry_version(version.trim()));
+            } else if let Some(version) = part.strip_prefix("<<") {
+                max_version_exclusive = Some(registry_version(version.trim()));
+            } else if let Some(version) = part.strip_prefix('<') {
+                max_version_exclusive = Some(registry_version(version.trim()));
+            }
+        }
+
+        (min_version, max_version_exclusive)
+    }
+
+    fn registry_version(version: &str) -> RegistryVersion {
+        let mut parts = version
+            .split('.')
+            .map(|part| part.parse::<u64>().expect("version part should parse"))
+            .collect::<Vec<_>>();
+        while parts.len() < 4 {
+            parts.push(0);
+        }
+
+        RegistryVersion {
+            major: parts[0],
+            minor: parts[1],
+            patch: parts[2],
+            build: parts[3],
         }
     }
 

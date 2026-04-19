@@ -49,10 +49,6 @@ pub struct ClosureVersion {
     pub version: String,
     #[serde(rename = "sourceUrl")]
     pub source_url: String,
-    #[serde(rename = "sourceTarballKey")]
-    pub source_tarball_key: String,
-    #[serde(rename = "descriptionKey")]
-    pub description_key: String,
     pub dependencies: Vec<ClosureDependency>,
 }
 
@@ -62,8 +58,32 @@ pub struct ClosureDependency {
     pub dependency_name: String,
     #[serde(rename = "dependencyKind")]
     pub dependency_kind: String,
-    #[serde(rename = "constraintRaw")]
-    pub constraint_raw: Option<String>,
+    #[serde(rename = "minVersion")]
+    pub min_version: Option<RegistryVersion>,
+    #[serde(rename = "maxVersionExclusive")]
+    pub max_version_exclusive: Option<RegistryVersion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegistryVersion {
+    pub major: u64,
+    pub minor: u64,
+    pub patch: u64,
+    pub build: u64,
+}
+
+impl std::fmt::Display for RegistryVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.build != 0 {
+            return write!(f, "{}.{}.{}.{}", self.major, self.minor, self.patch, self.build);
+        }
+
+        if self.patch != 0 {
+            return write!(f, "{}.{}.{}", self.major, self.minor, self.patch);
+        }
+
+        write!(f, "{}.{}", self.major, self.minor)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -417,13 +437,12 @@ mod tests {
         {
           "version": "1.1.4",
           "sourceUrl": "https://api.rrepo.org/packages/dplyr/versions/1.1.4/source",
-          "sourceTarballKey": "src/dplyr_1.1.4.tar.gz",
-          "descriptionKey": "desc/dplyr_1.1.4",
           "dependencies": [
             {
               "dependencyName": "rlang",
               "dependencyKind": "Imports",
-              "constraintRaw": ">= 1.1.0"
+              "minVersion": { "major": 1, "minor": 1, "patch": 0, "build": 0 },
+              "maxVersionExclusive": null
             }
           ]
         }
