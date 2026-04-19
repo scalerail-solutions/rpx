@@ -308,8 +308,7 @@ enum VersionPart<'a> {
 #[cfg(test)]
 mod tests {
     use crate::registry::{
-        ClosureDependency, ClosureRoot, CompleteClosureResponse, IngestingClosureResponse,
-        PackageIngestionStatus, WorkflowStatus,
+        ClosureDependency, ClosureRoot, CompleteClosureResponse, IngestingResponse,
     };
 
     use super::*;
@@ -413,17 +412,7 @@ mod tests {
     #[test]
     fn rejects_ingesting_closure_responses() {
         let request = closure_request(vec![root("dplyr", "*")]);
-        let response = ClosureResponse::Ingesting(IngestingClosureResponse {
-            roots: vec![root("dplyr", "*")],
-            statuses: vec![PackageIngestionStatus {
-                package_name: "dplyr".to_string(),
-                workflow_id: "pkg-dplyr".to_string(),
-                status: WorkflowStatus {
-                    status: "running".to_string(),
-                    error: None,
-                },
-            }],
-        });
+        let response = ClosureResponse::Ingesting(IngestingResponse {});
 
         let error = resolve_from_closure(&request, &response).expect_err("resolution should fail");
 

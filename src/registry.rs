@@ -24,7 +24,7 @@ pub struct ClosureRoot {
 #[serde(tag = "status", rename_all = "lowercase")]
 pub enum ClosureResponse {
     Complete(CompleteClosureResponse),
-    Ingesting(IngestingClosureResponse),
+    Ingesting(IngestingResponse),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -36,25 +36,7 @@ pub struct CompleteClosureResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct IngestingClosureResponse {
-    pub roots: Vec<ClosureRoot>,
-    pub statuses: Vec<PackageIngestionStatus>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PackageIngestionStatus {
-    #[serde(rename = "packageName")]
-    pub package_name: String,
-    #[serde(rename = "workflowId")]
-    pub workflow_id: String,
-    pub status: WorkflowStatus,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WorkflowStatus {
-    pub status: String,
-    pub error: Option<String>,
-}
+pub struct IngestingResponse {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClosurePackage {
@@ -103,6 +85,20 @@ pub struct VersionSummary {
     pub version: String,
     #[serde(rename = "sourceUrl")]
     pub source_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+enum LatestVersionEnvelope {
+    Complete(LatestVersionResponse),
+    Ingesting(ClosureResponse),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+enum PackageVersionsEnvelope {
+    Complete(PackageVersionsResponse),
+    Ingesting(ClosureResponse),
 }
 
 #[derive(Debug, Clone)]
@@ -210,7 +206,36 @@ impl RegistryClient {
         Err(unexpected_response_message(response))
     }
 
+    #[allow(dead_code)]
     pub fn fetch_latest_version(&self, package: &str) -> Result<LatestVersionResponse, String> {
+        match self.fetch_latest_version_once(package)? {
+            LatestVersionEnvelope::Complete(response) => Ok(response),
+            LatestVersionEnvelope::Ingesting(_) => {
+                Err("registry is still hydrating dependencies; wait a bit and retry".to_string())
+            }
+        }
+    }
+
+    pub fn fetch_latest_version_with_retry(
+        &self,
+        package: &str,
+    ) -> Result<LatestVersionResponse, String> {
+        for (attempt, delay) in self.poll_config.delays.iter().enumerate() {
+            match self.fetch_latest_version_once(package)? {
+                LatestVersionEnvelope::Complete(response) => return Ok(response),
+                LatestVersionEnvelope::Ingesting(_) => {
+                    if attempt == self.poll_config.delays.len() - 1 {
+                        break;
+                    }
+                    thread::sleep(*delay);
+                }
+            }
+        }
+
+        Err("registry is still hydrating dependencies; wait a bit and retry".to_string())
+    }
+
+    fn fetch_latest_version_once(&self, package: &str) -> Result<LatestVersionEnvelope, String> {
         let response = self
             .client
             .get(format!("{}/packages/{package}/versions/latest", self.base_url))
@@ -222,6 +247,35 @@ impl RegistryClient {
 
     #[allow(dead_code)]
     pub fn fetch_package_versions(&self, package: &str) -> Result<PackageVersionsResponse, String> {
+        match self.fetch_package_versions_once(package)? {
+            PackageVersionsEnvelope::Complete(response) => Ok(response),
+            PackageVersionsEnvelope::Ingesting(_) => {
+                Err("registry is still hydrating dependencies; wait a bit and retry".to_string())
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn fetch_package_versions_with_retry(
+        &self,
+        package: &str,
+    ) -> Result<PackageVersionsResponse, String> {
+        for (attempt, delay) in self.poll_config.delays.iter().enumerate() {
+            match self.fetch_package_versions_once(package)? {
+                PackageVersionsEnvelope::Complete(response) => return Ok(response),
+                PackageVersionsEnvelope::Ingesting(_) => {
+                    if attempt == self.poll_config.delays.len() - 1 {
+                        break;
+                    }
+                    thread::sleep(*delay);
+                }
+            }
+        }
+
+        Err("registry is still hydrating dependencies; wait a bit and retry".to_string())
+    }
+
+    fn fetch_package_versions_once(&self, package: &str) -> Result<PackageVersionsEnvelope, String> {
         let response = self
             .client
             .get(format!("{}/packages/{package}/versions", self.base_url))
@@ -381,20 +435,7 @@ mod tests {
 
     fn sample_ingesting_body() -> &'static str {
         r#"{
-  "status": "ingesting",
-  "roots": [
-    { "name": "dplyr", "constraint": "*" }
-  ],
-  "statuses": [
-    {
-      "packageName": "dplyr",
-      "workflowId": "pkg-dplyr",
-      "status": {
-        "status": "running",
-        "error": null
-      }
-    }
-  ]
+  "status": "ingesting"
 }"#
     }
 
@@ -466,6 +507,36 @@ mod tests {
     }
 
     #[test]
+    fn polls_until_latest_version_is_ready() {
+        let mut server = Server::new();
+        let _first = server
+            .mock("GET", "/packages/dplyr/versions/latest")
+            .with_status(202)
+            .with_header("content-type", "application/json")
+            .with_body(sample_ingesting_body())
+            .expect(1)
+            .create();
+        let second = server
+            .mock("GET", "/packages/dplyr/versions/latest")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(sample_latest_version_body())
+            .expect(1)
+            .create();
+
+        let client = RegistryClient::with_poll_config(
+            server.url(),
+            PollConfig::from_delays(vec![Duration::ZERO, Duration::ZERO, Duration::ZERO]),
+        );
+        let response = client
+            .fetch_latest_version_with_retry("dplyr")
+            .expect("latest version fetch should succeed");
+
+        second.assert();
+        assert_eq!(response.version, "1.1.4");
+    }
+
+    #[test]
     fn fetches_all_package_versions() {
         let mut server = Server::new();
         let mock = server
@@ -484,6 +555,36 @@ mod tests {
         assert_eq!(response.package, "dplyr");
         assert_eq!(response.versions.len(), 2);
         assert_eq!(response.versions[1].version, "1.1.3");
+    }
+
+    #[test]
+    fn polls_until_package_versions_are_ready() {
+        let mut server = Server::new();
+        let _first = server
+            .mock("GET", "/packages/dplyr/versions")
+            .with_status(202)
+            .with_header("content-type", "application/json")
+            .with_body(sample_ingesting_body())
+            .expect(1)
+            .create();
+        let second = server
+            .mock("GET", "/packages/dplyr/versions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(sample_package_versions_body())
+            .expect(1)
+            .create();
+
+        let client = RegistryClient::with_poll_config(
+            server.url(),
+            PollConfig::from_delays(vec![Duration::ZERO, Duration::ZERO, Duration::ZERO]),
+        );
+        let response = client
+            .fetch_package_versions_with_retry("dplyr")
+            .expect("package versions fetch should succeed");
+
+        second.assert();
+        assert_eq!(response.versions.len(), 2);
     }
 
     #[test]
@@ -572,6 +673,32 @@ mod tests {
         let error = client
             .fetch_closure_with_retry(&sample_request())
             .expect_err("closure fetch should time out");
+
+        mock.assert();
+        assert_eq!(
+            error,
+            "registry is still hydrating dependencies; wait a bit and retry"
+        );
+    }
+
+    #[test]
+    fn returns_friendly_error_when_latest_version_keeps_ingesting() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/packages/dplyr/versions/latest")
+            .with_status(202)
+            .with_header("content-type", "application/json")
+            .with_body(sample_ingesting_body())
+            .expect(3)
+            .create();
+
+        let client = RegistryClient::with_poll_config(
+            server.url(),
+            PollConfig::from_delays(vec![Duration::ZERO, Duration::ZERO, Duration::ZERO]),
+        );
+        let error = client
+            .fetch_latest_version_with_retry("dplyr")
+            .expect_err("latest version fetch should time out");
 
         mock.assert();
         assert_eq!(

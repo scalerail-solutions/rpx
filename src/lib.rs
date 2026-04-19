@@ -244,7 +244,7 @@ fn resolve_addition_from_latest(
     package: &str,
     client: &RegistryClient,
 ) -> Result<AddResolution, String> {
-    let latest = client.fetch_latest_version(package)?;
+    let latest = client.fetch_latest_version_with_retry(package)?;
     let constraints = semver_add_constraints(&latest.version)?;
 
     for constraint in constraints {
