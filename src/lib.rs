@@ -416,16 +416,19 @@ fn sync_from_lockfile() {
     }
 
     let installed = installed_packages_by_name();
-    let exact_reinstalls = lockfile
-        .packages
-        .iter()
-        .filter_map(|(name, package)| match installed.get(name) {
-            Some(installed_package) if installed_package.version == package.version => None,
-            _ => Some((
-                name.clone(),
-                package.version.clone(),
-                package.source_url.clone(),
-            )),
+    let install_order = locked_install_order(&lockfile)
+        .unwrap_or_else(|error| panic!("failed to compute install order from lockfile: {error}"));
+    let exact_reinstalls = install_order
+        .into_iter()
+        .filter_map(|name| {
+            let package = lockfile
+                .packages
+                .get(&name)
+                .expect("ordered package should exist in lockfile");
+            match installed.get(&name) {
+                Some(installed_package) if installed_package.version == package.version => None,
+                _ => Some((name, package.version.clone(), package.source_url.clone())),
+            }
         })
         .collect::<Vec<_>>();
 
@@ -444,7 +447,7 @@ fn sync_from_lockfile() {
             .unwrap_or_else(|error| panic!("failed to download source artifact: {error}"));
         ui.finish_download(name, version);
         ui.start_install(index + 1, name, version);
-        if let Err(error) = install_downloaded_artifact(artifact) {
+        if let Err(error) = install_downloaded_artifact(name, version, artifact) {
             ui.fail_install(name, version);
             report_install_failure(name, version, &error);
             std::process::exit(error.exit_code.unwrap_or(1));
@@ -572,10 +575,86 @@ fn registry_source_url(registry: &str, package: &str, version: &str) -> String {
     )
 }
 
-fn install_downloaded_artifact(artifact: DownloadedArtifact) -> Result<(), InstallFailure> {
-    let result = install_source_package(artifact.path());
+fn install_downloaded_artifact(
+    package: &str,
+    version: &str,
+    artifact: DownloadedArtifact,
+) -> Result<(), InstallFailure> {
+    let result = install_source_package(artifact.path(), package, version);
     artifact.cleanup();
     result
+}
+
+fn locked_install_order(lockfile: &Lockfile) -> Result<Vec<String>, String> {
+    let mut indegree = lockfile
+        .packages
+        .keys()
+        .map(|name| (name.clone(), 0_usize))
+        .collect::<BTreeMap<_, _>>();
+    let mut dependents = lockfile
+        .packages
+        .keys()
+        .map(|name| (name.clone(), BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+
+    for (name, package) in &lockfile.packages {
+        let internal_dependencies = package
+            .dependencies
+            .iter()
+            .filter(|dependency| lockfile.packages.contains_key(&dependency.package))
+            .map(|dependency| dependency.package.clone())
+            .collect::<BTreeSet<_>>();
+
+        *indegree
+            .get_mut(name)
+            .expect("lockfile package should have indegree") += internal_dependencies.len();
+
+        for dependency in internal_dependencies {
+            dependents
+                .get_mut(&dependency)
+                .expect("lockfile dependency should exist")
+                .insert(name.clone());
+        }
+    }
+
+    let mut ready = indegree
+        .iter()
+        .filter(|(_, count)| **count == 0)
+        .map(|(name, _)| name.clone())
+        .collect::<BTreeSet<_>>();
+    let mut ordered = Vec::with_capacity(lockfile.packages.len());
+
+    while let Some(name) = ready.pop_first() {
+        ordered.push(name.clone());
+
+        for dependent in dependents
+            .get(&name)
+            .cloned()
+            .unwrap_or_default()
+        {
+            let count = indegree
+                .get_mut(&dependent)
+                .expect("dependent should have indegree entry");
+            *count -= 1;
+            if *count == 0 {
+                ready.insert(dependent);
+            }
+        }
+    }
+
+    if ordered.len() != lockfile.packages.len() {
+        let unresolved = indegree
+            .into_iter()
+            .filter(|(_, count)| *count > 0)
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "cyclic or unresolved lockfile dependencies: {}",
+            unresolved.join(", ")
+        ));
+    }
+
+    Ok(ordered)
 }
 
 fn report_install_failure(name: &str, version: &str, failure: &InstallFailure) {
@@ -730,8 +809,8 @@ impl SyncUi {
 #[cfg(test)]
 mod tests {
     use super::{
-        add_closure_roots, lockfile_from_resolution, persisted_constraints, registry_base_url,
-        semver_add_constraints,
+        add_closure_roots, locked_install_order, lockfile_from_resolution,
+        persisted_constraints, registry_base_url, semver_add_constraints,
     };
     use crate::{
         description::DescriptionExt,
@@ -950,5 +1029,105 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn installs_locked_packages_in_dependency_order() {
+        let lockfile = Lockfile {
+            version: 1,
+            registry: "https://api.rrepo.org".to_string(),
+            roots: vec![],
+            packages: BTreeMap::from([
+                (
+                    "AzureKeyVault".to_string(),
+                    LockedPackage {
+                        package: "AzureKeyVault".to_string(),
+                        version: "1.0.0".to_string(),
+                        source: Some("registry".to_string()),
+                        source_url: Some("https://api.rrepo.org/packages/AzureKeyVault/versions/1.0.0/source".to_string()),
+                        dependencies: vec![LockedDependency {
+                            package: "AzureRMR".to_string(),
+                            kind: "Imports".to_string(),
+                            min_version: None,
+                            max_version_exclusive: None,
+                        }],
+                    },
+                ),
+                (
+                    "AzureRMR".to_string(),
+                    LockedPackage {
+                        package: "AzureRMR".to_string(),
+                        version: "1.0.0".to_string(),
+                        source: Some("registry".to_string()),
+                        source_url: Some("https://api.rrepo.org/packages/AzureRMR/versions/1.0.0/source".to_string()),
+                        dependencies: vec![LockedDependency {
+                            package: "httr2".to_string(),
+                            kind: "Imports".to_string(),
+                            min_version: None,
+                            max_version_exclusive: None,
+                        }],
+                    },
+                ),
+                (
+                    "httr2".to_string(),
+                    LockedPackage {
+                        package: "httr2".to_string(),
+                        version: "1.0.0".to_string(),
+                        source: Some("registry".to_string()),
+                        source_url: Some("https://api.rrepo.org/packages/httr2/versions/1.0.0/source".to_string()),
+                        dependencies: vec![],
+                    },
+                ),
+            ]),
+        };
+
+        assert_eq!(
+            locked_install_order(&lockfile).unwrap(),
+            vec!["httr2".to_string(), "AzureRMR".to_string(), "AzureKeyVault".to_string()]
+        );
+    }
+
+    #[test]
+    fn rejects_cyclic_locked_dependencies() {
+        let lockfile = Lockfile {
+            version: 1,
+            registry: "https://api.rrepo.org".to_string(),
+            roots: vec![],
+            packages: BTreeMap::from([
+                (
+                    "a".to_string(),
+                    LockedPackage {
+                        package: "a".to_string(),
+                        version: "1.0.0".to_string(),
+                        source: Some("registry".to_string()),
+                        source_url: None,
+                        dependencies: vec![LockedDependency {
+                            package: "b".to_string(),
+                            kind: "Imports".to_string(),
+                            min_version: None,
+                            max_version_exclusive: None,
+                        }],
+                    },
+                ),
+                (
+                    "b".to_string(),
+                    LockedPackage {
+                        package: "b".to_string(),
+                        version: "1.0.0".to_string(),
+                        source: Some("registry".to_string()),
+                        source_url: None,
+                        dependencies: vec![LockedDependency {
+                            package: "a".to_string(),
+                            kind: "Imports".to_string(),
+                            min_version: None,
+                            max_version_exclusive: None,
+                        }],
+                    },
+                ),
+            ]),
+        };
+
+        let error = locked_install_order(&lockfile).expect_err("cycle should fail");
+        assert!(error.contains("cyclic or unresolved lockfile dependencies"));
     }
 }

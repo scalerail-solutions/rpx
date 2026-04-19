@@ -21,14 +21,24 @@ pub fn project_command(program: impl AsRef<str>) -> Command {
     command
 }
 
-pub fn install_source_package(source_path: &Path) -> Result<(), InstallFailure> {
+pub fn install_source_package(
+    source_path: &Path,
+    package: &str,
+    version: &str,
+) -> Result<(), InstallFailure> {
     let source_path = source_path
         .to_str()
         .expect("source package path should be valid utf-8");
-    let expression = format!(
-        "install.packages('{}', repos = NULL, type = 'source')",
-        escape_r_string(source_path)
-    );
+    let expression = concat!(
+        "install.packages('%SOURCE%', repos = NULL, type = 'source');",
+        "packages <- installed.packages(lib.loc = .libPaths()[1]);",
+        "if (!('%PACKAGE%' %in% rownames(packages))) stop('Expected package %PACKAGE% to be installed');",
+        "installed_version <- packages['%PACKAGE%', 'Version'];",
+        "if (installed_version != '%VERSION%') stop(sprintf('Installed %s version %s, expected %s', '%PACKAGE%', installed_version, '%VERSION%'))"
+    )
+    .replace("%SOURCE%", &escape_r_string(source_path))
+    .replace("%PACKAGE%", &escape_r_string(package))
+    .replace("%VERSION%", &escape_r_string(version));
 
     let output = project_command("Rscript")
         .arg("-e")
