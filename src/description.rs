@@ -262,12 +262,22 @@ fn closure_root_from_relation(relation: &Relation) -> ClosureRoot {
     let constraint = relation
         .version
         .as_ref()
-        .map(|(operator, version)| format!("{operator} {version}"))
+        .map(|(operator, version)| format!("{} {version}", closure_operator(operator)))
         .unwrap_or_else(|| "*".to_string());
 
     ClosureRoot {
         name: relation.name.clone(),
         constraint,
+    }
+}
+
+fn closure_operator(operator: &VersionConstraint) -> &'static str {
+    match operator {
+        VersionConstraint::LessThan => "<",
+        VersionConstraint::GreaterThan => ">",
+        VersionConstraint::LessThanEqual => "<=",
+        VersionConstraint::GreaterThanEqual => ">=",
+        VersionConstraint::Equal => "=",
     }
 }
 
@@ -357,6 +367,7 @@ mod tests {
         DescriptionExt, format_description_for_write, parse_constraint, relation_with_constraint,
         sanitize_package_name, title_from_package_name,
     };
+    use crate::registry::ClosureRoot;
     use r_description::{VersionConstraint, lossy::RDescription};
     use std::str::FromStr;
 
@@ -458,5 +469,27 @@ mod tests {
         let formatted = format_description_for_write(&description);
 
         assert!(formatted.contains("Imports:\n    dplyr (>= 1.1.4),\n    dplyr (<< 2.0.0)"));
+    }
+
+    #[test]
+    fn normalizes_strict_relation_operators_for_closure_requests() {
+        let description = RDescription::from_str(
+            "Package: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\nImports: AzureAuth (<< 2.0.0), httr2 (>> 1.0.0)\n",
+        )
+        .expect("description should parse");
+
+        assert_eq!(
+            description.closure_roots(),
+            vec![
+                ClosureRoot {
+                    name: "AzureAuth".to_string(),
+                    constraint: "< 2.0.0".to_string(),
+                },
+                ClosureRoot {
+                    name: "httr2".to_string(),
+                    constraint: "> 1.0.0".to_string(),
+                },
+            ]
+        );
     }
 }
