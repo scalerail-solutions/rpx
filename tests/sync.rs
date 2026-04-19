@@ -82,7 +82,7 @@ fn runs_rpx_lock_from_current_library() {
 
     let lockfile = read_project_file(&container, project_path, "rpx.lock");
     assert!(
-        lockfile.contains("\"requirements\": []"),
+        lockfile.contains("\"roots\": []"),
         "lockfile was: {lockfile}"
     );
     assert!(
@@ -165,7 +165,7 @@ fn runs_rpx_sync_restores_locked_versions() {
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
     let seed_lockfile = format!(
-        "mkdir -p {project_path} && cd {project_path} && cat > rpx.lock <<'EOF'\n{{\n  \"version\": 2,\n  \"requirements\": [\n    \"digest\"\n  ],\n  \"registry\": \"https://api.rrepo.org\",\n  \"packages\": {{\n    \"digest\": {{\n      \"package\": \"digest\",\n      \"version\": \"0.6.37\",\n      \"source\": \"registry\",\n      \"source_url\": \"https://api.rrepo.org/packages/digest/versions/0.6.37/source\"\n    }}\n  }}\n}}\nEOF"
+        "mkdir -p {project_path} && cd {project_path} && cat > rpx.lock <<'EOF'\n{{\n  \"version\": 1,\n  \"registry\": \"https://api.rrepo.org\",\n  \"roots\": [\n    {{\n      \"package\": \"digest\",\n      \"constraint\": \"*\"\n    }}\n  ],\n  \"packages\": {{\n    \"digest\": {{\n      \"package\": \"digest\",\n      \"version\": \"0.6.37\",\n      \"source\": \"registry\",\n      \"source_url\": \"https://api.rrepo.org/packages/digest/versions/0.6.37/source\"\n    }}\n  }}\n}}\nEOF"
     );
     let (exit_code, stdout, stderr) = run_shell_command(&container, &seed_lockfile);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
@@ -186,9 +186,9 @@ fn runs_rpx_sync_restores_locked_versions() {
 }
 
 #[test]
-fn runs_rpx_sync_with_reordered_lockfile_requirements() {
+fn runs_rpx_sync_with_reordered_lockfile_roots() {
     let container = start_container();
-    let project_path = "/tmp/rpx-project-sync-ordered-requirements";
+    let project_path = "/tmp/rpx-project-sync-ordered-roots";
     write_description(
         &container,
         project_path,
@@ -207,9 +207,15 @@ Imports: digest, jsonlite",
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
     let reorder_command = format!(
-        r#"cd {project_path} && perl -0pi -e 's/"requirements": \\[\s+"digest",\s+"jsonlite"\s+\\]/"requirements": [
-    "jsonlite",
-    "digest"
+        r#"cd {project_path} && perl -0pi -e 's/"roots": \[\s+\{{\s+"package": "digest",\s+"constraint": "\*"\s+\}},\s+\{{\s+"package": "jsonlite",\s+"constraint": "\*"\s+\}}\s+\]/"roots": [
+    {{
+      "package": "jsonlite",
+      "constraint": "*"
+    }},
+    {{
+      "package": "digest",
+      "constraint": "*"
+    }}
   ]/' rpx.lock"#
     );
     let (exit_code, stdout, stderr) = run_shell_command(&container, &reorder_command);

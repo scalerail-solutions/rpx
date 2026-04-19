@@ -65,7 +65,7 @@ fn runs_rpx_add_inside_custom_r_image() {
         "lockfile was: {lockfile}"
     );
     assert!(
-        lockfile.contains("\"requirements\""),
+        lockfile.contains("\"roots\""),
         "lockfile was: {lockfile}"
     );
     assert!(

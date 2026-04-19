@@ -7,6 +7,15 @@ pub struct ResolvedPackage {
     pub name: String,
     pub version: String,
     pub source_url: String,
+    pub dependencies: Vec<ResolvedDependency>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDependency {
+    pub package: String,
+    pub kind: String,
+    pub min_version: Option<String>,
+    pub max_version_exclusive: Option<String>,
 }
 
 pub fn resolve_from_closure(
@@ -45,8 +54,26 @@ pub fn resolve_from_closure(
             name: resolved.package_name,
             version: resolved.version.version.clone(),
             source_url: resolved.version.source_url.clone(),
+            dependencies: resolved
+                .version
+                .dependencies
+                .iter()
+                .map(resolved_dependency)
+                .collect(),
         })
         .collect())
+}
+
+fn resolved_dependency(dependency: &crate::registry::ClosureDependency) -> ResolvedDependency {
+    ResolvedDependency {
+        package: dependency.dependency_name.clone(),
+        kind: dependency.dependency_kind.clone(),
+        min_version: dependency.min_version.as_ref().map(ToString::to_string),
+        max_version_exclusive: dependency
+            .max_version_exclusive
+            .as_ref()
+            .map(ToString::to_string),
+    }
 }
 
 #[derive(Debug, Clone)]

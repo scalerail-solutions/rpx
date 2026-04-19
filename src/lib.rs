@@ -67,7 +67,7 @@ fn cmd_add(package: &str) {
         .add_to_imports_with_constraints(package, &resolved_addition.constraints);
     write_description(&project);
     write_lockfile(lockfile_from_resolution(
-        project.description.requirements(),
+        project.description.closure_roots(),
         client.base_url(),
         &resolved_addition.resolved,
     ));
@@ -141,9 +141,9 @@ fn cmd_status() {
         .into_iter()
         .collect::<BTreeSet<_>>();
     let lock_requirements = lockfile
-        .requirements
+        .roots
         .iter()
-        .cloned()
+        .map(|root| root.package.clone())
         .collect::<BTreeSet<_>>();
     let installed = installed_packages();
     let installed_names = installed
@@ -189,7 +189,7 @@ fn cmd_status() {
         .collect::<Vec<_>>();
 
     println!("Manifest requirements: {}", manifest_requirements.len());
-    println!("Locked requirements: {}", lockfile.requirements.len());
+    println!("Locked roots: {}", lockfile.roots.len());
     println!("Locked registry: {}", lockfile.registry);
     println!("Locked packages: {}", lockfile.packages.len());
     println!("Installed packages: {}", installed.len());
@@ -372,17 +372,15 @@ fn persisted_constraints(constraint: &str) -> Vec<String> {
 
 fn lock_from_description() {
     let project = read_description().expect("failed to read DESCRIPTION");
-    let requirements = project.description.requirements();
+    let roots = project.description.closure_roots();
     let registry = registry_base_url();
 
-    if requirements.is_empty() {
+    if roots.is_empty() {
         write_lockfile(lockfile_from_resolution(vec![], &registry, &[]));
         return;
     }
 
-    let request = ClosureRequest {
-        roots: project.description.closure_roots(),
-    };
+    let request = ClosureRequest { roots: roots.clone() };
     let client = RegistryClient::new(&registry);
     let closure = client
         .fetch_closure_with_retry(&request)
@@ -391,7 +389,7 @@ fn lock_from_description() {
         .unwrap_or_else(|error| panic!("failed to resolve package set from closure: {error}"));
 
     write_lockfile(lockfile_from_resolution(
-        requirements,
+        roots,
         client.base_url(),
         &resolved,
     ));
@@ -399,10 +397,19 @@ fn lock_from_description() {
 
 fn sync_from_lockfile() {
     let project = read_description().expect("failed to read DESCRIPTION");
-    let manifest_requirements = project.description.requirements();
+    let manifest_requirements = project
+        .description
+        .requirements()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     let lockfile = read_lockfile().expect("failed to read lockfile");
+    let lock_requirements = lockfile
+        .roots
+        .iter()
+        .map(|root| root.package.clone())
+        .collect::<BTreeSet<_>>();
 
-    if manifest_requirements != lockfile.requirements {
+    if manifest_requirements != lock_requirements {
         eprintln!("lockfile out of date; run rpx lock");
         std::process::exit(1);
     }
@@ -503,14 +510,20 @@ fn registry_base_url() -> String {
 }
 
 fn lockfile_from_resolution(
-    requirements: Vec<String>,
+    roots: Vec<ClosureRoot>,
     registry: &str,
     resolved: &[ResolvedPackage],
 ) -> Lockfile {
     Lockfile {
-        version: 2,
-        requirements,
+        version: 1,
         registry: registry.to_string(),
+        roots: roots
+            .into_iter()
+            .map(|root| lockfile::LockedRoot {
+                package: root.name,
+                constraint: root.constraint,
+            })
+            .collect(),
         packages: resolved
             .iter()
             .map(|package| {
@@ -521,6 +534,16 @@ fn lockfile_from_resolution(
                         version: package.version.clone(),
                         source: Some("registry".to_string()),
                         source_url: Some(registry_source_url(registry, &package.name, &package.version)),
+                        dependencies: package
+                            .dependencies
+                            .iter()
+                            .map(|dependency| lockfile::LockedDependency {
+                                package: dependency.package.clone(),
+                                kind: dependency.kind.clone(),
+                                min_version: dependency.min_version.clone(),
+                                max_version_exclusive: dependency.max_version_exclusive.clone(),
+                            })
+                            .collect(),
                     },
                 )
             })
@@ -548,9 +571,9 @@ mod tests {
     };
     use crate::{
         description::DescriptionExt,
-        lockfile::{LockedPackage, Lockfile},
+        lockfile::{LockedDependency, LockedPackage, LockedRoot, Lockfile},
         registry::ClosureRoot,
-        resolver::ResolvedPackage,
+        resolver::{ResolvedDependency, ResolvedPackage},
     };
     use r_description::lossy::RDescription;
     use std::collections::BTreeMap;
@@ -589,7 +612,16 @@ mod tests {
     #[test]
     fn builds_lockfile_from_registry_resolution() {
         let lockfile = lockfile_from_resolution(
-            vec!["cli".to_string(), "digest".to_string()],
+            vec![
+                ClosureRoot {
+                    name: "cli".to_string(),
+                    constraint: "= 3.6.5".to_string(),
+                },
+                ClosureRoot {
+                    name: "digest".to_string(),
+                    constraint: "*".to_string(),
+                },
+            ],
             "https://api.rrepo.org",
             &[
                 ResolvedPackage {
@@ -597,18 +629,28 @@ mod tests {
                     version: "3.6.5".to_string(),
                     source_url: "https://api.rrepo.org/packages/cli/versions/3.6.5/source"
                         .to_string(),
+                    dependencies: vec![ResolvedDependency {
+                        package: "R".to_string(),
+                        kind: "Depends".to_string(),
+                        min_version: Some("4.3".to_string()),
+                        max_version_exclusive: None,
+                    }],
                 },
                 ResolvedPackage {
                     name: "digest".to_string(),
                     version: "0.6.37".to_string(),
                     source_url: "https://api.rrepo.org/packages/digest/versions/0.6.37/source"
                         .to_string(),
+                    dependencies: vec![],
                 },
             ],
         );
 
         assert_eq!(lockfile.registry, "https://api.rrepo.org");
+        assert_eq!(lockfile.version, 1);
+        assert_eq!(lockfile.roots[0].constraint, "= 3.6.5");
         assert_eq!(lockfile.packages["cli"].source.as_deref(), Some("registry"));
+        assert_eq!(lockfile.packages["cli"].dependencies.len(), 1);
         assert_eq!(
             lockfile.packages["digest"].source_url.as_deref(),
             Some("https://api.rrepo.org/packages/digest/versions/0.6.37/source")
@@ -671,9 +713,12 @@ mod tests {
         )
         .expect("description should parse");
         let lockfile = Lockfile {
-            version: 2,
-            requirements: vec!["cli".to_string()],
+            version: 1,
             registry: "https://api.rrepo.org".to_string(),
+            roots: vec![LockedRoot {
+                package: "cli".to_string(),
+                constraint: "*".to_string(),
+            }],
             packages: BTreeMap::from([(
                 "cli".to_string(),
                 LockedPackage {
@@ -683,6 +728,12 @@ mod tests {
                     source_url: Some(
                         "https://api.rrepo.org/packages/cli/versions/3.6.5/source".to_string(),
                     ),
+                    dependencies: vec![LockedDependency {
+                        package: "R".to_string(),
+                        kind: "Depends".to_string(),
+                        min_version: Some("4.3".to_string()),
+                        max_version_exclusive: None,
+                    }],
                 },
             )]),
         };

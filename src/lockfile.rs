@@ -5,9 +5,15 @@ use std::{collections::BTreeMap, fs};
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Lockfile {
     pub version: u32,
-    pub requirements: Vec<String>,
     pub registry: String,
+    pub roots: Vec<LockedRoot>,
     pub packages: BTreeMap<String, LockedPackage>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LockedRoot {
+    pub package: String,
+    pub constraint: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -18,6 +24,18 @@ pub struct LockedPackage {
     pub source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<LockedDependency>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LockedDependency {
+    pub package: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_version_exclusive: Option<String>,
 }
 
 pub fn read_lockfile() -> Result<Lockfile, String> {
@@ -45,14 +63,17 @@ pub fn write_lockfile(lockfile: Lockfile) {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{LockedPackage, Lockfile};
+    use super::{LockedDependency, LockedPackage, LockedRoot, Lockfile};
 
     #[test]
     fn serializes_new_registry_lockfile_shape() {
         let lockfile = Lockfile {
-            version: 2,
-            requirements: vec!["digest".to_string()],
+            version: 1,
             registry: "https://api.rrepo.org".to_string(),
+            roots: vec![LockedRoot {
+                package: "digest".to_string(),
+                constraint: "*".to_string(),
+            }],
             packages: BTreeMap::from([(
                 "digest".to_string(),
                 LockedPackage {
@@ -62,14 +83,23 @@ mod tests {
                     source_url: Some(
                         "https://api.rrepo.org/packages/digest/versions/0.6.37/source".to_string(),
                     ),
+                    dependencies: vec![LockedDependency {
+                        package: "utils".to_string(),
+                        kind: "Imports".to_string(),
+                        min_version: None,
+                        max_version_exclusive: None,
+                    }],
                 },
             )]),
         };
 
         let json = serde_json::to_string_pretty(&lockfile).expect("lockfile should serialize");
 
+        assert!(json.contains("\"version\": 1"));
         assert!(json.contains("\"registry\": \"https://api.rrepo.org\""));
+        assert!(json.contains("\"roots\""));
         assert!(json.contains("\"source_url\""));
+        assert!(json.contains("\"dependencies\""));
         assert!(!json.contains("\"repositories\""));
         assert!(!json.contains("\"repository\""));
     }
@@ -81,6 +111,7 @@ mod tests {
             version: "0.6.37".to_string(),
             source: None,
             source_url: None,
+            dependencies: vec![],
         };
 
         let json = serde_json::to_string(&package).expect("package should serialize");
