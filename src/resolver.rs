@@ -271,6 +271,8 @@ fn parse_constraint_part(constraint: &str) -> Option<(ConstraintOperator, &str)>
     for (prefix, operator) in [
         (">=", ConstraintOperator::Gte),
         ("<=", ConstraintOperator::Lte),
+        (">>", ConstraintOperator::Gt),
+        ("<<", ConstraintOperator::Lt),
         ("==", ConstraintOperator::Eq),
         (">", ConstraintOperator::Gt),
         ("<", ConstraintOperator::Lt),
@@ -429,6 +431,25 @@ mod tests {
             error,
             "cannot resolve dependencies from an ingesting closure"
         );
+    }
+
+    #[test]
+    fn accepts_debian_style_strict_bounds() {
+        let request = closure_request(vec![root("pkg", "*"), root("dep", "<< 2.0.0")]);
+        let response = complete_response(vec![
+            package(
+                "pkg",
+                vec![version("1.0.0", vec![dependency("dep", "Imports", "<< 2.0.0")])],
+            ),
+            package(
+                "dep",
+                vec![version("2.0.0", vec![]), version("1.5.0", vec![])],
+            ),
+        ]);
+
+        let resolved = resolve_from_closure(&request, &response).expect("resolution should work");
+
+        assert_eq!(resolved_names(&resolved), ["dep@1.5.0", "pkg@1.0.0"]);
     }
 
     fn closure_request(roots: Vec<ClosureRoot>) -> ClosureRequest {

@@ -1,4 +1,6 @@
-use r_description::{Version, lossy::RDescription, lossy::Relation, lossy::Relations};
+use r_description::{
+    Version, VersionConstraint, lossy::RDescription, lossy::Relation, lossy::Relations,
+};
 use std::{collections::BTreeSet, fs, str::FromStr};
 
 use crate::project::{current_description_path, description_path};
@@ -6,6 +8,8 @@ use crate::registry::ClosureRoot;
 
 pub trait DescriptionExt {
     fn add_to_imports(&mut self, package: &str);
+    fn add_to_imports_with_constraints(&mut self, package: &str, constraints: &[String]);
+    fn has_dependency(&self, package: &str) -> bool;
     fn remove_from_field(&mut self, field_name: &str, package: &str);
     fn closure_roots(&self) -> Vec<ClosureRoot>;
     fn requirements(&self) -> Vec<String>;
@@ -56,23 +60,47 @@ pub fn init_description() -> Result<String, String> {
 
 impl DescriptionExt for RDescription {
     fn add_to_imports(&mut self, package: &str) {
-        let mut imports = self.imports.clone().unwrap_or_default();
+        self.add_to_imports_with_constraints(package, &[]);
+    }
 
-        let already_present_in_depends = self
-            .depends
-            .as_ref()
-            .map(|depends| depends.iter().any(|entry| entry.name == package))
-            .unwrap_or(false);
-
-        if imports.iter().any(|entry| entry.name == package) || already_present_in_depends {
+    fn add_to_imports_with_constraints(&mut self, package: &str, constraints: &[String]) {
+        if self.has_dependency(package) {
             return;
         }
 
-        imports.0.push(Relation {
-            name: package.to_string(),
-            version: None,
-        });
+        let mut imports = self.imports.clone().unwrap_or_default();
+
+        if constraints.is_empty() || constraints.iter().all(|constraint| constraint.trim() == "*") {
+            imports.0.push(Relation {
+                name: package.to_string(),
+                version: None,
+            });
+        } else {
+            imports.0.extend(
+                constraints
+                    .iter()
+                    .map(|constraint| relation_with_constraint(package, constraint)),
+            );
+        }
+
         self.imports = Some(imports);
+    }
+
+    fn has_dependency(&self, package: &str) -> bool {
+        let present_in_imports = self
+            .imports
+            .as_ref()
+            .map(|imports| imports.iter().any(|entry| entry.name == package))
+            .unwrap_or(false);
+
+        if present_in_imports {
+            return true;
+        }
+
+        self.depends
+            .as_ref()
+            .map(|depends| depends.iter().any(|entry| entry.name == package))
+            .unwrap_or(false)
     }
 
     fn remove_from_field(&mut self, field_name: &str, package: &str) {
@@ -153,6 +181,45 @@ impl DescriptionExt for RDescription {
 
         requirements.into_iter().collect()
     }
+}
+
+fn relation_with_constraint(package: &str, constraint: &str) -> Relation {
+    let constraint = constraint.trim();
+
+    if constraint.is_empty() || constraint == "*" {
+        return Relation {
+            name: package.to_string(),
+            version: None,
+        };
+    }
+
+    let (operator, version) = parse_constraint(constraint);
+
+    Relation {
+        name: package.to_string(),
+        version: Some((operator, version.parse().expect("constraint version should parse"))),
+    }
+}
+
+fn parse_constraint(constraint: &str) -> (VersionConstraint, &str) {
+    for (prefix, operator) in [
+        (">=", VersionConstraint::GreaterThanEqual),
+        ("<=", VersionConstraint::LessThanEqual),
+        ("<<", VersionConstraint::LessThan),
+        (">>", VersionConstraint::GreaterThan),
+        ("=", VersionConstraint::Equal),
+        ("<", VersionConstraint::LessThan),
+        (">", VersionConstraint::GreaterThan),
+    ] {
+        if let Some(version) = constraint.strip_prefix(prefix) {
+            let version = version.trim();
+            if !version.is_empty() {
+                return (operator, version);
+            }
+        }
+    }
+
+    panic!("invalid dependency constraint: {constraint}");
 }
 
 fn closure_root_from_relation(relation: &Relation) -> ClosureRoot {
@@ -250,7 +317,12 @@ fn title_from_package_name(package_name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{sanitize_package_name, title_from_package_name};
+    use super::{
+        DescriptionExt, parse_constraint, relation_with_constraint, sanitize_package_name,
+        title_from_package_name,
+    };
+    use r_description::{VersionConstraint, lossy::RDescription};
+    use std::str::FromStr;
 
     #[test]
     fn sanitizes_directory_name_to_package_name() {
@@ -273,6 +345,52 @@ mod tests {
         assert_eq!(
             title_from_package_name("my.package.name"),
             "My Package Name"
+        );
+    }
+
+    #[test]
+    fn adds_multiple_import_entries_for_bounded_constraints() {
+        let mut description = RDescription::from_str(
+            "Package: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\n",
+        )
+        .expect("description should parse");
+
+        description.add_to_imports_with_constraints(
+            "dplyr",
+            &[">= 1.1.4".to_string(), "< 2.0.0".to_string()],
+        );
+
+        let imports = description.imports.expect("imports should exist");
+        assert_eq!(imports.0.len(), 2);
+        assert_eq!(imports.0[0].to_string(), "dplyr (>= 1.1.4)");
+        assert_eq!(imports.0[1].to_string(), "dplyr (<< 2.0.0)");
+    }
+
+    #[test]
+    fn detects_existing_dependency_in_imports_or_depends() {
+        let description = RDescription::from_str(
+            "Package: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\nImports: digest\nDepends: R (>= 4.3), cli\n",
+        )
+        .expect("description should parse");
+
+        assert!(description.has_dependency("digest"));
+        assert!(description.has_dependency("cli"));
+        assert!(!description.has_dependency("jsonlite"));
+    }
+
+    #[test]
+    fn parses_strict_less_than_constraints() {
+        assert_eq!(
+            parse_constraint("< 2.0.0"),
+            (VersionConstraint::LessThan, "2.0.0")
+        );
+        assert_eq!(
+            parse_constraint("<< 2.0.0"),
+            (VersionConstraint::LessThan, "2.0.0")
+        );
+        assert_eq!(
+            relation_with_constraint("dplyr", "< 2.0.0").to_string(),
+            "dplyr (<< 2.0.0)"
         );
     }
 }

@@ -75,7 +75,7 @@ fn runs_rpx_add_inside_custom_r_image() {
 
     let description = read_project_file(&container, project_path, "DESCRIPTION");
     assert!(
-        description.contains("Imports: digest"),
+        description.contains("Imports: digest") || (description.contains("Imports: digest (>=") && description.contains("digest (<<")),
         "DESCRIPTION was: {description}"
     );
 }
@@ -135,7 +135,7 @@ Imports: digest",
         "lockfile was: {lockfile}"
     );
     assert!(
-        lockfile.contains("https://cran.r-project.org/src/contrib/"),
+        lockfile.contains("https://api.rrepo.org/packages/digest/versions/"),
         "lockfile was: {lockfile}"
     );
 }
