@@ -2,6 +2,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
+    io::{Read, Write},
     path::{Path, PathBuf},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -305,12 +306,26 @@ impl RegistryClient {
         decode_json_response(response, "failed to decode package versions response")
     }
 
+    #[allow(dead_code)]
     pub fn download_source_artifact(
         &self,
         package: &str,
         version: &str,
         source_url: &str,
     ) -> Result<DownloadedArtifact, String> {
+        self.download_source_artifact_with_progress(package, version, source_url, |_| {})
+    }
+
+    pub fn download_source_artifact_with_progress<F>(
+        &self,
+        package: &str,
+        version: &str,
+        source_url: &str,
+        mut on_progress: F,
+    ) -> Result<DownloadedArtifact, String>
+    where
+        F: FnMut(DownloadProgress),
+    {
         let response = self
             .client
             .get(source_url)
@@ -329,19 +344,48 @@ impl RegistryClient {
             return Err(format!("artifact download failed ({status}): {body}"));
         }
 
-        let bytes = response
-            .bytes()
-            .map_err(|error| format!("failed to read source artifact: {error}"))?;
+        let total_bytes = response.content_length();
         let directory = artifact_directory();
         fs::create_dir_all(&directory)
             .map_err(|error| format!("failed to create artifact directory: {error}"))?;
 
         let path = directory.join(format!("{package}_{version}.tar.gz"));
-        fs::write(&path, &bytes)
+        let mut file = fs::File::create(&path)
             .map_err(|error| format!("failed to write source artifact: {error}"))?;
+        let mut response = response;
+        let mut downloaded_bytes = 0_u64;
+        let mut buffer = [0_u8; 16 * 1024];
+
+        on_progress(DownloadProgress {
+            downloaded_bytes,
+            total_bytes,
+        });
+
+        loop {
+            let read = response
+                .read(&mut buffer)
+                .map_err(|error| format!("failed to read source artifact: {error}"))?;
+            if read == 0 {
+                break;
+            }
+
+            file.write_all(&buffer[..read])
+                .map_err(|error| format!("failed to write source artifact: {error}"))?;
+            downloaded_bytes += read as u64;
+            on_progress(DownloadProgress {
+                downloaded_bytes,
+                total_bytes,
+            });
+        }
 
         Ok(DownloadedArtifact { path })
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DownloadProgress {
+    pub downloaded_bytes: u64,
+    pub total_bytes: Option<u64>,
 }
 
 fn decode_json_response<T: serde::de::DeserializeOwned>(

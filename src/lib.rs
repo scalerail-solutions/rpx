@@ -1,5 +1,6 @@
 use clap::Parser;
-use std::{collections::{BTreeMap, BTreeSet}, env};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use std::{collections::{BTreeMap, BTreeSet}, env, io::IsTerminal, path::Path};
 
 mod cli;
 mod description;
@@ -14,10 +15,10 @@ use description::{DescriptionExt, init_description, read_description, write_desc
 use lockfile::{Lockfile, read_lockfile, read_lockfile_optional, write_lockfile};
 use project::lockfile_path;
 use r::{
-    install_source_package, installed_packages, installed_packages_by_name, project_command,
+    InstallFailure, install_source_package, installed_packages, installed_packages_by_name, project_command,
     remove_installed_package_dir, remove_installed_packages,
 };
-use registry::{ClosureRequest, ClosureRoot, DEFAULT_REGISTRY_BASE_URL, DownloadedArtifact, RegistryClient};
+use registry::{ClosureRequest, ClosureRoot, DEFAULT_REGISTRY_BASE_URL, DownloadProgress, DownloadedArtifact, RegistryClient};
 use resolver::{ResolvedPackage, resolve_from_closure};
 
 pub fn run() {
@@ -429,16 +430,29 @@ fn sync_from_lockfile() {
         .collect::<Vec<_>>();
 
     let client = RegistryClient::new(&lockfile.registry);
+    let mut ui = SyncUi::new(exact_reinstalls.len());
 
-    for (name, version, source_url) in &exact_reinstalls {
+    for (index, (name, version, source_url)) in exact_reinstalls.iter().enumerate() {
         let source_url = source_url
             .as_ref()
             .unwrap_or_else(|| panic!("lockfile package {name}@{version} is missing source_url"));
+        ui.start_download(index + 1, name, version, None);
         let artifact = client
-            .download_source_artifact(name, version, source_url)
+            .download_source_artifact_with_progress(name, version, source_url, |progress| {
+                ui.update_download(progress)
+            })
             .unwrap_or_else(|error| panic!("failed to download source artifact: {error}"));
-        install_downloaded_artifact(artifact);
+        ui.finish_download(name, version);
+        ui.start_install(index + 1, name, version);
+        if let Err(error) = install_downloaded_artifact(artifact) {
+            ui.fail_install(name, version);
+            report_install_failure(name, version, &error);
+            std::process::exit(error.exit_code.unwrap_or(1));
+        }
+        ui.finish_install(name, version);
     }
+
+    ui.finish();
 
     let extras = installed_packages_by_name()
         .into_keys()
@@ -558,9 +572,159 @@ fn registry_source_url(registry: &str, package: &str, version: &str) -> String {
     )
 }
 
-fn install_downloaded_artifact(artifact: DownloadedArtifact) {
-    install_source_package(artifact.path());
+fn install_downloaded_artifact(artifact: DownloadedArtifact) -> Result<(), InstallFailure> {
+    let result = install_source_package(artifact.path());
     artifact.cleanup();
+    result
+}
+
+fn report_install_failure(name: &str, version: &str, failure: &InstallFailure) {
+    eprintln!("failed to install {name}@{version}");
+    eprintln!("summary: {}", failure.summary);
+    eprintln!("log: {}", failure.log_path.display());
+
+    let log_tail = read_log_tail(&failure.log_path, 80);
+    if !log_tail.is_empty() {
+        eprintln!("recent build output:");
+        eprintln!("{log_tail}");
+    }
+}
+
+fn read_log_tail(path: &Path, max_lines: usize) -> String {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return String::new();
+    };
+
+    let lines = contents.lines().collect::<Vec<_>>();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join("\n")
+}
+
+struct SyncUi {
+    interactive: bool,
+    overall: ProgressBar,
+    current: ProgressBar,
+    total: usize,
+}
+
+impl SyncUi {
+    fn new(total: usize) -> Self {
+        let interactive = std::io::stderr().is_terminal();
+
+        if interactive {
+            let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr());
+            let overall = multi.add(ProgressBar::new(total as u64));
+            overall.set_style(
+                ProgressStyle::with_template("{bar:40.cyan/blue} {pos}/{len} packages")
+                    .expect("progress template should parse")
+                    .progress_chars("##-"),
+            );
+            let current = multi.add(ProgressBar::new_spinner());
+            current.set_style(
+                ProgressStyle::with_template("{spinner} {msg}")
+                    .expect("progress template should parse"),
+            );
+
+            Self {
+                interactive,
+                overall,
+                current,
+                total,
+            }
+        } else {
+            Self {
+                interactive,
+                overall: ProgressBar::hidden(),
+                current: ProgressBar::hidden(),
+                total,
+            }
+        }
+    }
+
+    fn start_download(&mut self, index: usize, name: &str, version: &str, total_bytes: Option<u64>) {
+        if self.interactive {
+            self.current.set_length(total_bytes.unwrap_or(0));
+            if total_bytes.is_some() {
+                self.current.set_style(
+                    ProgressStyle::with_template(
+                        "{spinner} downloading {msg} [{bar:30.cyan/blue}] {bytes}/{total_bytes}",
+                    )
+                    .expect("progress template should parse")
+                    .progress_chars("##-"),
+                );
+            } else {
+                self.current.set_style(
+                    ProgressStyle::with_template("{spinner} downloading {msg} {bytes}")
+                        .expect("progress template should parse"),
+                );
+            }
+            self.current.set_position(0);
+            self.current.enable_steady_tick(std::time::Duration::from_millis(100));
+            self.current
+                .set_message(format!("{index}/{} {name}@{version}", self.total));
+        } else {
+            eprintln!("Downloading {index}/{}: {name}@{version}", self.total);
+        }
+    }
+
+    fn update_download(&self, progress: DownloadProgress) {
+        if !self.interactive {
+            return;
+        }
+
+        if let Some(total_bytes) = progress.total_bytes {
+            if self.current.length() != Some(total_bytes) {
+                self.current.set_length(total_bytes);
+            }
+            self.current.set_position(progress.downloaded_bytes.min(total_bytes));
+        } else {
+            self.current.set_position(progress.downloaded_bytes);
+        }
+    }
+
+    fn finish_download(&self, name: &str, version: &str) {
+        if self.interactive {
+            self.current.finish_with_message(format!("downloaded {name}@{version}"));
+            self.current.reset();
+        }
+    }
+
+    fn start_install(&self, index: usize, name: &str, version: &str) {
+        if self.interactive {
+            self.current.set_style(
+                ProgressStyle::with_template("{spinner} installing {msg}")
+                    .expect("progress template should parse"),
+            );
+            self.current.enable_steady_tick(std::time::Duration::from_millis(100));
+            self.current
+                .set_message(format!("{index}/{} {name}@{version}", self.total));
+        } else {
+            eprintln!("Installing {index}/{}: {name}@{version}", self.total);
+        }
+    }
+
+    fn finish_install(&self, name: &str, version: &str) {
+        self.overall.inc(1);
+        if self.interactive {
+            self.current.finish_with_message(format!("installed {name}@{version}"));
+            self.current.reset();
+        } else {
+            eprintln!("Installed {name}@{version}");
+        }
+    }
+
+    fn fail_install(&self, name: &str, version: &str) {
+        if self.interactive {
+            self.current.abandon_with_message(format!("failed {name}@{version}"));
+        }
+    }
+
+    fn finish(&self) {
+        if self.interactive {
+            self.overall.finish_and_clear();
+            self.current.finish_and_clear();
+        }
+    }
 }
 
 #[cfg(test)]
