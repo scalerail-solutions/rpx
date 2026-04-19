@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fs, path::Path, process::Command};
+use std::{collections::BTreeMap, fs, path::{Path, PathBuf}, process::Command, time::{SystemTime, UNIX_EPOCH}};
 
 use crate::project::project_library_path;
 
@@ -8,28 +8,66 @@ pub struct InstalledPackage {
     pub version: String,
 }
 
+#[derive(Debug)]
+pub struct InstallFailure {
+    pub exit_code: Option<i32>,
+    pub log_path: PathBuf,
+    pub summary: String,
+}
+
 pub fn project_command(program: impl AsRef<str>) -> Command {
     let mut command = Command::new(program.as_ref());
     command.env("R_LIBS_USER", project_library_path());
     command
 }
 
-pub fn install_source_package(source_path: &Path) {
+pub fn install_source_package(
+    source_path: &Path,
+    package: &str,
+    version: &str,
+) -> Result<(), InstallFailure> {
     let source_path = source_path
         .to_str()
         .expect("source package path should be valid utf-8");
-    let expression = format!(
-        "install.packages('{}', repos = NULL, type = 'source')",
-        escape_r_string(source_path)
-    );
+    let expression = concat!(
+        "install.packages('%SOURCE%', repos = NULL, type = 'source');",
+        "packages <- installed.packages(lib.loc = .libPaths()[1]);",
+        "if (!('%PACKAGE%' %in% rownames(packages))) stop('Expected package %PACKAGE% to be installed');",
+        "installed_version <- packages['%PACKAGE%', 'Version'];",
+        "if (installed_version != '%VERSION%') stop(sprintf('Installed %s version %s, expected %s', '%PACKAGE%', installed_version, '%VERSION%'))"
+    )
+    .replace("%SOURCE%", &escape_r_string(source_path))
+    .replace("%PACKAGE%", &escape_r_string(package))
+    .replace("%VERSION%", &escape_r_string(version));
 
-    let status = project_command("Rscript")
+    let output = project_command("Rscript")
         .arg("-e")
         .arg(expression)
-        .status()
+        .output()
         .expect("failed to run Rscript");
 
-    crate::exit_with_status(status.code());
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let log_path = install_log_path();
+    let mut contents = String::new();
+    contents.push_str("# stdout\n");
+    contents.push_str(&String::from_utf8_lossy(&output.stdout));
+    if !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    contents.push_str("# stderr\n");
+    contents.push_str(&String::from_utf8_lossy(&output.stderr));
+    fs::write(&log_path, contents).expect("failed to write install log");
+
+    let summary = summarize_install_output(&output.stdout, &output.stderr);
+
+    Err(InstallFailure {
+        exit_code: output.status.code(),
+        log_path,
+        summary,
+    })
 }
 
 pub fn installed_packages() -> Vec<InstalledPackage> {
@@ -107,4 +145,35 @@ fn parse_installed_packages(output: &str) -> Vec<InstalledPackage> {
 
 fn escape_r_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+fn summarize_install_output(stdout: &[u8], stderr: &[u8]) -> String {
+    let combined = [String::from_utf8_lossy(stderr), String::from_utf8_lossy(stdout)].join("\n");
+    let lines = combined
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+
+    lines
+        .iter()
+        .rev()
+        .find(|line| {
+            line.contains("ERROR")
+                || line.contains("error:")
+                || line.contains("installation of package")
+                || line.contains("failed")
+        })
+        .copied()
+        .or_else(|| lines.last().copied())
+        .unwrap_or("package installation failed")
+        .to_string()
+}
+
+fn install_log_path() -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!("rpx-install-{}-{unique}.log", std::process::id()))
 }

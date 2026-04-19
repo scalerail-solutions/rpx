@@ -1,5 +1,6 @@
 use clap::Parser;
-use std::{collections::{BTreeMap, BTreeSet}, env};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use std::{collections::{BTreeMap, BTreeSet}, env, io::IsTerminal, path::Path};
 
 mod cli;
 mod description;
@@ -14,10 +15,10 @@ use description::{DescriptionExt, init_description, read_description, write_desc
 use lockfile::{Lockfile, read_lockfile, read_lockfile_optional, write_lockfile};
 use project::lockfile_path;
 use r::{
-    install_source_package, installed_packages, installed_packages_by_name, project_command,
+    InstallFailure, install_source_package, installed_packages, installed_packages_by_name, project_command,
     remove_installed_package_dir, remove_installed_packages,
 };
-use registry::{ClosureRequest, ClosureRoot, DEFAULT_REGISTRY_BASE_URL, DownloadedArtifact, RegistryClient};
+use registry::{ClosureRequest, ClosureRoot, DEFAULT_REGISTRY_BASE_URL, DownloadProgress, DownloadedArtifact, RegistryClient};
 use resolver::{ResolvedPackage, resolve_from_closure};
 
 pub fn run() {
@@ -415,30 +416,46 @@ fn sync_from_lockfile() {
     }
 
     let installed = installed_packages_by_name();
-    let exact_reinstalls = lockfile
-        .packages
-        .iter()
-        .filter_map(|(name, package)| match installed.get(name) {
-            Some(installed_package) if installed_package.version == package.version => None,
-            _ => Some((
-                name.clone(),
-                package.version.clone(),
-                package.source_url.clone(),
-            )),
+    let install_order = locked_install_order(&lockfile)
+        .unwrap_or_else(|error| panic!("failed to compute install order from lockfile: {error}"));
+    let exact_reinstalls = install_order
+        .into_iter()
+        .filter_map(|name| {
+            let package = lockfile
+                .packages
+                .get(&name)
+                .expect("ordered package should exist in lockfile");
+            match installed.get(&name) {
+                Some(installed_package) if installed_package.version == package.version => None,
+                _ => Some((name, package.version.clone(), package.source_url.clone())),
+            }
         })
         .collect::<Vec<_>>();
 
     let client = RegistryClient::new(&lockfile.registry);
+    let mut ui = SyncUi::new(exact_reinstalls.len());
 
-    for (name, version, source_url) in &exact_reinstalls {
+    for (index, (name, version, source_url)) in exact_reinstalls.iter().enumerate() {
         let source_url = source_url
             .as_ref()
             .unwrap_or_else(|| panic!("lockfile package {name}@{version} is missing source_url"));
+        ui.start_download(index + 1, name, version, None);
         let artifact = client
-            .download_source_artifact(name, version, source_url)
+            .download_source_artifact_with_progress(name, version, source_url, |progress| {
+                ui.update_download(progress)
+            })
             .unwrap_or_else(|error| panic!("failed to download source artifact: {error}"));
-        install_downloaded_artifact(artifact);
+        ui.finish_download(name, version);
+        ui.start_install(index + 1, name, version);
+        if let Err(error) = install_downloaded_artifact(name, version, artifact) {
+            ui.fail_install(name, version);
+            report_install_failure(name, version, &error);
+            std::process::exit(error.exit_code.unwrap_or(1));
+        }
+        ui.finish_install(name, version);
     }
+
+    ui.finish();
 
     let extras = installed_packages_by_name()
         .into_keys()
@@ -558,16 +575,242 @@ fn registry_source_url(registry: &str, package: &str, version: &str) -> String {
     )
 }
 
-fn install_downloaded_artifact(artifact: DownloadedArtifact) {
-    install_source_package(artifact.path());
+fn install_downloaded_artifact(
+    package: &str,
+    version: &str,
+    artifact: DownloadedArtifact,
+) -> Result<(), InstallFailure> {
+    let result = install_source_package(artifact.path(), package, version);
     artifact.cleanup();
+    result
+}
+
+fn locked_install_order(lockfile: &Lockfile) -> Result<Vec<String>, String> {
+    let mut indegree = lockfile
+        .packages
+        .keys()
+        .map(|name| (name.clone(), 0_usize))
+        .collect::<BTreeMap<_, _>>();
+    let mut dependents = lockfile
+        .packages
+        .keys()
+        .map(|name| (name.clone(), BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+
+    for (name, package) in &lockfile.packages {
+        let internal_dependencies = package
+            .dependencies
+            .iter()
+            .filter(|dependency| lockfile.packages.contains_key(&dependency.package))
+            .map(|dependency| dependency.package.clone())
+            .collect::<BTreeSet<_>>();
+
+        *indegree
+            .get_mut(name)
+            .expect("lockfile package should have indegree") += internal_dependencies.len();
+
+        for dependency in internal_dependencies {
+            dependents
+                .get_mut(&dependency)
+                .expect("lockfile dependency should exist")
+                .insert(name.clone());
+        }
+    }
+
+    let mut ready = indegree
+        .iter()
+        .filter(|(_, count)| **count == 0)
+        .map(|(name, _)| name.clone())
+        .collect::<BTreeSet<_>>();
+    let mut ordered = Vec::with_capacity(lockfile.packages.len());
+
+    while let Some(name) = ready.pop_first() {
+        ordered.push(name.clone());
+
+        for dependent in dependents
+            .get(&name)
+            .cloned()
+            .unwrap_or_default()
+        {
+            let count = indegree
+                .get_mut(&dependent)
+                .expect("dependent should have indegree entry");
+            *count -= 1;
+            if *count == 0 {
+                ready.insert(dependent);
+            }
+        }
+    }
+
+    if ordered.len() != lockfile.packages.len() {
+        let unresolved = indegree
+            .into_iter()
+            .filter(|(_, count)| *count > 0)
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "cyclic or unresolved lockfile dependencies: {}",
+            unresolved.join(", ")
+        ));
+    }
+
+    Ok(ordered)
+}
+
+fn report_install_failure(name: &str, version: &str, failure: &InstallFailure) {
+    eprintln!("failed to install {name}@{version}");
+    eprintln!("summary: {}", failure.summary);
+    eprintln!("log: {}", failure.log_path.display());
+
+    let log_tail = read_log_tail(&failure.log_path, 80);
+    if !log_tail.is_empty() {
+        eprintln!("recent build output:");
+        eprintln!("{log_tail}");
+    }
+}
+
+fn read_log_tail(path: &Path, max_lines: usize) -> String {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return String::new();
+    };
+
+    let lines = contents.lines().collect::<Vec<_>>();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join("\n")
+}
+
+struct SyncUi {
+    interactive: bool,
+    overall: ProgressBar,
+    current: ProgressBar,
+    total: usize,
+}
+
+impl SyncUi {
+    fn new(total: usize) -> Self {
+        let interactive = std::io::stderr().is_terminal();
+
+        if interactive {
+            let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr());
+            let overall = multi.add(ProgressBar::new(total as u64));
+            overall.set_style(
+                ProgressStyle::with_template("{bar:40.cyan/blue} {pos}/{len} packages")
+                    .expect("progress template should parse")
+                    .progress_chars("##-"),
+            );
+            let current = multi.add(ProgressBar::new_spinner());
+            current.set_style(
+                ProgressStyle::with_template("{spinner} {msg}")
+                    .expect("progress template should parse"),
+            );
+
+            Self {
+                interactive,
+                overall,
+                current,
+                total,
+            }
+        } else {
+            Self {
+                interactive,
+                overall: ProgressBar::hidden(),
+                current: ProgressBar::hidden(),
+                total,
+            }
+        }
+    }
+
+    fn start_download(&mut self, index: usize, name: &str, version: &str, total_bytes: Option<u64>) {
+        if self.interactive {
+            self.current.set_length(total_bytes.unwrap_or(0));
+            if total_bytes.is_some() {
+                self.current.set_style(
+                    ProgressStyle::with_template(
+                        "{spinner} downloading {msg} [{bar:30.cyan/blue}] {bytes}/{total_bytes}",
+                    )
+                    .expect("progress template should parse")
+                    .progress_chars("##-"),
+                );
+            } else {
+                self.current.set_style(
+                    ProgressStyle::with_template("{spinner} downloading {msg} {bytes}")
+                        .expect("progress template should parse"),
+                );
+            }
+            self.current.set_position(0);
+            self.current.enable_steady_tick(std::time::Duration::from_millis(100));
+            self.current
+                .set_message(format!("{index}/{} {name}@{version}", self.total));
+        } else {
+            eprintln!("Downloading {index}/{}: {name}@{version}", self.total);
+        }
+    }
+
+    fn update_download(&self, progress: DownloadProgress) {
+        if !self.interactive {
+            return;
+        }
+
+        if let Some(total_bytes) = progress.total_bytes {
+            if self.current.length() != Some(total_bytes) {
+                self.current.set_length(total_bytes);
+            }
+            self.current.set_position(progress.downloaded_bytes.min(total_bytes));
+        } else {
+            self.current.set_position(progress.downloaded_bytes);
+        }
+    }
+
+    fn finish_download(&self, name: &str, version: &str) {
+        if self.interactive {
+            self.current.finish_with_message(format!("downloaded {name}@{version}"));
+            self.current.reset();
+        }
+    }
+
+    fn start_install(&self, index: usize, name: &str, version: &str) {
+        if self.interactive {
+            self.current.set_style(
+                ProgressStyle::with_template("{spinner} installing {msg}")
+                    .expect("progress template should parse"),
+            );
+            self.current.enable_steady_tick(std::time::Duration::from_millis(100));
+            self.current
+                .set_message(format!("{index}/{} {name}@{version}", self.total));
+        } else {
+            eprintln!("Installing {index}/{}: {name}@{version}", self.total);
+        }
+    }
+
+    fn finish_install(&self, name: &str, version: &str) {
+        self.overall.inc(1);
+        if self.interactive {
+            self.current.finish_with_message(format!("installed {name}@{version}"));
+            self.current.reset();
+        } else {
+            eprintln!("Installed {name}@{version}");
+        }
+    }
+
+    fn fail_install(&self, name: &str, version: &str) {
+        if self.interactive {
+            self.current.abandon_with_message(format!("failed {name}@{version}"));
+        }
+    }
+
+    fn finish(&self) {
+        if self.interactive {
+            self.overall.finish_and_clear();
+            self.current.finish_and_clear();
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        add_closure_roots, lockfile_from_resolution, persisted_constraints, registry_base_url,
-        semver_add_constraints,
+        add_closure_roots, locked_install_order, lockfile_from_resolution,
+        persisted_constraints, registry_base_url, semver_add_constraints,
     };
     use crate::{
         description::DescriptionExt,
@@ -786,5 +1029,105 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn installs_locked_packages_in_dependency_order() {
+        let lockfile = Lockfile {
+            version: 1,
+            registry: "https://api.rrepo.org".to_string(),
+            roots: vec![],
+            packages: BTreeMap::from([
+                (
+                    "AzureKeyVault".to_string(),
+                    LockedPackage {
+                        package: "AzureKeyVault".to_string(),
+                        version: "1.0.0".to_string(),
+                        source: Some("registry".to_string()),
+                        source_url: Some("https://api.rrepo.org/packages/AzureKeyVault/versions/1.0.0/source".to_string()),
+                        dependencies: vec![LockedDependency {
+                            package: "AzureRMR".to_string(),
+                            kind: "Imports".to_string(),
+                            min_version: None,
+                            max_version_exclusive: None,
+                        }],
+                    },
+                ),
+                (
+                    "AzureRMR".to_string(),
+                    LockedPackage {
+                        package: "AzureRMR".to_string(),
+                        version: "1.0.0".to_string(),
+                        source: Some("registry".to_string()),
+                        source_url: Some("https://api.rrepo.org/packages/AzureRMR/versions/1.0.0/source".to_string()),
+                        dependencies: vec![LockedDependency {
+                            package: "httr2".to_string(),
+                            kind: "Imports".to_string(),
+                            min_version: None,
+                            max_version_exclusive: None,
+                        }],
+                    },
+                ),
+                (
+                    "httr2".to_string(),
+                    LockedPackage {
+                        package: "httr2".to_string(),
+                        version: "1.0.0".to_string(),
+                        source: Some("registry".to_string()),
+                        source_url: Some("https://api.rrepo.org/packages/httr2/versions/1.0.0/source".to_string()),
+                        dependencies: vec![],
+                    },
+                ),
+            ]),
+        };
+
+        assert_eq!(
+            locked_install_order(&lockfile).unwrap(),
+            vec!["httr2".to_string(), "AzureRMR".to_string(), "AzureKeyVault".to_string()]
+        );
+    }
+
+    #[test]
+    fn rejects_cyclic_locked_dependencies() {
+        let lockfile = Lockfile {
+            version: 1,
+            registry: "https://api.rrepo.org".to_string(),
+            roots: vec![],
+            packages: BTreeMap::from([
+                (
+                    "a".to_string(),
+                    LockedPackage {
+                        package: "a".to_string(),
+                        version: "1.0.0".to_string(),
+                        source: Some("registry".to_string()),
+                        source_url: None,
+                        dependencies: vec![LockedDependency {
+                            package: "b".to_string(),
+                            kind: "Imports".to_string(),
+                            min_version: None,
+                            max_version_exclusive: None,
+                        }],
+                    },
+                ),
+                (
+                    "b".to_string(),
+                    LockedPackage {
+                        package: "b".to_string(),
+                        version: "1.0.0".to_string(),
+                        source: Some("registry".to_string()),
+                        source_url: None,
+                        dependencies: vec![LockedDependency {
+                            package: "a".to_string(),
+                            kind: "Imports".to_string(),
+                            min_version: None,
+                            max_version_exclusive: None,
+                        }],
+                    },
+                ),
+            ]),
+        };
+
+        let error = locked_install_order(&lockfile).expect_err("cycle should fail");
+        assert!(error.contains("cyclic or unresolved lockfile dependencies"));
     }
 }
