@@ -1,11 +1,12 @@
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use crate::project::artifact_cache_path;
 use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 pub const DEFAULT_REGISTRY_BASE_URL: &str = "https://api.rrepo.org";
@@ -306,26 +307,17 @@ impl RegistryClient {
         decode_json_response(response, "failed to decode package versions response")
     }
 
-    #[allow(dead_code)]
     pub fn download_source_artifact(
         &self,
         package: &str,
         version: &str,
         source_url: &str,
     ) -> Result<DownloadedArtifact, String> {
-        self.download_source_artifact_with_progress(package, version, source_url, |_| {})
-    }
+        let path = artifact_cache_path(package, version);
+        if path.exists() {
+            return Ok(DownloadedArtifact { path });
+        }
 
-    pub fn download_source_artifact_with_progress<F>(
-        &self,
-        package: &str,
-        version: &str,
-        source_url: &str,
-        mut on_progress: F,
-    ) -> Result<DownloadedArtifact, String>
-    where
-        F: FnMut(DownloadProgress),
-    {
         let response = self
             .client
             .get(source_url)
@@ -344,22 +336,10 @@ impl RegistryClient {
             return Err(format!("artifact download failed ({status}): {body}"));
         }
 
-        let total_bytes = response.content_length();
-        let directory = artifact_directory();
-        fs::create_dir_all(&directory)
-            .map_err(|error| format!("failed to create artifact directory: {error}"))?;
-
-        let path = directory.join(format!("{package}_{version}.tar.gz"));
         let mut file = fs::File::create(&path)
             .map_err(|error| format!("failed to write source artifact: {error}"))?;
         let mut response = response;
-        let mut downloaded_bytes = 0_u64;
         let mut buffer = [0_u8; 16 * 1024];
-
-        on_progress(DownloadProgress {
-            downloaded_bytes,
-            total_bytes,
-        });
 
         loop {
             let read = response
@@ -371,21 +351,10 @@ impl RegistryClient {
 
             file.write_all(&buffer[..read])
                 .map_err(|error| format!("failed to write source artifact: {error}"))?;
-            downloaded_bytes += read as u64;
-            on_progress(DownloadProgress {
-                downloaded_bytes,
-                total_bytes,
-            });
         }
 
         Ok(DownloadedArtifact { path })
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct DownloadProgress {
-    pub downloaded_bytes: u64,
-    pub total_bytes: Option<u64>,
 }
 
 fn decode_json_response<T: serde::de::DeserializeOwned>(
@@ -436,26 +405,12 @@ impl DownloadedArtifact {
         &self.path
     }
 
-    pub fn cleanup(self) {
-        let _ = fs::remove_file(&self.path);
-
-        if let Some(parent) = self.path.parent() {
-            let _ = fs::remove_dir(parent);
-        }
-    }
-}
-
-fn artifact_directory() -> PathBuf {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be after unix epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!("rpx-artifacts-{}-{unique}", std::process::id()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::artifact_cache_path;
     use mockito::{Matcher, Server};
 
     fn sample_request() -> ClosureRequest {
@@ -797,6 +752,8 @@ mod tests {
 
     #[test]
     fn downloads_source_artifact_to_a_local_file() {
+        clear_cached_artifact("digest", "0.6.37");
+
         let mut server = Server::new();
         let mock = server
             .mock("GET", "/packages/digest/versions/0.6.37/source")
@@ -817,11 +774,13 @@ mod tests {
         mock.assert();
         let contents = fs::read(artifact.path()).expect("artifact should exist");
         assert_eq!(contents, b"fake-tarball");
-        artifact.cleanup();
+        clear_cached_artifact("digest", "0.6.37");
     }
 
     #[test]
     fn surfaces_source_artifact_download_errors() {
+        clear_cached_artifact("digest", "0.6.37");
+
         let mut server = Server::new();
         let mock = server
             .mock("GET", "/packages/digest/versions/0.6.37/source")
@@ -842,5 +801,10 @@ mod tests {
         assert!(
             error.contains("artifact download failed (500 Internal Server Error): tarball missing")
         );
+    }
+
+    fn clear_cached_artifact(package: &str, version: &str) {
+        let path = artifact_cache_path(package, version);
+        let _ = fs::remove_file(&path);
     }
 }
