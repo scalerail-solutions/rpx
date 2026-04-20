@@ -137,6 +137,27 @@ fn reports_when_removed_package_is_already_missing_from_library() {
 }
 
 #[test]
+fn adds_and_removes_multiple_packages() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-multi-deps";
+    create_package_project(&container, project_path);
+
+    let add_command = format!("cd {project_path} && rpx add digest cli");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &add_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(stdout.contains("Added digest, cli"), "stdout was: {stdout}\nstderr was: {stderr}");
+    assert_package_state(&container, project_path, "digest", "TRUE");
+    assert_package_state(&container, project_path, "cli", "TRUE");
+
+    let remove_command = format!("cd {project_path} && rpx remove digest cli");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &remove_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(stdout.contains("Removed digest, cli"), "stdout was: {stdout}\nstderr was: {stderr}");
+    assert_package_state(&container, project_path, "digest", "FALSE");
+    assert_package_state(&container, project_path, "cli", "FALSE");
+}
+
+#[test]
 fn runs_rpx_lock_without_installing_packages() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-lock";

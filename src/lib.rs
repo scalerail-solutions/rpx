@@ -28,8 +28,8 @@ pub fn run() {
 
     match cli.command {
         Commands::Init => cmd_init(),
-        Commands::Add { package } => cmd_add(&package),
-        Commands::Remove { package } => cmd_remove(&package),
+        Commands::Add { packages } => cmd_add(&packages),
+        Commands::Remove { packages } => cmd_remove(&packages),
         Commands::Run { command } => cmd_run(&command),
         Commands::Lock => cmd_lock(),
         Commands::Status => cmd_status(),
@@ -44,57 +44,94 @@ fn cmd_init() {
     println!("Next: run `rpx add <package>` or `rpx lock`");
 }
 
-fn cmd_add(package: &str) {
+fn cmd_add(packages: &[String]) {
     let mut project = read_description().expect("failed to read DESCRIPTION");
-    let lockfile = read_lockfile_optional().expect("failed to read lockfile");
-
-    if project.description.has_dependency(package) {
-        project.description.add_to_imports(package);
-        write_description(&project);
-        lock_from_description();
-        let _ = sync_from_lockfile();
-        println!("Added {package}");
-        return;
-    }
-
+    let mut lockfile = read_lockfile_optional().expect("failed to read lockfile");
     let registry = registry_base_url();
     let client = RegistryClient::new(&registry);
-    let resolved_addition = resolve_addition_from_latest(&project.description, lockfile.as_ref(), package, &client)
-        .unwrap_or_else(|error| panic!("failed to add package from registry: {error}"));
+    let mut new_packages = Vec::new();
 
-    project
-        .description
-        .add_to_imports_with_constraints(package, &resolved_addition.constraints);
-    write_description(&project);
-    write_lockfile(lockfile_from_resolution(
-        project.description.closure_roots(),
-        client.base_url(),
-        &resolved_addition.resolved,
-    ));
-    let _ = sync_from_lockfile();
-    println!("Added {package}");
-}
+    for package in packages {
+        if project.description.has_dependency(package) {
+            project.description.add_to_imports(package);
+            continue;
+        }
 
-fn cmd_remove(package: &str) {
-    let mut project = read_description().expect("failed to read DESCRIPTION");
-    project.description.remove_from_field("Imports", package);
-    project.description.remove_from_field("Depends", package);
-    write_description(&project);
-
-    let was_installed = installed_packages_by_name().contains_key(package);
-    if was_installed {
-        remove_installed_packages(&[package.to_string()]);
-    } else {
-        remove_installed_package_dir(package);
+        new_packages.push(package.clone());
     }
 
-    lock_from_description();
+    if !new_packages.is_empty() {
+        let resolved_addition = resolve_additions_from_latest(
+            &project.description,
+            lockfile.as_ref(),
+            &new_packages,
+            &client,
+        )
+        .unwrap_or_else(|error| panic!("failed to add package from registry: {error}"));
+
+        for package in &new_packages {
+            let constraints = resolved_addition
+                .constraints
+                .get(package)
+                .expect("resolved addition should include constraints for each new package");
+            project
+                .description
+                .add_to_imports_with_constraints(package, constraints);
+        }
+
+        lockfile = Some(lockfile_from_resolution(
+            project.description.closure_roots(),
+            client.base_url(),
+            &resolved_addition.resolved,
+        ));
+    }
+
+    write_description(&project);
+    if let Some(lockfile) = lockfile {
+        write_lockfile(lockfile);
+    } else {
+        let _ = lock_from_description();
+    }
+    let _ = sync_from_lockfile();
+    println!("Added {}", packages.join(", "));
+}
+
+fn cmd_remove(packages: &[String]) {
+    let mut project = read_description().expect("failed to read DESCRIPTION");
+    for package in packages {
+        project.description.remove_from_field("Imports", package);
+        project.description.remove_from_field("Depends", package);
+    }
+    write_description(&project);
+
+    let installed = installed_packages_by_name();
+    let mut removed = Vec::new();
+    let mut missing = Vec::new();
+    for package in packages {
+        if installed.contains_key(package) {
+            removed.push(package.clone());
+        } else {
+            missing.push(package.clone());
+            remove_installed_package_dir(package);
+        }
+    }
+
+    if !removed.is_empty() {
+        remove_installed_packages(&removed);
+    }
+
+    let _ = lock_from_description();
     let _ = sync_from_lockfile();
 
-    if was_installed {
-        println!("Removed {package}");
-    } else {
-        println!("{package} is already missing from the project library");
+    if !removed.is_empty() {
+        println!("Removed {}", removed.join(", "));
+    }
+    if !missing.is_empty() {
+        println!(
+            "{} {} already missing from the project library",
+            missing.join(", "),
+            if missing.len() == 1 { "is" } else { "are" }
+        );
     }
 }
 
@@ -263,7 +300,7 @@ fn print_status_group(title: &str, items: &[String]) {
 
 #[derive(Debug, PartialEq, Eq)]
 struct AddResolution {
-    constraints: Vec<String>,
+    constraints: BTreeMap<String, Vec<String>>,
     resolved: Vec<ResolvedPackage>,
 }
 
@@ -294,43 +331,51 @@ struct CompletedBuild {
     temp_library: PathBuf,
 }
 
-fn resolve_addition_from_latest(
+fn resolve_additions_from_latest(
     description: &r_description::lossy::RDescription,
     lockfile: Option<&Lockfile>,
-    package: &str,
+    packages: &[String],
     client: &RegistryClient,
 ) -> Result<AddResolution, String> {
-    let latest = client.fetch_latest_version_with_retry(package)?;
-    let constraints = semver_add_constraints(&latest.version)?;
+    let constraints_by_package = latest_constraints_by_package(packages, client)?;
+    let attempts = max_constraint_attempts(&constraints_by_package);
 
-    for constraint in constraints {
+    for index in 0..attempts {
+        let package_constraints = constraints_for_attempt(&constraints_by_package, index);
         let request = ClosureRequest {
-            roots: add_closure_roots(description, lockfile, package, &constraint),
+            roots: add_closure_roots(description, lockfile, &package_constraints),
         };
 
         let closure = client.fetch_closure_with_retry(&request)?;
-        if let Ok(resolved) = resolve_from_closure(&request, &registry::ClosureResponse::Complete(closure)) {
+        if let Ok(resolved) =
+            resolve_from_closure(&request, &registry::ClosureResponse::Complete(closure))
+        {
             return Ok(AddResolution {
-                constraints: persisted_constraints(&constraint),
+                constraints: package_constraints
+                    .into_iter()
+                    .map(|(package, constraint)| (package, persisted_constraints(&constraint)))
+                    .collect(),
                 resolved,
             });
         }
     }
 
-    Err(format!("could not resolve a compatible dependency set for {package}"))
+    Err(format!(
+        "could not resolve a compatible dependency set for {}",
+        packages.join(", ")
+    ))
 }
 
 fn add_closure_roots(
     description: &r_description::lossy::RDescription,
     lockfile: Option<&Lockfile>,
-    new_package: &str,
-    new_constraint: &str,
+    new_packages: &BTreeMap<String, String>,
 ) -> Vec<ClosureRoot> {
     let mut roots = BTreeSet::new();
-    let locked_packages = pinned_existing_roots(description, lockfile, new_package);
+    let locked_packages = pinned_existing_roots(description, lockfile, new_packages);
 
     for root in description.closure_roots() {
-        if root.name == new_package || locked_packages.contains_key(&root.name) {
+        if new_packages.contains_key(&root.name) || locked_packages.contains_key(&root.name) {
             continue;
         }
 
@@ -344,10 +389,12 @@ fn add_closure_roots(
         });
     }
 
-    roots.insert(ClosureRoot {
-        name: new_package.to_string(),
-        constraint: new_constraint.to_string(),
-    });
+    for (name, constraint) in new_packages {
+        roots.insert(ClosureRoot {
+            name: name.clone(),
+            constraint: constraint.clone(),
+        });
+    }
 
     roots.into_iter().collect()
 }
@@ -355,7 +402,7 @@ fn add_closure_roots(
 fn pinned_existing_roots(
     description: &r_description::lossy::RDescription,
     lockfile: Option<&Lockfile>,
-    excluded_package: &str,
+    excluded_packages: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
     let Some(lockfile) = lockfile else {
         return BTreeMap::new();
@@ -364,12 +411,75 @@ fn pinned_existing_roots(
     description
         .requirements()
         .into_iter()
-        .filter(|name| name != excluded_package)
+        .filter(|name| !excluded_packages.contains_key(name))
         .filter_map(|name| {
             lockfile
                 .packages
                 .get(&name)
                 .map(|package| (name, package.version.clone()))
+        })
+        .collect()
+}
+
+fn latest_constraints_by_package(
+    packages: &[String],
+    client: &RegistryClient,
+) -> Result<BTreeMap<String, Vec<String>>, String> {
+    if packages.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let queue = Arc::new(Mutex::new(VecDeque::from(packages.to_vec())));
+    let (sender, receiver) = mpsc::channel();
+
+    for _ in 0..SYNC_WORKERS.min(packages.len()) {
+        let queue = Arc::clone(&queue);
+        let sender = sender.clone();
+        let base_url = client.base_url().to_string();
+        thread::spawn(move || {
+            let client = RegistryClient::new(&base_url);
+            loop {
+                let Some(package) = queue.lock().expect("latest queue should lock").pop_front() else {
+                    break;
+                };
+                let result = client
+                    .fetch_latest_version_with_retry(&package)
+                    .and_then(|latest| semver_add_constraints(&latest.version));
+                let _ = sender.send((package, result));
+            }
+        });
+    }
+    drop(sender);
+
+    let mut constraints = BTreeMap::new();
+    for _ in 0..packages.len() {
+        let (package, result) = receiver.recv().expect("latest worker should return a result");
+        constraints.insert(package.clone(), result.map_err(|error| format!("{package}: {error}"))?);
+    }
+    Ok(constraints)
+}
+
+fn max_constraint_attempts(constraints_by_package: &BTreeMap<String, Vec<String>>) -> usize {
+    constraints_by_package
+        .values()
+        .map(Vec::len)
+        .max()
+        .unwrap_or(0)
+}
+
+fn constraints_for_attempt(
+    constraints_by_package: &BTreeMap<String, Vec<String>>,
+    index: usize,
+) -> BTreeMap<String, String> {
+    constraints_by_package
+        .iter()
+        .map(|(package, constraints)| {
+            let constraint = constraints
+                .get(index)
+                .or_else(|| constraints.last())
+                .expect("each package should have at least one constraint")
+                .clone();
+            (package.clone(), constraint)
         })
         .collect()
 }
@@ -1377,7 +1487,14 @@ mod tests {
             )]),
         };
 
-        let roots = add_closure_roots(&description, Some(&lockfile), "digest", ">= 0.6.37, < 1.0.0");
+        let roots = add_closure_roots(
+            &description,
+            Some(&lockfile),
+            &BTreeMap::from([(
+                "digest".to_string(),
+                ">= 0.6.37, < 1.0.0".to_string(),
+            )]),
+        );
 
         assert_eq!(
             roots,
