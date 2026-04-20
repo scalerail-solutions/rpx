@@ -500,6 +500,7 @@ fn sync_from_lockfile() -> SyncOutcome {
         .map(|package| package.name.clone())
         .collect::<Vec<_>>();
 
+    ui.start_restores(cached_names.len());
     for name in cached_names {
         let package = pending
             .remove(&name)
@@ -508,8 +509,9 @@ fn sync_from_lockfile() -> SyncOutcome {
             .unwrap_or_else(|error| panic!("failed to restore cached package {}@{}: {error}", package.name, package.version));
         satisfied.insert(package.name.clone());
         outcome.installed += 1;
-        ui.cache_hit(&package.name, &package.version);
+        ui.finish_restore(&package.name, &package.version);
     }
+    ui.finish_restores();
 
     let download_order = pending.values().cloned().collect::<Vec<_>>();
     ui.start_downloads(download_order.len());
@@ -559,7 +561,9 @@ fn sync_from_lockfile() -> SyncOutcome {
         .filter(|name| !lockfile.packages.contains_key(name))
         .collect::<Vec<_>>();
     outcome.removed = extras.len();
+    ui.start_removals(extras.len());
     remove_installed_packages(&extras);
+    ui.finish_removals();
 
     let final_state = installed_packages_by_name();
     let missing = lockfile
@@ -1034,12 +1038,34 @@ impl SyncUi {
         }
     }
 
-    fn cache_hit(&self, name: &str, version: &str) {
+    fn start_restores(&self, total: usize) {
+        if total == 0 {
+            return;
+        }
+
+        if self.interactive {
+            self.downloads.set_length(total as u64);
+            self.downloads.set_position(0);
+            self.status
+                .set_message("restoring cached packages".to_string());
+        } else {
+            eprintln!("Restoring {total} cached packages");
+        }
+    }
+
+    fn finish_restore(&self, name: &str, version: &str) {
+        self.downloads.inc(1);
         if self.interactive {
             self.status
                 .set_message(format!("restored {name}@{version} from cache"));
         } else {
             eprintln!("Restored {name}@{version} from cache");
+        }
+    }
+
+    fn finish_restores(&self) {
+        if self.interactive && self.downloads.length().unwrap_or(0) > 0 {
+            self.downloads.finish_and_clear();
         }
     }
 
@@ -1114,6 +1140,25 @@ impl SyncUi {
     fn finish_builds(&self) {
         if self.interactive {
             self.builds.finish_and_clear();
+        }
+    }
+
+    fn start_removals(&self, total: usize) {
+        if total == 0 {
+            return;
+        }
+
+        if self.interactive {
+            self.status
+                .set_message("removing extra packages".to_string());
+        } else {
+            eprintln!("Removing {total} extra packages");
+        }
+    }
+
+    fn finish_removals(&self) {
+        if self.interactive {
+            self.status.set_message("removed extra packages".to_string());
         }
     }
 
