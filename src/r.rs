@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fs, path::{Path, PathBuf}, process::Command, time::{SystemTime, UNIX_EPOCH}};
+use std::{collections::BTreeMap, fs, path::{Path, PathBuf}, process::Command, sync::OnceLock, time::{SystemTime, UNIX_EPOCH}};
 
 use crate::project::project_library_path;
 
@@ -15,9 +15,38 @@ pub struct InstallFailure {
     pub summary: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeInfo {
+    pub version: String,
+    pub platform: String,
+}
+
+static RUNTIME_INFO: OnceLock<RuntimeInfo> = OnceLock::new();
+
 pub fn project_command(program: impl AsRef<str>) -> Command {
+    library_command(program, &project_library_path(), &[])
+}
+
+pub fn library_command(
+    program: impl AsRef<str>,
+    primary_library: &Path,
+    additional_libraries: &[PathBuf],
+) -> Command {
     let mut command = Command::new(program.as_ref());
-    command.env("R_LIBS_USER", project_library_path());
+    let primary_library = primary_library
+        .to_str()
+        .expect("library path should be valid utf-8");
+    command.env("R_LIBS_USER", primary_library);
+
+    if !additional_libraries.is_empty() {
+        let joined = additional_libraries
+            .iter()
+            .map(|path| path.to_str().expect("library path should be valid utf-8"))
+            .collect::<Vec<_>>()
+            .join(":");
+        command.env("R_LIBS", joined);
+    }
+
     command
 }
 
@@ -25,22 +54,29 @@ pub fn install_source_package(
     source_path: &Path,
     package: &str,
     version: &str,
+    target_library: &Path,
+    dependency_libraries: &[PathBuf],
 ) -> Result<(), InstallFailure> {
+    let target_library_path = target_library.to_path_buf();
     let source_path = source_path
         .to_str()
         .expect("source package path should be valid utf-8");
+    let target_library = target_library
+        .to_str()
+        .expect("target library path should be valid utf-8");
     let expression = concat!(
-        "install.packages('%SOURCE%', repos = NULL, type = 'source');",
-        "packages <- installed.packages(lib.loc = .libPaths()[1]);",
+        "install.packages('%SOURCE%', repos = NULL, type = 'source', lib = '%LIB%');",
+        "packages <- installed.packages(lib.loc = '%LIB%');",
         "if (!('%PACKAGE%' %in% rownames(packages))) stop('Expected package %PACKAGE% to be installed');",
         "installed_version <- packages['%PACKAGE%', 'Version'];",
         "if (installed_version != '%VERSION%') stop(sprintf('Installed %s version %s, expected %s', '%PACKAGE%', installed_version, '%VERSION%'))"
     )
     .replace("%SOURCE%", &escape_r_string(source_path))
+    .replace("%LIB%", &escape_r_string(target_library))
     .replace("%PACKAGE%", &escape_r_string(package))
     .replace("%VERSION%", &escape_r_string(version));
 
-    let output = project_command("Rscript")
+    let output = library_command("Rscript", &target_library_path, dependency_libraries)
         .arg("-e")
         .arg(expression)
         .output()
@@ -68,6 +104,12 @@ pub fn install_source_package(
         log_path,
         summary,
     })
+}
+
+pub fn runtime_info() -> RuntimeInfo {
+    RUNTIME_INFO
+        .get_or_init(fetch_runtime_info)
+        .clone()
 }
 
 pub fn installed_packages() -> Vec<InstalledPackage> {
@@ -155,6 +197,29 @@ fn parse_installed_packages(output: &str) -> Vec<InstalledPackage> {
 
 fn escape_r_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+fn fetch_runtime_info() -> RuntimeInfo {
+    let output = Command::new("Rscript")
+        .arg("-e")
+        .arg("cat(as.character(getRversion()), '\t', R.version$platform, sep = '')")
+        .output()
+        .expect("failed to run Rscript");
+
+    crate::exit_with_status(output.status.code());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut parts = stdout.trim().splitn(2, '\t');
+    RuntimeInfo {
+        version: parts
+            .next()
+            .expect("R version should be present")
+            .to_string(),
+        platform: parts
+            .next()
+            .expect("R platform should be present")
+            .to_string(),
+    }
 }
 
 fn summarize_install_output(stdout: &[u8], stderr: &[u8]) -> String {

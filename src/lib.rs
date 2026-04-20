@@ -1,6 +1,6 @@
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use std::{collections::{BTreeMap, BTreeSet}, env, io::IsTerminal, path::Path};
+use std::{collections::{BTreeMap, BTreeSet, VecDeque}, env, fs, io::IsTerminal, path::{Path, PathBuf}, sync::{mpsc, Arc, Mutex}, thread, time::{SystemTime, UNIX_EPOCH}};
 
 mod cli;
 mod description;
@@ -13,12 +13,15 @@ mod resolver;
 use cli::{Cli, Commands};
 use description::{DescriptionExt, init_description, read_description, write_description};
 use lockfile::{Lockfile, read_lockfile, read_lockfile_optional, write_lockfile};
+use project::{build_temp_library_path, compiled_cache_package_path, project_library_path};
 use r::{
-    InstallFailure, install_source_package, installed_packages, installed_packages_by_name, project_command,
+    InstallFailure, RuntimeInfo, install_source_package, installed_packages, installed_packages_by_name, project_command, runtime_info,
     remove_installed_package_dir, remove_installed_packages,
 };
-use registry::{ClosureRequest, ClosureRoot, DEFAULT_REGISTRY_BASE_URL, DownloadProgress, DownloadedArtifact, RegistryClient};
+use registry::{ClosureRequest, ClosureRoot, DEFAULT_REGISTRY_BASE_URL, DownloadedArtifact, RegistryClient};
 use resolver::{ResolvedPackage, resolve_from_closure};
+
+const SYNC_WORKERS: usize = 4;
 
 pub fn run() {
     let cli = Cli::parse();
@@ -275,6 +278,22 @@ struct SyncOutcome {
     removed: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingInstall {
+    name: String,
+    version: String,
+    source_url: String,
+    dependencies: BTreeSet<String>,
+    cache_key: String,
+    cache_path: PathBuf,
+}
+
+#[derive(Debug)]
+struct CompletedBuild {
+    package: PendingInstall,
+    temp_library: PathBuf,
+}
+
 fn resolve_addition_from_latest(
     description: &r_description::lossy::RDescription,
     lockfile: Option<&Lockfile>,
@@ -458,55 +477,93 @@ fn sync_from_lockfile() -> SyncOutcome {
     }
 
     let installed = installed_packages_by_name();
-    let install_order = locked_install_order(&lockfile)
-        .unwrap_or_else(|error| panic!("failed to compute install order from lockfile: {error}"));
-    let exact_reinstalls = install_order
-        .into_iter()
-        .filter_map(|name| {
-            let package = lockfile
+    let runtime = runtime_info();
+    let client = RegistryClient::new(&lockfile.registry);
+    let mut outcome = SyncOutcome::default();
+    let ui = SyncUi::new();
+    let mut satisfied = installed
+        .iter()
+        .filter_map(|(name, installed_package)| {
+            lockfile
                 .packages
-                .get(&name)
-                .expect("ordered package should exist in lockfile");
-            match installed.get(&name) {
-                Some(installed_package) if installed_package.version == package.version => None,
-                _ => Some((name, package.version.clone(), package.source_url.clone())),
-            }
+                .get(name)
+                .filter(|locked_package| locked_package.version == installed_package.version)
+                .map(|_| name.clone())
         })
+        .collect::<BTreeSet<_>>();
+
+    let mut pending = collect_pending_installs(&lockfile, &installed, &runtime);
+
+    let cached_names = pending
+        .values()
+        .filter(|package| package.cache_path.exists())
+        .map(|package| package.name.clone())
         .collect::<Vec<_>>();
 
-    let client = RegistryClient::new(&lockfile.registry);
-    let mut ui = SyncUi::new(exact_reinstalls.len());
-    let mut outcome = SyncOutcome::default();
-
-    for (index, (name, version, source_url)) in exact_reinstalls.iter().enumerate() {
-        let source_url = source_url
-            .as_ref()
-            .unwrap_or_else(|| panic!("lockfile package {name}@{version} is missing source_url"));
-        ui.start_download(index + 1, name, version, None);
-        let artifact = client
-            .download_source_artifact_with_progress(name, version, source_url, |progress| {
-                ui.update_download(progress)
-            })
-            .unwrap_or_else(|error| panic!("failed to download source artifact: {error}"));
-        ui.finish_download(name, version);
-        ui.start_install(index + 1, name, version);
-        if let Err(error) = install_downloaded_artifact(name, version, artifact) {
-            ui.fail_install(name, version);
-            report_install_failure(name, version, &error);
-            std::process::exit(error.exit_code.unwrap_or(1));
-        }
-        ui.finish_install(name, version);
+    ui.start_restores(cached_names.len());
+    for name in cached_names {
+        let package = pending
+            .remove(&name)
+            .expect("cached package should still be pending");
+        restore_cached_package(&package, &project_library_path())
+            .unwrap_or_else(|error| panic!("failed to restore cached package {}@{}: {error}", package.name, package.version));
+        satisfied.insert(package.name.clone());
         outcome.installed += 1;
+        ui.finish_restore(&package.name, &package.version);
     }
+    ui.finish_restores();
 
-    ui.finish();
+    let download_order = pending.values().cloned().collect::<Vec<_>>();
+    ui.start_downloads(download_order.len());
+    let downloaded = download_artifacts_in_parallel(&client, &download_order, &ui)
+        .unwrap_or_else(|error| panic!("failed to prepare source artifacts: {error}"));
+    ui.finish_downloads();
+
+    let project_library = project_library_path();
+    ui.start_builds(downloaded.len());
+    while !pending.is_empty() {
+        let ready_names = ready_install_batch(&pending, &satisfied, SYNC_WORKERS);
+        if ready_names.is_empty() {
+            let blocked = pending.keys().cloned().collect::<Vec<_>>();
+            panic!(
+                "no installable packages remain after dependency resolution: {}",
+                blocked.join(", ")
+            );
+        }
+
+        let batch = ready_names
+            .into_iter()
+            .map(|name| pending.remove(&name).expect("ready package should be pending"))
+            .collect::<Vec<_>>();
+        ui.start_build_batch(&batch);
+        let results = build_batch(&batch, &downloaded, &project_library);
+        for result in results {
+            match result {
+                Ok(completed) => {
+                    finalize_built_package(&completed, &project_library)
+                        .unwrap_or_else(|error| panic!("failed to cache built package {}@{}: {error}", completed.package.name, completed.package.version));
+                    satisfied.insert(completed.package.name.clone());
+                    outcome.installed += 1;
+                    ui.finish_build(&completed.package.name, &completed.package.version);
+                }
+                Err((package, error)) => {
+                    ui.fail_build(&package.name, &package.version);
+                    report_install_failure(&package.name, &package.version, &error);
+                    std::process::exit(error.exit_code.unwrap_or(1));
+                }
+            }
+        }
+    }
+    ui.finish_builds();
 
     let extras = installed_packages_by_name()
         .into_keys()
         .filter(|name| !lockfile.packages.contains_key(name))
         .collect::<Vec<_>>();
     outcome.removed = extras.len();
+    ui.start_removals(extras.len());
     remove_installed_packages(&extras);
+    ui.finish_removals();
 
     let final_state = installed_packages_by_name();
     let missing = lockfile
@@ -537,6 +594,7 @@ fn sync_from_lockfile() -> SyncOutcome {
         .collect::<Vec<_>>();
 
     if missing.is_empty() && extras.is_empty() && version_mismatches.is_empty() {
+        ui.finish();
         return outcome;
     }
 
@@ -555,6 +613,7 @@ fn sync_from_lockfile() -> SyncOutcome {
         );
     }
 
+    ui.finish();
     std::process::exit(1);
 }
 
@@ -620,16 +679,223 @@ fn registry_source_url(registry: &str, package: &str, version: &str) -> String {
     )
 }
 
-fn install_downloaded_artifact(
-    package: &str,
-    version: &str,
-    artifact: DownloadedArtifact,
-) -> Result<(), InstallFailure> {
-    let result = install_source_package(artifact.path(), package, version);
-    artifact.cleanup();
-    result
+fn collect_pending_installs(
+    lockfile: &Lockfile,
+    installed: &BTreeMap<String, r::InstalledPackage>,
+    runtime: &RuntimeInfo,
+) -> BTreeMap<String, PendingInstall> {
+    lockfile
+        .packages
+        .iter()
+        .filter_map(|(name, package)| match installed.get(name) {
+            Some(installed_package) if installed_package.version == package.version => None,
+            _ => {
+                let source_url = package
+                    .source_url
+                    .clone()
+                    .unwrap_or_else(|| panic!("lockfile package {name}@{} is missing source_url", package.version));
+                let dependencies = package
+                    .dependencies
+                    .iter()
+                    .filter(|dependency| lockfile.packages.contains_key(&dependency.package))
+                    .map(|dependency| dependency.package.clone())
+                    .collect::<BTreeSet<_>>();
+                let cache_key = compiled_cache_key(name, &package.version, runtime);
+                let cache_path = compiled_cache_package_path(&cache_key, name);
+
+                Some((
+                    name.clone(),
+                    PendingInstall {
+                        name: name.clone(),
+                        version: package.version.clone(),
+                        source_url,
+                        dependencies,
+                        cache_key,
+                        cache_path,
+                    },
+                ))
+            }
+        })
+        .collect()
 }
 
+fn compiled_cache_key(package: &str, version: &str, runtime: &RuntimeInfo) -> String {
+    let input = format!("{package}\n{version}\n{}\n{}", runtime.version, runtime.platform);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    use std::hash::{Hash, Hasher};
+    input.hash(&mut hasher);
+    format!(
+        "{}-{}-{:016x}",
+        package,
+        version,
+        hasher.finish()
+    )
+}
+
+fn restore_cached_package(package: &PendingInstall, target_library: &Path) -> Result<(), String> {
+    copy_package_into_library(&package.cache_path, target_library)
+}
+
+fn download_artifacts_in_parallel(
+    client: &RegistryClient,
+    packages: &[PendingInstall],
+    ui: &SyncUi,
+) -> Result<BTreeMap<String, DownloadedArtifact>, String> {
+    if packages.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let queue = Arc::new(Mutex::new(VecDeque::from(packages.to_vec())));
+    let (sender, receiver) = mpsc::channel();
+
+    for _ in 0..SYNC_WORKERS.min(packages.len()) {
+        let queue = Arc::clone(&queue);
+        let sender = sender.clone();
+        let base_url = client.base_url().to_string();
+        thread::spawn(move || {
+            let client = RegistryClient::new(&base_url);
+            loop {
+                let Some(package) = queue.lock().expect("download queue should lock").pop_front() else {
+                    break;
+                };
+
+                let result = client
+                    .download_source_artifact(&package.name, &package.version, &package.source_url);
+                let _ = sender.send((package, result));
+            }
+        });
+    }
+    drop(sender);
+
+    let mut downloaded = BTreeMap::new();
+    for _ in 0..packages.len() {
+        let (package, result) = receiver.recv().expect("download worker should return a result");
+        let artifact = result.map_err(|error| format!("{}@{}: {error}", package.name, package.version))?;
+        ui.finish_download(&package.name, &package.version);
+        downloaded.insert(package.name.clone(), artifact);
+    }
+
+    Ok(downloaded)
+}
+
+fn ready_install_batch(
+    pending: &BTreeMap<String, PendingInstall>,
+    satisfied: &BTreeSet<String>,
+    concurrency: usize,
+) -> Vec<String> {
+    pending
+        .values()
+        .filter(|package| package.dependencies.iter().all(|dependency| satisfied.contains(dependency)))
+        .take(concurrency)
+        .map(|package| package.name.clone())
+        .collect()
+}
+
+fn build_batch(
+    batch: &[PendingInstall],
+    artifacts: &BTreeMap<String, DownloadedArtifact>,
+    dependency_library: &Path,
+) -> Vec<Result<CompletedBuild, (PendingInstall, InstallFailure)>> {
+    let (sender, receiver) = mpsc::channel();
+
+    for package in batch.iter().cloned() {
+        let sender = sender.clone();
+        let artifact_path = artifacts
+            .get(&package.name)
+            .expect("artifact should exist for pending package")
+            .path()
+            .to_path_buf();
+        let dependency_library = dependency_library.to_path_buf();
+        thread::spawn(move || {
+            let temp_library = build_temp_library_path(&package.name, &unique_build_token());
+            let package_for_success = package.clone();
+            let package_for_error = package.clone();
+            let result = install_source_package(
+                &artifact_path,
+                &package.name,
+                &package.version,
+                &temp_library,
+                &[dependency_library],
+            )
+            .map(|_| CompletedBuild {
+                package: package_for_success,
+                temp_library,
+            })
+            .map_err(|error| (package_for_error, error));
+            let _ = sender.send(result);
+        });
+    }
+    drop(sender);
+
+    (0..batch.len())
+        .map(|_| receiver.recv().expect("build worker should return a result"))
+        .collect()
+}
+
+fn finalize_built_package(completed: &CompletedBuild, target_library: &Path) -> Result<(), String> {
+    let built_package_path = completed.temp_library.join(&completed.package.name);
+    if !built_package_path.exists() {
+        return Err(format!(
+            "built package directory is missing: {}",
+            built_package_path.display()
+        ));
+    }
+
+    copy_package_dir(&built_package_path, &completed.package.cache_path)?;
+    copy_package_into_library(&completed.package.cache_path, target_library)?;
+    fs::remove_dir_all(
+        completed
+            .temp_library
+            .parent()
+            .expect("temporary build library should have a parent"),
+    )
+    .map_err(|error| format!("failed to clean temporary build directory: {error}"))?;
+    Ok(())
+}
+
+fn copy_package_into_library(package_path: &Path, target_library: &Path) -> Result<(), String> {
+    let package_name = package_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("invalid package path: {}", package_path.display()))?;
+    copy_package_dir(package_path, &target_library.join(package_name))
+}
+
+fn copy_package_dir(source: &Path, destination: &Path) -> Result<(), String> {
+    if destination.exists() {
+        fs::remove_dir_all(destination)
+            .map_err(|error| format!("failed to replace package directory: {error}"))?;
+    }
+    fs::create_dir_all(destination)
+        .map_err(|error| format!("failed to create package directory: {error}"))?;
+
+    for entry in fs::read_dir(source).map_err(|error| format!("failed to read package directory: {error}"))? {
+        let entry = entry.map_err(|error| format!("failed to read package entry: {error}"))?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("failed to inspect package entry: {error}"))?;
+        if file_type.is_dir() {
+            copy_package_dir(&source_path, &destination_path)?;
+        } else {
+            fs::copy(&source_path, &destination_path)
+                .map_err(|error| format!("failed to copy package file: {error}"))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn unique_build_token() -> String {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    format!("{}-{unique}", std::process::id())
+}
+
+#[cfg(test)]
 fn locked_install_order(lockfile: &Lockfile) -> Result<Vec<String>, String> {
     let mut indegree = lockfile
         .packages
@@ -726,127 +992,179 @@ fn read_log_tail(path: &Path, max_lines: usize) -> String {
 
 struct SyncUi {
     interactive: bool,
-    overall: ProgressBar,
-    current: ProgressBar,
-    total: usize,
+    downloads: ProgressBar,
+    builds: ProgressBar,
+    status: ProgressBar,
 }
 
 impl SyncUi {
-    fn new(total: usize) -> Self {
+    fn new() -> Self {
         let interactive = std::io::stderr().is_terminal();
 
         if interactive {
             let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr());
-            let overall = multi.add(ProgressBar::new(total as u64));
-            overall.set_style(
-                ProgressStyle::with_template("{bar:40.cyan/blue} {pos}/{len} packages")
+            let downloads = multi.add(ProgressBar::new(0));
+            downloads.set_style(
+                ProgressStyle::with_template("downloads [{bar:30.cyan/blue}] {pos}/{len}")
                     .expect("progress template should parse")
                     .progress_chars("##-"),
             );
-            let current = multi.add(ProgressBar::new_spinner());
-            current.set_style(
+            let builds = multi.add(ProgressBar::new(0));
+            builds.set_style(
+                ProgressStyle::with_template("builds    [{bar:30.green/blue}] {pos}/{len}")
+                    .expect("progress template should parse")
+                    .progress_chars("##-"),
+            );
+            let status = multi.add(ProgressBar::new_spinner());
+            status.set_style(
                 ProgressStyle::with_template("{spinner} {msg}")
                     .expect("progress template should parse"),
             );
+            status.enable_steady_tick(std::time::Duration::from_millis(100));
 
             Self {
                 interactive,
-                overall,
-                current,
-                total,
+                downloads,
+                builds,
+                status,
             }
         } else {
             Self {
                 interactive,
-                overall: ProgressBar::hidden(),
-                current: ProgressBar::hidden(),
-                total,
+                downloads: ProgressBar::hidden(),
+                builds: ProgressBar::hidden(),
+                status: ProgressBar::hidden(),
             }
         }
     }
 
-    fn start_download(&mut self, index: usize, name: &str, version: &str, total_bytes: Option<u64>) {
-        if self.interactive {
-            self.current.set_length(total_bytes.unwrap_or(0));
-            if total_bytes.is_some() {
-                self.current.set_style(
-                    ProgressStyle::with_template(
-                        "{spinner} downloading {msg} [{bar:30.cyan/blue}] {bytes}/{total_bytes}",
-                    )
-                    .expect("progress template should parse")
-                    .progress_chars("##-"),
-                );
-            } else {
-                self.current.set_style(
-                    ProgressStyle::with_template("{spinner} downloading {msg} {bytes}")
-                        .expect("progress template should parse"),
-                );
-            }
-            self.current.set_position(0);
-            self.current.enable_steady_tick(std::time::Duration::from_millis(100));
-            self.current
-                .set_message(format!("{index}/{} {name}@{version}", self.total));
-        } else {
-            eprintln!("Downloading {index}/{}: {name}@{version}", self.total);
-        }
-    }
-
-    fn update_download(&self, progress: DownloadProgress) {
-        if !self.interactive {
+    fn start_restores(&self, total: usize) {
+        if total == 0 {
             return;
         }
 
-        if let Some(total_bytes) = progress.total_bytes {
-            if self.current.length() != Some(total_bytes) {
-                self.current.set_length(total_bytes);
-            }
-            self.current.set_position(progress.downloaded_bytes.min(total_bytes));
+        if self.interactive {
+            self.downloads.set_length(total as u64);
+            self.downloads.set_position(0);
+            self.status
+                .set_message("restoring cached packages".to_string());
         } else {
-            self.current.set_position(progress.downloaded_bytes);
+            eprintln!("Restoring {total} cached packages");
+        }
+    }
+
+    fn finish_restore(&self, name: &str, version: &str) {
+        self.downloads.inc(1);
+        if self.interactive {
+            self.status
+                .set_message(format!("restored {name}@{version} from cache"));
+        } else {
+            eprintln!("Restored {name}@{version} from cache");
+        }
+    }
+
+    fn finish_restores(&self) {
+        if self.interactive && self.downloads.length().unwrap_or(0) > 0 {
+            self.downloads.finish_and_clear();
+        }
+    }
+
+    fn start_downloads(&self, total: usize) {
+        if self.interactive {
+            self.downloads.set_length(total as u64);
+            self.downloads.set_position(0);
+            self.status.set_message("downloading source packages".to_string());
+        } else {
+            eprintln!("Downloading {total} packages");
         }
     }
 
     fn finish_download(&self, name: &str, version: &str) {
+        self.downloads.inc(1);
         if self.interactive {
-            self.current.finish_with_message(format!("downloaded {name}@{version}"));
-            self.current.reset();
-        }
-    }
-
-    fn start_install(&self, index: usize, name: &str, version: &str) {
-        if self.interactive {
-            self.current.set_style(
-                ProgressStyle::with_template("{spinner} installing {msg}")
-                    .expect("progress template should parse"),
-            );
-            self.current.enable_steady_tick(std::time::Duration::from_millis(100));
-            self.current
-                .set_message(format!("{index}/{} {name}@{version}", self.total));
+            self.status.set_message(format!("downloaded {name}@{version}"));
         } else {
-            eprintln!("Installing {index}/{}: {name}@{version}", self.total);
+            eprintln!("Downloaded {name}@{version}");
         }
     }
 
-    fn finish_install(&self, name: &str, version: &str) {
-        self.overall.inc(1);
+    fn finish_downloads(&self) {
         if self.interactive {
-            self.current.finish_with_message(format!("installed {name}@{version}"));
-            self.current.reset();
+            self.downloads.finish_and_clear();
+        }
+    }
+
+    fn start_builds(&self, total: usize) {
+        if self.interactive {
+            self.builds.set_length(total as u64);
+            self.builds.set_position(0);
+            self.status.set_message("building packages".to_string());
         } else {
-            eprintln!("Installed {name}@{version}");
+            eprintln!("Building {total} packages");
         }
     }
 
-    fn fail_install(&self, name: &str, version: &str) {
+    fn start_build_batch(&self, batch: &[PendingInstall]) {
         if self.interactive {
-            self.current.abandon_with_message(format!("failed {name}@{version}"));
+            let names = batch
+                .iter()
+                .map(|package| package.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.status.set_message(format!("building {names}"));
+        } else {
+            let names = batch
+                .iter()
+                .map(|package| format!("{}@{}", package.name, package.version))
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!("Building {names}");
+        }
+    }
+
+    fn finish_build(&self, name: &str, version: &str) {
+        self.builds.inc(1);
+        if self.interactive {
+            self.status.set_message(format!("built {name}@{version}"));
+        } else {
+            eprintln!("Built {name}@{version}");
+        }
+    }
+
+    fn fail_build(&self, name: &str, version: &str) {
+        if self.interactive {
+            self.status.set_message(format!("failed {name}@{version}"));
+        }
+    }
+
+    fn finish_builds(&self) {
+        if self.interactive {
+            self.builds.finish_and_clear();
+        }
+    }
+
+    fn start_removals(&self, total: usize) {
+        if total == 0 {
+            return;
+        }
+
+        if self.interactive {
+            self.status
+                .set_message("removing extra packages".to_string());
+        } else {
+            eprintln!("Removing {total} extra packages");
+        }
+    }
+
+    fn finish_removals(&self) {
+        if self.interactive {
+            self.status.set_message("removed extra packages".to_string());
         }
     }
 
     fn finish(&self) {
         if self.interactive {
-            self.overall.finish_and_clear();
-            self.current.finish_and_clear();
+            self.status.finish_and_clear();
         }
     }
 }
