@@ -85,7 +85,7 @@ fn current_dir() -> PathBuf {
 }
 
 fn project_dirs() -> ProjectDirs {
-    ProjectDirs::from("dev", "blyedev", "rpx").expect("failed to resolve rpx data directory")
+    ProjectDirs::from("de", "scalerail", "rpx").expect("failed to resolve rpx data directory")
 }
 
 fn ensure_parent_dir(path: &Path) {
