@@ -56,6 +56,7 @@ fn runs_rpx_add_inside_custom_r_image() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
 
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(stdout.contains("Added digest"), "stdout was: {stdout}\nstderr was: {stderr}");
     assert_package_state(&container, working_path, "digest", "TRUE");
 
     let lockfile = read_project_file(&container, project_path, "rpx.lock");
@@ -96,6 +97,7 @@ fn runs_rpx_remove_inside_custom_r_image() {
     let remove_command = format!("cd {project_path} && rpx remove digest");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &remove_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(stdout.contains("Removed digest"), "stdout was: {stdout}\nstderr was: {stderr}");
     assert_package_state(&container, project_path, "digest", "FALSE");
 
     let lockfile = read_project_file(&container, project_path, "rpx.lock");
@@ -106,6 +108,32 @@ fn runs_rpx_remove_inside_custom_r_image() {
         !description.contains("digest"),
         "DESCRIPTION was: {description}"
     );
+}
+
+#[test]
+fn reports_when_removed_package_is_already_missing_from_library() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-remove-missing";
+    create_package_project(&container, project_path);
+
+    let add_command = format!("mkdir -p {project_path} && cd {project_path} && rpx add digest");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &add_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let remove_package_dir = format!(
+        "cd {project_path} && rm -rf \"$(rpx run Rscript -e \"cat(file.path(.libPaths()[1], 'digest'))\")\""
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &remove_package_dir);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let remove_command = format!("cd {project_path} && rpx remove digest");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &remove_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stdout.contains("digest is already missing from the project library"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert_package_state(&container, project_path, "digest", "FALSE");
 }
 
 #[test]

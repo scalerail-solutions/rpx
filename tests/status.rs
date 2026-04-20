@@ -15,7 +15,7 @@ fn runs_rpx_status_for_clean_project() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stdout.contains("Status: ok"),
+        stdout.contains("Project is in sync"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }
@@ -40,11 +40,19 @@ fn runs_rpx_status_for_lockfile_drift() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
     assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stdout.contains("Status: drift"),
+        stdout.contains("Lockfile is out of date"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert!(
-        stdout.contains("Missing from lockfile: digest"),
+        stdout.contains("Run: rpx lock"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert!(
+        stdout.contains("Packages in DESCRIPTION but not locked:"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert!(
+        stdout.contains("- digest"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }
@@ -69,7 +77,7 @@ fn runs_rpx_status_ignores_additional_repositories() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stdout.contains("Status: ok"),
+        stdout.contains("Project is in sync"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }
@@ -94,7 +102,19 @@ fn runs_rpx_status_for_missing_library_package() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
     assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stdout.contains("Missing from library: digest"),
+        stdout.contains("Project library is out of sync"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert!(
+        stdout.contains("Run: rpx sync"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert!(
+        stdout.contains("Packages locked but not installed:"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert!(
+        stdout.contains("- digest"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }
@@ -118,7 +138,15 @@ fn runs_rpx_status_for_extra_library_package() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
     assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stdout.contains("Extra in library: jsonlite"),
+        stdout.contains("Project library is out of sync"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert!(
+        stdout.contains("Packages installed but not locked:"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert!(
+        stdout.contains("- jsonlite"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }
@@ -143,7 +171,15 @@ fn runs_rpx_status_for_version_mismatch() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
     assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stdout.contains("Version mismatch: digest ("),
+        stdout.contains("Project library is out of sync"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert!(
+        stdout.contains("Installed versions that differ from rpx.lock:"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert!(
+        stdout.contains("- digest ("),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert!(

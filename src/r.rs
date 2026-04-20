@@ -107,13 +107,23 @@ pub fn remove_installed_packages(packages: &[String]) {
         .collect::<Vec<_>>()
         .join(", ");
 
-    let status = project_command("Rscript")
+    let output = project_command("Rscript")
         .arg("-e")
         .arg(format!("remove.packages(c({package_expression}))"))
-        .status()
+        .output()
         .expect("failed to run Rscript");
 
-    crate::exit_with_status(status.code());
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stdout.trim().is_empty() {
+            eprintln!("{stdout}");
+        }
+        if !stderr.trim().is_empty() {
+            eprintln!("{stderr}");
+        }
+        crate::exit_with_status(output.status.code());
+    }
 
     for package in packages {
         remove_installed_package_dir(package);
