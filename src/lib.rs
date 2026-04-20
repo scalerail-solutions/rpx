@@ -13,7 +13,6 @@ mod resolver;
 use cli::{Cli, Commands};
 use description::{DescriptionExt, init_description, read_description, write_description};
 use lockfile::{Lockfile, read_lockfile, read_lockfile_optional, write_lockfile};
-use project::lockfile_path;
 use r::{
     InstallFailure, install_source_package, installed_packages, installed_packages_by_name, project_command,
     remove_installed_package_dir, remove_installed_packages,
@@ -43,10 +42,6 @@ fn cmd_init() {
 }
 
 fn cmd_add(package: &str) {
-    if lockfile_path().exists() {
-        let _ = sync_from_lockfile();
-    }
-
     let mut project = read_description().expect("failed to read DESCRIPTION");
     let lockfile = read_lockfile_optional().expect("failed to read lockfile");
 
