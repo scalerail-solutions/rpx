@@ -1,6 +1,6 @@
+use crate::project::artifact_cache_path;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use crate::project::artifact_cache_path;
 use std::{
     fs,
     io::{Read, Write},
@@ -77,7 +77,11 @@ pub struct RegistryVersion {
 impl std::fmt::Display for RegistryVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.build != 0 {
-            return write!(f, "{}.{}.{}.{}", self.major, self.minor, self.patch, self.build);
+            return write!(
+                f,
+                "{}.{}.{}.{}",
+                self.major, self.minor, self.patch, self.build
+            );
         }
 
         if self.patch != 0 {
@@ -154,6 +158,19 @@ pub struct RegistryClient {
     base_url: String,
     client: reqwest::blocking::Client,
     poll_config: PollConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactKind {
+    Source,
+    Binary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactRequest {
+    pub kind: ArtifactKind,
+    pub url: String,
+    pub cache_file_name: String,
 }
 
 impl Default for RegistryClient {
@@ -260,7 +277,10 @@ impl RegistryClient {
     fn fetch_latest_version_once(&self, package: &str) -> Result<LatestVersionEnvelope, String> {
         let response = self
             .client
-            .get(format!("{}/packages/{package}/versions/latest", self.base_url))
+            .get(format!(
+                "{}/packages/{package}/versions/latest",
+                self.base_url
+            ))
             .send()
             .map_err(|error| format!("failed to contact registry: {error}"))?;
 
@@ -297,7 +317,10 @@ impl RegistryClient {
         Err("registry is still hydrating dependencies; wait a bit and retry".to_string())
     }
 
-    fn fetch_package_versions_once(&self, package: &str) -> Result<PackageVersionsEnvelope, String> {
+    fn fetch_package_versions_once(
+        &self,
+        package: &str,
+    ) -> Result<PackageVersionsEnvelope, String> {
         let response = self
             .client
             .get(format!("{}/packages/{package}/versions", self.base_url))
@@ -307,22 +330,26 @@ impl RegistryClient {
         decode_json_response(response, "failed to decode package versions response")
     }
 
-    pub fn download_source_artifact(
+    pub fn download_artifact(
         &self,
         package: &str,
         version: &str,
-        source_url: &str,
+        artifact: &ArtifactRequest,
     ) -> Result<DownloadedArtifact, String> {
-        let path = artifact_cache_path(package, version);
+        let path = artifact_cache_path(package, version, &artifact.cache_file_name);
         if path.exists() {
             return Ok(DownloadedArtifact { path });
         }
 
+        let artifact_label = match artifact.kind {
+            ArtifactKind::Source => "source artifact",
+            ArtifactKind::Binary => "binary artifact",
+        };
         let response = self
             .client
-            .get(source_url)
+            .get(&artifact.url)
             .send()
-            .map_err(|error| format!("failed to download source artifact: {error}"))?;
+            .map_err(|error| format!("failed to download {artifact_label}: {error}"))?;
 
         let status = response.status();
         if !status.is_success() {
@@ -337,20 +364,20 @@ impl RegistryClient {
         }
 
         let mut file = fs::File::create(&path)
-            .map_err(|error| format!("failed to write source artifact: {error}"))?;
+            .map_err(|error| format!("failed to write {artifact_label}: {error}"))?;
         let mut response = response;
         let mut buffer = [0_u8; 16 * 1024];
 
         loop {
             let read = response
                 .read(&mut buffer)
-                .map_err(|error| format!("failed to read source artifact: {error}"))?;
+                .map_err(|error| format!("failed to read {artifact_label}: {error}"))?;
             if read == 0 {
                 break;
             }
 
             file.write_all(&buffer[..read])
-                .map_err(|error| format!("failed to write source artifact: {error}"))?;
+                .map_err(|error| format!("failed to write {artifact_label}: {error}"))?;
         }
 
         Ok(DownloadedArtifact { path })
@@ -404,7 +431,6 @@ impl DownloadedArtifact {
     pub fn path(&self) -> &Path {
         &self.path
     }
-
 }
 
 #[cfg(test)]
@@ -752,7 +778,7 @@ mod tests {
 
     #[test]
     fn downloads_source_artifact_to_a_local_file() {
-        clear_cached_artifact("digest", "0.6.37");
+        clear_cached_artifact("digest", "0.6.37", "digest_0.6.37.tar.gz");
 
         let mut server = Server::new();
         let mock = server
@@ -764,22 +790,26 @@ mod tests {
 
         let client = RegistryClient::new(server.url());
         let artifact = client
-            .download_source_artifact(
+            .download_artifact(
                 "digest",
                 "0.6.37",
-                &format!("{}/packages/digest/versions/0.6.37/source", server.url()),
+                &ArtifactRequest {
+                    kind: ArtifactKind::Source,
+                    url: format!("{}/packages/digest/versions/0.6.37/source", server.url()),
+                    cache_file_name: "digest_0.6.37.tar.gz".to_string(),
+                },
             )
             .expect("download should succeed");
 
         mock.assert();
         let contents = fs::read(artifact.path()).expect("artifact should exist");
         assert_eq!(contents, b"fake-tarball");
-        clear_cached_artifact("digest", "0.6.37");
+        clear_cached_artifact("digest", "0.6.37", "digest_0.6.37.tar.gz");
     }
 
     #[test]
     fn surfaces_source_artifact_download_errors() {
-        clear_cached_artifact("digest", "0.6.37");
+        clear_cached_artifact("digest", "0.6.37", "digest_0.6.37.tar.gz");
 
         let mut server = Server::new();
         let mock = server
@@ -790,10 +820,14 @@ mod tests {
 
         let client = RegistryClient::new(server.url());
         let error = client
-            .download_source_artifact(
+            .download_artifact(
                 "digest",
                 "0.6.37",
-                &format!("{}/packages/digest/versions/0.6.37/source", server.url()),
+                &ArtifactRequest {
+                    kind: ArtifactKind::Source,
+                    url: format!("{}/packages/digest/versions/0.6.37/source", server.url()),
+                    cache_file_name: "digest_0.6.37.tar.gz".to_string(),
+                },
             )
             .expect_err("download should fail");
 
@@ -803,8 +837,45 @@ mod tests {
         );
     }
 
-    fn clear_cached_artifact(package: &str, version: &str) {
-        let path = artifact_cache_path(package, version);
+    #[test]
+    fn downloads_binary_artifact_to_a_local_file() {
+        clear_cached_artifact("digest", "0.6.37", "digest_0.6.37.zip");
+
+        let mut server = Server::new();
+        let mock = server
+            .mock(
+                "GET",
+                "/packages/digest/versions/0.6.37/binaries/windows/4.5",
+            )
+            .with_status(200)
+            .with_header("content-type", "application/zip")
+            .with_body("fake-zip")
+            .create();
+
+        let client = RegistryClient::new(server.url());
+        let artifact = client
+            .download_artifact(
+                "digest",
+                "0.6.37",
+                &ArtifactRequest {
+                    kind: ArtifactKind::Binary,
+                    url: format!(
+                        "{}/packages/digest/versions/0.6.37/binaries/windows/4.5",
+                        server.url()
+                    ),
+                    cache_file_name: "digest_0.6.37.zip".to_string(),
+                },
+            )
+            .expect("download should succeed");
+
+        mock.assert();
+        let contents = fs::read(artifact.path()).expect("artifact should exist");
+        assert_eq!(contents, b"fake-zip");
+        clear_cached_artifact("digest", "0.6.37", "digest_0.6.37.zip");
+    }
+
+    fn clear_cached_artifact(package: &str, version: &str, file_name: &str) {
+        let path = artifact_cache_path(package, version, file_name);
         let _ = fs::remove_file(&path);
     }
 }

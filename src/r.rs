@@ -1,4 +1,11 @@
-use std::{collections::BTreeMap, fs, path::{Path, PathBuf}, process::Command, sync::OnceLock, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::OnceLock,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use crate::project::project_library_path;
 
@@ -19,6 +26,7 @@ pub struct InstallFailure {
 pub struct RuntimeInfo {
     pub version: String,
     pub platform: String,
+    pub pkg_type: String,
 }
 
 static RUNTIME_INFO: OnceLock<RuntimeInfo> = OnceLock::new();
@@ -50,28 +58,30 @@ pub fn library_command(
     command
 }
 
-pub fn install_source_package(
-    source_path: &Path,
+pub fn install_local_package(
+    artifact_path: &Path,
     package: &str,
     version: &str,
+    pkg_type: &str,
     target_library: &Path,
     dependency_libraries: &[PathBuf],
 ) -> Result<(), InstallFailure> {
     let target_library_path = target_library.to_path_buf();
-    let source_path = source_path
+    let artifact_path = artifact_path
         .to_str()
-        .expect("source package path should be valid utf-8");
+        .expect("artifact path should be valid utf-8");
     let target_library = target_library
         .to_str()
         .expect("target library path should be valid utf-8");
     let expression = concat!(
-        "install.packages('%SOURCE%', repos = NULL, type = 'source', lib = '%LIB%');",
+        "install.packages('%ARTIFACT%', repos = NULL, type = '%TYPE%', lib = '%LIB%');",
         "packages <- installed.packages(lib.loc = '%LIB%');",
         "if (!('%PACKAGE%' %in% rownames(packages))) stop('Expected package %PACKAGE% to be installed');",
         "installed_version <- packages['%PACKAGE%', 'Version'];",
         "if (installed_version != '%VERSION%') stop(sprintf('Installed %s version %s, expected %s', '%PACKAGE%', installed_version, '%VERSION%'))"
     )
-    .replace("%SOURCE%", &escape_r_string(source_path))
+    .replace("%ARTIFACT%", &escape_r_string(artifact_path))
+    .replace("%TYPE%", &escape_r_string(pkg_type))
     .replace("%LIB%", &escape_r_string(target_library))
     .replace("%PACKAGE%", &escape_r_string(package))
     .replace("%VERSION%", &escape_r_string(version));
@@ -107,9 +117,7 @@ pub fn install_source_package(
 }
 
 pub fn runtime_info() -> RuntimeInfo {
-    RUNTIME_INFO
-        .get_or_init(fetch_runtime_info)
-        .clone()
+    RUNTIME_INFO.get_or_init(fetch_runtime_info).clone()
 }
 
 pub fn installed_packages() -> Vec<InstalledPackage> {
@@ -202,14 +210,14 @@ fn escape_r_string(value: &str) -> String {
 fn fetch_runtime_info() -> RuntimeInfo {
     let output = Command::new("Rscript")
         .arg("-e")
-        .arg("cat(as.character(getRversion()), '\t', R.version$platform, sep = '')")
+        .arg("cat(as.character(getRversion()), '\t', R.version$platform, '\t', .Platform$pkgType, sep = '')")
         .output()
         .expect("failed to run Rscript");
 
     crate::exit_with_status(output.status.code());
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut parts = stdout.trim().splitn(2, '\t');
+    let mut parts = stdout.trim().splitn(3, '\t');
     RuntimeInfo {
         version: parts
             .next()
@@ -219,11 +227,19 @@ fn fetch_runtime_info() -> RuntimeInfo {
             .next()
             .expect("R platform should be present")
             .to_string(),
+        pkg_type: parts
+            .next()
+            .expect("R package type should be present")
+            .to_string(),
     }
 }
 
 fn summarize_install_output(stdout: &[u8], stderr: &[u8]) -> String {
-    let combined = [String::from_utf8_lossy(stderr), String::from_utf8_lossy(stdout)].join("\n");
+    let combined = [
+        String::from_utf8_lossy(stderr),
+        String::from_utf8_lossy(stdout),
+    ]
+    .join("\n");
     let lines = combined
         .lines()
         .map(str::trim)

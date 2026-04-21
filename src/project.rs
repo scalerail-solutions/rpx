@@ -33,13 +33,13 @@ pub fn project_library_path() -> PathBuf {
     library_path
 }
 
-pub fn artifact_cache_path(package: &str, version: &str) -> PathBuf {
+pub fn artifact_cache_path(package: &str, version: &str, file_name: &str) -> PathBuf {
     let path = project_dirs()
         .cache_dir()
         .join("artifacts")
         .join(package)
         .join(version)
-        .join("source.tar.gz");
+        .join(file_name);
     ensure_parent_dir(&path);
     path
 }

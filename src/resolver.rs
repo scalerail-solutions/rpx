@@ -340,8 +340,7 @@ enum VersionPart<'a> {
 #[cfg(test)]
 mod tests {
     use crate::registry::{
-        ClosureDependency, ClosureRoot, CompleteClosureResponse, IngestingResponse,
-        RegistryVersion,
+        ClosureDependency, ClosureRoot, CompleteClosureResponse, IngestingResponse, RegistryVersion,
     };
 
     use super::*;
@@ -461,7 +460,10 @@ mod tests {
         let response = complete_response(vec![
             package(
                 "pkg",
-                vec![version("1.0.0", vec![dependency("dep", "Imports", "<< 2.0.0")])],
+                vec![version(
+                    "1.0.0",
+                    vec![dependency("dep", "Imports", "<< 2.0.0")],
+                )],
             ),
             package(
                 "dep",
@@ -527,7 +529,11 @@ mod tests {
         let mut min_version = None;
         let mut max_version_exclusive = None;
 
-        for part in constraint.split(',').map(str::trim).filter(|part| !part.is_empty()) {
+        for part in constraint
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+        {
             if let Some(version) = part.strip_prefix(">=") {
                 min_version = Some(registry_version(version.trim()));
             } else if let Some(version) = part.strip_prefix("<<") {

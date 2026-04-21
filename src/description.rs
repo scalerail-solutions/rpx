@@ -68,7 +68,11 @@ impl DescriptionExt for RDescription {
 
         let mut imports = self.imports.clone().unwrap_or_default();
 
-        if constraints.is_empty() || constraints.iter().all(|constraint| constraint.trim() == "*") {
+        if constraints.is_empty()
+            || constraints
+                .iter()
+                .all(|constraint| constraint.trim() == "*")
+        {
             imports.0.push(Relation {
                 name: package.to_string(),
                 version: None,
@@ -228,19 +232,28 @@ fn compare_dependency_entries(left: &str, right: &str) -> std::cmp::Ordering {
         .to_ascii_lowercase()
         .cmp(&dependency_entry_name(right).to_ascii_lowercase())
         .then_with(|| dependency_entry_name(left).cmp(dependency_entry_name(right)))
-        .then_with(|| dependency_entry_operator_rank(left).cmp(&dependency_entry_operator_rank(right)))
+        .then_with(|| {
+            dependency_entry_operator_rank(left).cmp(&dependency_entry_operator_rank(right))
+        })
         .then_with(|| left.cmp(right))
 }
 
 fn dependency_entry_name(entry: &str) -> &str {
-    entry.split_once(" (").map(|(name, _)| name).unwrap_or(entry)
+    entry
+        .split_once(" (")
+        .map(|(name, _)| name)
+        .unwrap_or(entry)
 }
 
 fn dependency_entry_operator_rank(entry: &str) -> u8 {
     let Some((_, rest)) = entry.split_once(" (") else {
         return 0;
     };
-    let operator = rest.trim_end_matches(')').split_whitespace().next().unwrap_or("");
+    let operator = rest
+        .trim_end_matches(')')
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
     match operator {
         ">=" => 1,
         ">>" => 2,
@@ -265,7 +278,10 @@ fn relation_with_constraint(package: &str, constraint: &str) -> Relation {
 
     Relation {
         name: package.to_string(),
-        version: Some((operator, version.parse().expect("constraint version should parse"))),
+        version: Some((
+            operator,
+            version.parse().expect("constraint version should parse"),
+        )),
     }
 }
 
