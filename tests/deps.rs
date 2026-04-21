@@ -56,7 +56,10 @@ fn runs_rpx_add_inside_custom_r_image() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
 
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
-    assert!(stdout.contains("Added digest"), "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stdout.contains("Added digest"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
     assert_package_state(&container, working_path, "digest", "TRUE");
 
     let lockfile = read_project_file(&container, project_path, "rpx.lock");
@@ -65,10 +68,7 @@ fn runs_rpx_add_inside_custom_r_image() {
         lockfile.contains("\"registry\""),
         "lockfile was: {lockfile}"
     );
-    assert!(
-        lockfile.contains("\"roots\""),
-        "lockfile was: {lockfile}"
-    );
+    assert!(lockfile.contains("\"roots\""), "lockfile was: {lockfile}");
     assert!(
         lockfile.contains("\"packages\""),
         "lockfile was: {lockfile}"
@@ -97,7 +97,10 @@ fn runs_rpx_remove_inside_custom_r_image() {
     let remove_command = format!("cd {project_path} && rpx remove digest");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &remove_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
-    assert!(stdout.contains("Removed digest"), "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stdout.contains("Removed digest"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
     assert_package_state(&container, project_path, "digest", "FALSE");
 
     let lockfile = read_project_file(&container, project_path, "rpx.lock");
@@ -145,14 +148,20 @@ fn adds_and_removes_multiple_packages() {
     let add_command = format!("cd {project_path} && rpx add digest cli");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &add_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
-    assert!(stdout.contains("Added digest, cli"), "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stdout.contains("Added digest, cli"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
     assert_package_state(&container, project_path, "digest", "TRUE");
     assert_package_state(&container, project_path, "cli", "TRUE");
 
     let remove_command = format!("cd {project_path} && rpx remove digest cli");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &remove_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
-    assert!(stdout.contains("Removed digest, cli"), "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stdout.contains("Removed digest, cli"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
     assert_package_state(&container, project_path, "digest", "FALSE");
     assert_package_state(&container, project_path, "cli", "FALSE");
 }

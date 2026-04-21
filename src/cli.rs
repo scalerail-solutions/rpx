@@ -24,7 +24,11 @@ pub enum Commands {
         long_about = "Install one or more packages for this project. Each package is recorded in DESCRIPTION, then rpx regenerates rpx.lock and syncs the project library."
     )]
     Add {
-        #[arg(help = "Package names to add to the project's dependencies", value_name = "PACKAGE", required = true)]
+        #[arg(
+            help = "Package names to add to the project's dependencies",
+            value_name = "PACKAGE",
+            required = true
+        )]
         packages: Vec<String>,
     },
 
@@ -33,7 +37,11 @@ pub enum Commands {
         long_about = "Remove one or more packages from this project. The packages are removed from DESCRIPTION, the project library is synced, and rpx regenerates rpx.lock."
     )]
     Remove {
-        #[arg(help = "Package names to remove from the project's dependencies", value_name = "PACKAGE", required = true)]
+        #[arg(
+            help = "Package names to remove from the project's dependencies",
+            value_name = "PACKAGE",
+            required = true
+        )]
         packages: Vec<String>,
     },
 
