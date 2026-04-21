@@ -1,12 +1,14 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     cmp::Reverse,
     collections::BTreeMap,
     error::Error,
     fmt,
+    io::{self, IsTerminal},
     str::FromStr,
 };
 
+use indicatif::{ProgressBar, ProgressStyle};
 use pubgrub::{
     Dependencies, DependencyConstraints, DependencyProvider, PackageResolutionStatistics, Ranges,
     resolve,
@@ -67,16 +69,26 @@ impl From<String> for ResolverError {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct RegistryDependencyProvider<'a> {
     client: &'a RegistryClient,
+    progress: ResolutionProgress,
     root_dependencies: Vec<PackageDependency>,
     versions_by_package: RefCell<BTreeMap<String, Vec<VersionSummary>>>,
     metadata_by_package_version: RefCell<BTreeMap<(String, String), PackageMetadata>>,
 }
 
+#[derive(Debug)]
+struct ResolutionProgress {
+    bar: ProgressBar,
+    version_loads: Cell<u64>,
+    description_loads: Cell<u64>,
+    cache_hits: Cell<u64>,
+}
+
 impl<'a> RegistryDependencyProvider<'a> {
     fn new(client: &'a RegistryClient, roots: &[ClosureRoot]) -> Result<Self, ResolverError> {
+        let progress = ResolutionProgress::new();
         let root_dependencies = roots
             .iter()
             .map(|root| {
@@ -95,6 +107,7 @@ impl<'a> RegistryDependencyProvider<'a> {
 
         Ok(Self {
             client,
+            progress,
             root_dependencies,
             versions_by_package: RefCell::new(BTreeMap::new()),
             metadata_by_package_version: RefCell::new(BTreeMap::new()),
@@ -103,9 +116,11 @@ impl<'a> RegistryDependencyProvider<'a> {
 
     fn package_versions(&self, package: &str) -> Result<Vec<VersionSummary>, ResolverError> {
         if let Some(versions) = self.versions_by_package.borrow().get(package) {
+            self.progress.on_cache_hit(&format!("cached versions for {package}"));
             return Ok(versions.clone());
         }
 
+        self.progress.on_version_load(package);
         let mut versions = self.client.fetch_package_versions_with_retry(package)?.versions;
         versions.sort_by(|left, right| {
             let left_version = parse_version(&left.version).expect("registry version should parse");
@@ -130,9 +145,12 @@ impl<'a> RegistryDependencyProvider<'a> {
     fn package_metadata(&self, package: &str, version: &Version) -> Result<PackageMetadata, ResolverError> {
         let key = (package.to_string(), version.to_string());
         if let Some(metadata) = self.metadata_by_package_version.borrow().get(&key) {
+            self.progress
+                .on_cache_hit(&format!("cached DESCRIPTION for {package}@{version}"));
             return Ok(metadata.clone());
         }
 
+        self.progress.on_description_load(package, version);
         let version_entry = self
             .package_versions(package)?
             .into_iter()
@@ -166,6 +184,68 @@ impl<'a> RegistryDependencyProvider<'a> {
                 .map(|dependency| dependency.resolved)
                 .collect(),
         })
+    }
+
+    fn finish_progress(&self, resolved_packages: usize) {
+        self.progress.finish(resolved_packages);
+    }
+}
+
+impl ResolutionProgress {
+    fn new() -> Self {
+        let bar = if io::stderr().is_terminal() {
+            let bar = ProgressBar::new_spinner();
+            bar.set_style(
+                ProgressStyle::with_template("{spinner} {msg}")
+                    .expect("resolution spinner template should be valid"),
+            );
+            bar.enable_steady_tick(std::time::Duration::from_millis(120));
+            bar
+        } else {
+            ProgressBar::hidden()
+        };
+
+        let progress = Self {
+            bar,
+            version_loads: Cell::new(0),
+            description_loads: Cell::new(0),
+            cache_hits: Cell::new(0),
+        };
+        progress.update_message("starting resolution");
+        progress
+    }
+
+    fn on_version_load(&self, package: &str) {
+        self.version_loads.set(self.version_loads.get() + 1);
+        self.update_message(&format!("loading versions for {package}"));
+    }
+
+    fn on_description_load(&self, package: &str, version: &Version) {
+        self.description_loads.set(self.description_loads.get() + 1);
+        self.update_message(&format!("loading DESCRIPTION for {package}@{version}"));
+    }
+
+    fn on_cache_hit(&self, detail: &str) {
+        self.cache_hits.set(self.cache_hits.get() + 1);
+        self.update_message(detail);
+    }
+
+    fn finish(&self, resolved_packages: usize) {
+        self.bar.finish_with_message(format!(
+            "resolved {resolved_packages} packages (version lists: {}, descriptions: {}, cache hits: {})",
+            self.version_loads.get(),
+            self.description_loads.get(),
+            self.cache_hits.get()
+        ));
+    }
+
+    fn update_message(&self, detail: &str) {
+        self.bar.set_message(format!(
+            "resolving packages: {detail} (version lists: {}, descriptions: {}, cache hits: {})",
+            self.version_loads.get(),
+            self.description_loads.get(),
+            self.cache_hits.get()
+        ));
     }
 }
 
@@ -266,13 +346,33 @@ pub fn resolve_from_registry(
     roots: &[ClosureRoot],
 ) -> Result<Vec<ResolvedPackage>, String> {
     let provider = RegistryDependencyProvider::new(client, roots).map_err(|error| error.to_string())?;
-    let selected = solve_selected_versions(&provider)?;
+    let selected = match solve_selected_versions(&provider) {
+        Ok(selected) => selected,
+        Err(error) => {
+            provider.progress.bar.finish_with_message(format!(
+                "resolution failed (version lists: {}, descriptions: {}, cache hits: {})",
+                provider.progress.version_loads.get(),
+                provider.progress.description_loads.get(),
+                provider.progress.cache_hits.get()
+            ));
+            return Err(error);
+        }
+    };
     let mut resolved = selected
         .into_iter()
         .map(|(package, version)| provider.resolved_package(&package, &version))
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|error: ResolverError| error.to_string())?;
+        .map_err(|error: ResolverError| {
+            provider.progress.bar.finish_with_message(format!(
+                "resolution failed (version lists: {}, descriptions: {}, cache hits: {})",
+                provider.progress.version_loads.get(),
+                provider.progress.description_loads.get(),
+                provider.progress.cache_hits.get()
+            ));
+            error.to_string()
+        })?;
     resolved.sort_by(|left, right| left.name.cmp(&right.name));
+    provider.finish_progress(resolved.len());
     Ok(resolved)
 }
 
@@ -423,7 +523,7 @@ fn root_version() -> Version {
 }
 
 fn is_not_found_error(error: &str) -> bool {
-    error.starts_with("unexpected registry response (404)")
+    error.starts_with("unexpected registry response (404")
 }
 
 #[derive(Debug, Clone, Copy)]
