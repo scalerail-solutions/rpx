@@ -12,6 +12,7 @@ use std::{
 };
 
 pub const DEFAULT_REGISTRY_BASE_URL: &str = "https://api.rrepo.org";
+const VERSION_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ResolutionRoot {
@@ -94,6 +95,7 @@ pub struct RegistryClient {
     base_url: String,
     client: reqwest::blocking::Client,
     poll_config: PollConfig,
+    version_cache_ttl: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,11 +123,25 @@ impl RegistryClient {
     }
 
     pub fn with_poll_config(base_url: impl AsRef<str>, poll_config: PollConfig) -> Self {
+        Self::with_config(base_url, poll_config, VERSION_CACHE_TTL)
+    }
+
+    fn with_config(
+        base_url: impl AsRef<str>,
+        poll_config: PollConfig,
+        version_cache_ttl: Duration,
+    ) -> Self {
         Self {
             base_url: base_url.as_ref().trim_end_matches('/').to_string(),
             client: reqwest::blocking::Client::new(),
             poll_config,
+            version_cache_ttl,
         }
+    }
+
+    #[cfg(test)]
+    fn with_cache_ttl(base_url: impl AsRef<str>, ttl: Duration) -> Self {
+        Self::with_config(base_url, PollConfig::default(), ttl)
     }
 
     pub fn base_url(&self) -> &str {
@@ -176,7 +192,10 @@ impl RegistryClient {
 
     #[cfg(test)]
     fn fetch_package_versions(&self, package: &str) -> Result<PackageVersionsResponse, String> {
-        if let Some(response) = read_json_cache(&self.package_versions_cache_path(package)) {
+        if let Some(response) = read_json_cache_fresh(
+            &self.package_versions_cache_path(package),
+            self.version_cache_ttl,
+        ) {
             return Ok(response);
         }
 
@@ -205,7 +224,10 @@ impl RegistryClient {
         &self,
         package: &str,
     ) -> Result<PackageVersionsResponse, String> {
-        if let Some(response) = read_json_cache(&self.package_versions_cache_path(package)) {
+        if let Some(response) = read_json_cache_fresh(
+            &self.package_versions_cache_path(package),
+            self.version_cache_ttl,
+        ) {
             return Ok(response);
         }
 
@@ -442,9 +464,27 @@ fn unexpected_response_message(response: reqwest::blocking::Response) -> String 
     format!("unexpected registry response ({status}): {body}")
 }
 
-fn read_json_cache<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+fn read_json_cache_fresh<T: serde::de::DeserializeOwned>(path: &Path, ttl: Duration) -> Option<T> {
+    if !is_fresh(path, ttl) {
+        return None;
+    }
+
     let contents = fs::read(path).ok()?;
     serde_json::from_slice(&contents).ok()
+}
+
+fn is_fresh(path: &Path, ttl: Duration) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    let Ok(age) = modified.elapsed() else {
+        return false;
+    };
+
+    age <= ttl
 }
 
 fn write_json_cache<T: Serialize>(path: &Path, value: &T) {
@@ -670,6 +710,31 @@ mod tests {
         let second = client
             .fetch_package_versions_with_retry("dplyr")
             .expect("cached package versions fetch should succeed");
+
+        mock.assert();
+        assert_eq!(first, second);
+        clear_registry_metadata_cache(client.base_url());
+    }
+
+    #[test]
+    fn refreshes_stale_package_versions_cache() {
+        let mut server = Server::new();
+        clear_registry_metadata_cache(&server.url());
+        let mock = server
+            .mock("GET", "/packages/dplyr/versions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(sample_package_versions_body())
+            .expect(2)
+            .create();
+
+        let client = RegistryClient::with_cache_ttl(server.url(), Duration::ZERO);
+        let first = client
+            .fetch_package_versions_with_retry("dplyr")
+            .expect("initial package versions fetch should succeed");
+        let second = client
+            .fetch_package_versions_with_retry("dplyr")
+            .expect("stale package versions fetch should refresh");
 
         mock.assert();
         assert_eq!(first, second);
