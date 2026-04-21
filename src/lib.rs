@@ -21,17 +21,20 @@ mod resolver;
 use cli::{Cli, Commands};
 use description::{DescriptionExt, init_description, read_description, write_description};
 use lockfile::{Lockfile, read_lockfile, read_lockfile_optional, write_lockfile};
-use project::{build_temp_library_path, compiled_cache_package_path, project_library_path};
+use project::{
+    build_temp_library_path, cache_dir_path, compiled_cache_package_path, project_library_path,
+    project_library_root_path,
+};
 use r::{
     InstallFailure, RuntimeInfo, install_local_package, installed_packages,
     installed_packages_by_name, project_command, remove_installed_package_dir,
     remove_installed_packages, runtime_info,
 };
 use registry::{
-    ArtifactKind, ArtifactRequest, ClosureRequest, ClosureRoot, DEFAULT_REGISTRY_BASE_URL,
+    ArtifactKind, ArtifactRequest, ClosureRoot, DEFAULT_REGISTRY_BASE_URL,
     DownloadedArtifact, RegistryClient,
 };
-use resolver::{ResolvedPackage, resolve_from_closure};
+use resolver::{ResolvedPackage, resolve_from_registry};
 
 const SYNC_WORKERS: usize = 4;
 
@@ -46,6 +49,7 @@ pub fn run() {
         Commands::Lock => cmd_lock(),
         Commands::Status => cmd_status(),
         Commands::Sync => cmd_sync(),
+        Commands::Clean => cmd_clean(),
     }
 }
 
@@ -298,6 +302,30 @@ fn cmd_status() {
     std::process::exit(1);
 }
 
+fn cmd_clean() {
+    let mut removed_any = false;
+
+    removed_any |= remove_dir_if_exists(&project_library_root_path(), "project library");
+    removed_any |= remove_dir_if_exists(&cache_dir_path(), "cache directory");
+
+    if removed_any {
+        println!("Removed project library and cache directories");
+    } else {
+        println!("Project library and cache directories are already clean");
+    }
+}
+
+fn remove_dir_if_exists(path: &Path, label: &str) -> bool {
+    if !path.exists() {
+        return false;
+    }
+
+    fs::remove_dir_all(path).unwrap_or_else(|error| {
+        panic!("failed to remove {label} at {}: {error}", path.display())
+    });
+    true
+}
+
 fn print_status_group(title: &str, items: &[String]) {
     if items.is_empty() {
         return;
@@ -362,14 +390,9 @@ fn resolve_additions_from_latest(
 
     for index in 0..attempts {
         let package_constraints = constraints_for_attempt(&constraints_by_package, index);
-        let request = ClosureRequest {
-            roots: add_closure_roots(description, lockfile, &package_constraints),
-        };
+        let roots = add_closure_roots(description, lockfile, &package_constraints);
 
-        let closure = client.fetch_closure_with_retry(&request)?;
-        if let Ok(resolved) =
-            resolve_from_closure(&request, &registry::ClosureResponse::Complete(closure))
-        {
+        if let Ok(resolved) = resolve_from_registry(client, &roots) {
             return Ok(AddResolution {
                 constraints: package_constraints
                     .into_iter()
@@ -575,15 +598,9 @@ fn lock_from_description() -> LockOutcome {
         return LockOutcome { changed };
     }
 
-    let request = ClosureRequest {
-        roots: roots.clone(),
-    };
     let client = RegistryClient::new(&registry);
-    let closure = client
-        .fetch_closure_with_retry(&request)
-        .unwrap_or_else(|error| panic!("failed to resolve lockfile from registry: {error}"));
-    let resolved = resolve_from_closure(&request, &registry::ClosureResponse::Complete(closure))
-        .unwrap_or_else(|error| panic!("failed to resolve package set from closure: {error}"));
+    let resolved = resolve_from_registry(&client, &roots)
+        .unwrap_or_else(|error| panic!("failed to resolve package set from registry: {error}"));
 
     let lockfile = lockfile_from_resolution(roots, client.base_url(), &resolved);
     let changed = existing_lockfile.as_ref() != Some(&lockfile);
