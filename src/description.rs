@@ -4,14 +4,14 @@ use r_description::{
 use std::{collections::BTreeSet, fs, str::FromStr};
 
 use crate::project::{current_description_path, description_path};
-use crate::registry::ClosureRoot;
+use crate::registry::ResolutionRoot;
 
 pub trait DescriptionExt {
     fn add_to_imports(&mut self, package: &str);
     fn add_to_imports_with_constraints(&mut self, package: &str, constraints: &[String]);
     fn has_dependency(&self, package: &str) -> bool;
     fn remove_from_field(&mut self, field_name: &str, package: &str);
-    fn closure_roots(&self) -> Vec<ClosureRoot>;
+    fn resolution_roots(&self) -> Vec<ResolutionRoot>;
     fn requirements(&self) -> Vec<String>;
 }
 
@@ -143,19 +143,19 @@ impl DescriptionExt for RDescription {
         }
     }
 
-    fn closure_roots(&self) -> Vec<ClosureRoot> {
+    fn resolution_roots(&self) -> Vec<ResolutionRoot> {
         let mut roots = BTreeSet::new();
 
         if let Some(imports) = &self.imports {
             for relation in imports.iter() {
-                roots.insert(closure_root_from_relation(relation));
+                roots.insert(resolution_root_from_relation(relation));
             }
         }
 
         if let Some(depends) = &self.depends {
             for relation in depends.iter() {
                 if relation.name != "R" {
-                    roots.insert(closure_root_from_relation(relation));
+                    roots.insert(resolution_root_from_relation(relation));
                 }
             }
         }
@@ -306,20 +306,20 @@ fn parse_constraint(constraint: &str) -> (VersionConstraint, &str) {
     panic!("invalid dependency constraint: {constraint}");
 }
 
-fn closure_root_from_relation(relation: &Relation) -> ClosureRoot {
+fn resolution_root_from_relation(relation: &Relation) -> ResolutionRoot {
     let constraint = relation
         .version
         .as_ref()
-        .map(|(operator, version)| format!("{} {version}", closure_operator(operator)))
+        .map(|(operator, version)| format!("{} {version}", relation_operator(operator)))
         .unwrap_or_else(|| "*".to_string());
 
-    ClosureRoot {
+    ResolutionRoot {
         name: relation.name.clone(),
         constraint,
     }
 }
 
-fn closure_operator(operator: &VersionConstraint) -> &'static str {
+fn relation_operator(operator: &VersionConstraint) -> &'static str {
     match operator {
         VersionConstraint::LessThan => "<",
         VersionConstraint::GreaterThan => ">",
@@ -415,7 +415,7 @@ mod tests {
         DescriptionExt, format_description_for_write, parse_constraint, relation_with_constraint,
         sanitize_package_name, title_from_package_name,
     };
-    use crate::registry::ClosureRoot;
+    use crate::registry::ResolutionRoot;
     use r_description::{VersionConstraint, lossy::RDescription};
     use std::str::FromStr;
 
@@ -533,20 +533,20 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_strict_relation_operators_for_closure_requests() {
+    fn normalizes_strict_relation_operators_for_resolution_roots() {
         let description = RDescription::from_str(
             "Package: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\nImports: AzureAuth (<< 2.0.0), httr2 (>> 1.0.0)\n",
         )
         .expect("description should parse");
 
         assert_eq!(
-            description.closure_roots(),
+            description.resolution_roots(),
             vec![
-                ClosureRoot {
+                ResolutionRoot {
                     name: "AzureAuth".to_string(),
                     constraint: "< 2.0.0".to_string(),
                 },
-                ClosureRoot {
+                ResolutionRoot {
                     name: "httr2".to_string(),
                     constraint: "> 1.0.0".to_string(),
                 },

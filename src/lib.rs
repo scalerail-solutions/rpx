@@ -31,7 +31,7 @@ use r::{
     remove_installed_packages, runtime_info,
 };
 use registry::{
-    ArtifactKind, ArtifactRequest, ClosureRoot, DEFAULT_REGISTRY_BASE_URL,
+    ArtifactKind, ArtifactRequest, DEFAULT_REGISTRY_BASE_URL, ResolutionRoot,
     DownloadedArtifact, RegistryClient,
 };
 use resolver::{ResolvedPackage, resolve_from_registry};
@@ -96,7 +96,7 @@ fn cmd_add(packages: &[String]) {
         }
 
         lockfile = Some(lockfile_from_resolution(
-            project.description.closure_roots(),
+            project.description.resolution_roots(),
             client.base_url(),
             &resolved_addition.resolved,
         ));
@@ -390,7 +390,7 @@ fn resolve_additions_from_latest(
 
     for index in 0..attempts {
         let package_constraints = constraints_for_attempt(&constraints_by_package, index);
-        let roots = add_closure_roots(description, lockfile, &package_constraints);
+        let roots = add_resolution_roots(description, lockfile, &package_constraints);
 
         if let Ok(resolved) = resolve_from_registry(client, &roots) {
             return Ok(AddResolution {
@@ -409,15 +409,15 @@ fn resolve_additions_from_latest(
     ))
 }
 
-fn add_closure_roots(
+fn add_resolution_roots(
     description: &r_description::lossy::RDescription,
     lockfile: Option<&Lockfile>,
     new_packages: &BTreeMap<String, String>,
-) -> Vec<ClosureRoot> {
+) -> Vec<ResolutionRoot> {
     let mut roots = BTreeSet::new();
     let locked_packages = pinned_existing_roots(description, lockfile, new_packages);
 
-    for root in description.closure_roots() {
+    for root in description.resolution_roots() {
         if new_packages.contains_key(&root.name) || locked_packages.contains_key(&root.name) {
             continue;
         }
@@ -426,14 +426,14 @@ fn add_closure_roots(
     }
 
     for (name, version) in locked_packages {
-        roots.insert(ClosureRoot {
+        roots.insert(ResolutionRoot {
             name,
             constraint: format!("= {version}"),
         });
     }
 
     for (name, constraint) in new_packages {
-        roots.insert(ClosureRoot {
+        roots.insert(ResolutionRoot {
             name: name.clone(),
             constraint: constraint.clone(),
         });
@@ -587,7 +587,7 @@ fn persisted_constraints(constraint: &str) -> Vec<String> {
 
 fn lock_from_description() -> LockOutcome {
     let project = read_description().expect("failed to read DESCRIPTION");
-    let roots = project.description.closure_roots();
+    let roots = project.description.resolution_roots();
     let registry = registry_base_url();
     let existing_lockfile = read_lockfile_optional().expect("failed to read lockfile");
 
@@ -794,7 +794,7 @@ fn registry_base_url() -> String {
 }
 
 fn lockfile_from_resolution(
-    roots: Vec<ClosureRoot>,
+    roots: Vec<ResolutionRoot>,
     registry: &str,
     resolved: &[ResolvedPackage],
 ) -> Lockfile {
@@ -1453,7 +1453,7 @@ impl SyncUi {
 #[cfg(test)]
 mod tests {
     use super::{
-        add_closure_roots, binary_artifact_request, compiled_cache_key, locked_install_order,
+        add_resolution_roots, binary_artifact_request, compiled_cache_key, locked_install_order,
         lockfile_from_resolution, persisted_constraints, r_minor_version, registry_base_url,
         semver_add_constraints, should_fallback_to_source,
     };
@@ -1461,7 +1461,7 @@ mod tests {
         description::DescriptionExt,
         lockfile::{LockedDependency, LockedPackage, LockedRoot, Lockfile},
         r::RuntimeInfo,
-        registry::ClosureRoot,
+        registry::ResolutionRoot,
         resolver::{ResolvedDependency, ResolvedPackage},
     };
     use r_description::lossy::RDescription;
@@ -1473,24 +1473,24 @@ mod tests {
     };
 
     #[test]
-    fn builds_closure_roots_from_description_constraints() {
+    fn builds_resolution_roots_from_description_constraints() {
         let description = RDescription::from_str(
             "Package: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\nImports: cli (>= 3.6.0), digest\nDepends: R (>= 4.2), jsonlite (= 1.8.9)\n",
         )
         .expect("description should parse");
 
         assert_eq!(
-            description.closure_roots(),
+            description.resolution_roots(),
             vec![
-                ClosureRoot {
+                ResolutionRoot {
                     name: "cli".to_string(),
                     constraint: ">= 3.6.0".to_string(),
                 },
-                ClosureRoot {
+                ResolutionRoot {
                     name: "digest".to_string(),
                     constraint: "*".to_string(),
                 },
-                ClosureRoot {
+                ResolutionRoot {
                     name: "jsonlite".to_string(),
                     constraint: "= 1.8.9".to_string(),
                 },
@@ -1502,11 +1502,11 @@ mod tests {
     fn builds_lockfile_from_registry_resolution() {
         let lockfile = lockfile_from_resolution(
             vec![
-                ClosureRoot {
+                ResolutionRoot {
                     name: "digest".to_string(),
                     constraint: "*".to_string(),
                 },
-                ClosureRoot {
+                ResolutionRoot {
                     name: "cli".to_string(),
                     constraint: "= 3.6.5".to_string(),
                 },
@@ -1664,7 +1664,7 @@ mod tests {
             )]),
         };
 
-        let roots = add_closure_roots(
+        let roots = add_resolution_roots(
             &description,
             Some(&lockfile),
             &BTreeMap::from([("digest".to_string(), ">= 0.6.37, < 1.0.0".to_string())]),
@@ -1673,11 +1673,11 @@ mod tests {
         assert_eq!(
             roots,
             vec![
-                ClosureRoot {
+                ResolutionRoot {
                     name: "cli".to_string(),
                     constraint: "= 3.6.5".to_string(),
                 },
-                ClosureRoot {
+                ResolutionRoot {
                     name: "digest".to_string(),
                     constraint: ">= 0.6.37, < 1.0.0".to_string(),
                 },
