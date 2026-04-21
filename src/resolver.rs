@@ -18,7 +18,7 @@ use r_description::{
     lossy::{RDescription, Relation, Relations},
 };
 
-use crate::registry::{ClosureRoot, RegistryClient, VersionSummary};
+use crate::registry::{RegistryClient, ResolutionRoot, VersionSummary};
 
 const ROOT_PACKAGE: &str = "__rpx_root__";
 type VersionRange = Ranges<Version>;
@@ -87,7 +87,7 @@ struct ResolutionProgress {
 }
 
 impl<'a> RegistryDependencyProvider<'a> {
-    fn new(client: &'a RegistryClient, roots: &[ClosureRoot]) -> Result<Self, ResolverError> {
+    fn new(client: &'a RegistryClient, roots: &[ResolutionRoot]) -> Result<Self, ResolverError> {
         let progress = ResolutionProgress::new();
         let root_dependencies = roots
             .iter()
@@ -343,7 +343,7 @@ impl DependencyProvider for RegistryDependencyProvider<'_> {
 
 pub fn resolve_from_registry(
     client: &RegistryClient,
-    roots: &[ClosureRoot],
+    roots: &[ResolutionRoot],
 ) -> Result<Vec<ResolvedPackage>, String> {
     let provider = RegistryDependencyProvider::new(client, roots).map_err(|error| error.to_string())?;
     let selected = match solve_selected_versions(&provider) {
