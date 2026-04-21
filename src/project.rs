@@ -22,15 +22,22 @@ pub fn lockfile_path() -> PathBuf {
 }
 
 pub fn project_library_path() -> PathBuf {
-    let project_key = hash_path(&project_root());
-    let library_path = project_dirs()
-        .data_dir()
-        .join("libraries")
-        .join(project_key)
-        .join("library");
+    let library_path = project_library_root_path().join("library");
 
     fs::create_dir_all(&library_path).expect("failed to create project library");
     library_path
+}
+
+pub fn project_library_root_path() -> PathBuf {
+    let project_key = hash_path(&project_root());
+    project_dirs()
+        .data_dir()
+        .join("libraries")
+        .join(project_key)
+}
+
+pub fn cache_dir_path() -> PathBuf {
+    project_dirs().cache_dir().to_path_buf()
 }
 
 pub fn artifact_cache_path(package: &str, version: &str, file_name: &str) -> PathBuf {

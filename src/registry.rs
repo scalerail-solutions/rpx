@@ -127,6 +127,12 @@ enum PackageVersionsEnvelope {
     Ingesting(ClosureResponse),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DescriptionEnvelope {
+    Complete(String),
+    Ingesting(ClosureResponse),
+}
+
 #[derive(Debug, Clone)]
 pub struct PollConfig {
     delays: Vec<Duration>,
@@ -196,6 +202,7 @@ impl RegistryClient {
         &self.base_url
     }
 
+    #[allow(dead_code)]
     pub fn fetch_closure_with_retry(
         &self,
         request: &ClosureRequest,
@@ -215,6 +222,7 @@ impl RegistryClient {
         Err("registry is still hydrating dependencies; wait a bit and retry".to_string())
     }
 
+    #[allow(dead_code)]
     fn fetch_closure_once(&self, request: &ClosureRequest) -> Result<ClosureResponse, String> {
         let response = self
             .client
@@ -317,6 +325,26 @@ impl RegistryClient {
         Err("registry is still hydrating dependencies; wait a bit and retry".to_string())
     }
 
+    pub fn fetch_description_with_retry(
+        &self,
+        package: &str,
+        version: &str,
+    ) -> Result<String, String> {
+        for (attempt, delay) in self.poll_config.delays.iter().enumerate() {
+            match self.fetch_description_once(package, version)? {
+                DescriptionEnvelope::Complete(description) => return Ok(description),
+                DescriptionEnvelope::Ingesting(_) => {
+                    if attempt == self.poll_config.delays.len() - 1 {
+                        break;
+                    }
+                    thread::sleep(*delay);
+                }
+            }
+        }
+
+        Err("registry is still hydrating dependencies; wait a bit and retry".to_string())
+    }
+
     fn fetch_package_versions_once(
         &self,
         package: &str,
@@ -328,6 +356,23 @@ impl RegistryClient {
             .map_err(|error| format!("failed to contact registry: {error}"))?;
 
         decode_json_response(response, "failed to decode package versions response")
+    }
+
+    fn fetch_description_once(
+        &self,
+        package: &str,
+        version: &str,
+    ) -> Result<DescriptionEnvelope, String> {
+        let response = self
+            .client
+            .get(format!(
+                "{}/packages/{package}/versions/{version}/description",
+                self.base_url
+            ))
+            .send()
+            .map_err(|error| format!("failed to contact registry: {error}"))?;
+
+        decode_description_response(response)
     }
 
     pub fn download_artifact(
@@ -394,6 +439,37 @@ fn decode_json_response<T: serde::de::DeserializeOwned>(
         return response
             .json::<T>()
             .map_err(|error| format!("{decode_error}: {error}"));
+    }
+
+    if status.is_server_error() {
+        let body = response.text().unwrap_or_default();
+        let body = body.trim();
+
+        if body.is_empty() {
+            return Err(format!("registry error ({status})"));
+        }
+
+        return Err(format!("registry error ({status}): {body}"));
+    }
+
+    Err(unexpected_response_message(response))
+}
+
+fn decode_description_response(response: reqwest::blocking::Response) -> Result<DescriptionEnvelope, String> {
+    let status = response.status();
+
+    if status == StatusCode::ACCEPTED {
+        return response
+            .json::<ClosureResponse>()
+            .map(DescriptionEnvelope::Ingesting)
+            .map_err(|error| format!("failed to decode DESCRIPTION response: {error}"));
+    }
+
+    if status.is_success() {
+        return response
+            .text()
+            .map(DescriptionEnvelope::Complete)
+            .map_err(|error| format!("failed to decode DESCRIPTION response: {error}"));
     }
 
     if status.is_server_error() {
@@ -505,6 +581,10 @@ mod tests {
     }
   ]
 }"#
+    }
+
+    fn sample_description_body() -> &'static str {
+        "Package: dplyr\nVersion: 1.1.4\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\nImports: rlang\n"
     }
 
     #[test]
@@ -629,6 +709,56 @@ mod tests {
 
         second.assert();
         assert_eq!(response.versions.len(), 2);
+    }
+
+    #[test]
+    fn fetches_remote_description_text() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/packages/dplyr/versions/1.1.4/description")
+            .with_status(200)
+            .with_header("content-type", "text/plain")
+            .with_body(sample_description_body())
+            .create();
+
+        let client = RegistryClient::new(server.url());
+        let response = client
+            .fetch_description_with_retry("dplyr", "1.1.4")
+            .expect("description fetch should succeed");
+
+        mock.assert();
+        assert!(response.contains("Package: dplyr"));
+        assert!(response.contains("Imports: rlang"));
+    }
+
+    #[test]
+    fn polls_until_description_is_ready() {
+        let mut server = Server::new();
+        let _first = server
+            .mock("GET", "/packages/dplyr/versions/1.1.4/description")
+            .with_status(202)
+            .with_header("content-type", "application/json")
+            .with_body(sample_ingesting_body())
+            .expect(1)
+            .create();
+        let second = server
+            .mock("GET", "/packages/dplyr/versions/1.1.4/description")
+            .with_status(200)
+            .with_header("content-type", "text/plain")
+            .with_body(sample_description_body())
+            .expect(1)
+            .create();
+
+        let client = RegistryClient::with_poll_config(
+            server.url(),
+            PollConfig::from_delays(vec![Duration::ZERO, Duration::ZERO, Duration::ZERO]),
+        );
+        let response = client
+            .fetch_description_with_retry("dplyr", "1.1.4")
+            .expect("description fetch should succeed");
+
+        second.assert();
+        assert!(response.contains("Version: 1.1.4"));
     }
 
     #[test]

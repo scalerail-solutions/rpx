@@ -77,4 +77,10 @@ pub enum Commands {
         long_about = "Install the exact package set recorded in rpx.lock into the project library."
     )]
     Sync,
+
+    #[command(
+        about = "Remove project library and caches",
+        long_about = "Remove this project's isolated library and wipe rpx cache directories so the next sync or add starts from a clean local state."
+    )]
+    Clean,
 }
