@@ -38,6 +38,23 @@ pub struct PackageVersionsResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepositoryPackagesResponse {
+    #[serde(rename = "repositorySlug")]
+    pub repository_slug: String,
+    pub packages: Vec<RepositoryPackageSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepositoryPackageSummary {
+    pub name: String,
+    #[serde(rename = "latestVersion")]
+    pub latest_version: String,
+    #[serde(rename = "latestUploadedAt")]
+    pub latest_uploaded_at: String,
+    pub versions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VersionSummary {
     pub version: String,
     #[serde(rename = "sourceUrl")]
@@ -93,6 +110,7 @@ impl PollConfig {
 #[derive(Debug)]
 pub struct RegistryClient {
     base_url: String,
+    token: Option<String>,
     client: reqwest::blocking::Client,
     poll_config: PollConfig,
     version_cache_ttl: Duration,
@@ -119,20 +137,34 @@ impl Default for RegistryClient {
 
 impl RegistryClient {
     pub fn new(base_url: impl AsRef<str>) -> Self {
-        Self::with_poll_config(base_url, PollConfig::default())
+        Self::with_token_and_poll_config(base_url, None, PollConfig::default())
+    }
+
+    pub fn with_token(base_url: impl AsRef<str>, token: Option<String>) -> Self {
+        Self::with_token_and_poll_config(base_url, token, PollConfig::default())
     }
 
     pub fn with_poll_config(base_url: impl AsRef<str>, poll_config: PollConfig) -> Self {
-        Self::with_config(base_url, poll_config, VERSION_CACHE_TTL)
+        Self::with_token_and_poll_config(base_url, None, poll_config)
+    }
+
+    pub fn with_token_and_poll_config(
+        base_url: impl AsRef<str>,
+        token: Option<String>,
+        poll_config: PollConfig,
+    ) -> Self {
+        Self::with_config(base_url, token, poll_config, VERSION_CACHE_TTL)
     }
 
     fn with_config(
         base_url: impl AsRef<str>,
+        token: Option<String>,
         poll_config: PollConfig,
         version_cache_ttl: Duration,
     ) -> Self {
         Self {
             base_url: base_url.as_ref().trim_end_matches('/').to_string(),
+            token,
             client: reqwest::blocking::Client::new(),
             poll_config,
             version_cache_ttl,
@@ -141,11 +173,20 @@ impl RegistryClient {
 
     #[cfg(test)]
     fn with_cache_ttl(base_url: impl AsRef<str>, ttl: Duration) -> Self {
-        Self::with_config(base_url, PollConfig::default(), ttl)
+        Self::with_config(base_url, None, PollConfig::default(), ttl)
     }
 
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    pub fn fetch_repository_packages(&self) -> Result<RepositoryPackagesResponse, String> {
+        let response = self
+            .request(reqwest::Method::GET, format!("{}/packages", self.base_url))
+            .send()
+            .map_err(|error| format!("failed to contact registry: {error}"))?;
+
+        decode_json_response(response, "failed to decode repository packages response")
     }
 
     #[cfg(test)]
@@ -179,11 +220,13 @@ impl RegistryClient {
 
     fn fetch_latest_version_once(&self, package: &str) -> Result<LatestVersionEnvelope, String> {
         let response = self
-            .client
-            .get(format!(
+            .request(
+                reqwest::Method::GET,
+                format!(
                 "{}/packages/{package}/versions/latest",
                 self.base_url
-            ))
+            ),
+            )
             .send()
             .map_err(|error| format!("failed to contact registry: {error}"))?;
 
@@ -291,8 +334,10 @@ impl RegistryClient {
         package: &str,
     ) -> Result<PackageVersionsEnvelope, String> {
         let response = self
-            .client
-            .get(format!("{}/packages/{package}/versions", self.base_url))
+            .request(
+                reqwest::Method::GET,
+                format!("{}/packages/{package}/versions", self.base_url),
+            )
             .send()
             .map_err(|error| format!("failed to contact registry: {error}"))?;
 
@@ -305,11 +350,13 @@ impl RegistryClient {
         version: &str,
     ) -> Result<DescriptionEnvelope, String> {
         let response = self
-            .client
-            .get(format!(
+            .request(
+                reqwest::Method::GET,
+                format!(
                 "{}/packages/{package}/versions/{version}/description",
                 self.base_url
-            ))
+            ),
+            )
             .send()
             .map_err(|error| format!("failed to contact registry: {error}"))?;
 
@@ -357,8 +404,7 @@ impl RegistryClient {
             ArtifactKind::Binary => "binary artifact",
         };
         let response = self
-            .client
-            .get(&artifact.url)
+            .request(reqwest::Method::GET, &artifact.url)
             .send()
             .map_err(|error| format!("failed to download {artifact_label}: {error}"))?;
 
@@ -392,6 +438,15 @@ impl RegistryClient {
         }
 
         Ok(DownloadedArtifact { path })
+    }
+
+    fn request(&self, method: reqwest::Method, url: impl AsRef<str>) -> reqwest::blocking::RequestBuilder {
+        let builder = self.client.request(method, url.as_ref());
+
+        match &self.token {
+            Some(token) => builder.bearer_auth(token),
+            None => builder,
+        }
     }
 }
 
@@ -521,8 +576,12 @@ fn hash_string(value: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-fn is_not_found_error(error: &str) -> bool {
+pub fn is_not_found_error(error: &str) -> bool {
     error.starts_with("unexpected registry response (404")
+}
+
+pub fn is_unauthorized_error(error: &str) -> bool {
+    error.starts_with("unexpected registry response (401")
 }
 
 fn missing_package_error(package: &str) -> String {
@@ -893,7 +952,7 @@ mod tests {
 
     #[test]
     fn downloads_source_artifact_to_a_local_file() {
-        clear_cached_artifact("digest", "0.6.37", "digest_0.6.37.tar.gz");
+        clear_cached_artifact("digest", "0.6.37", "digest_0.6.37_download.tar.gz");
 
         let mut server = Server::new();
         let mock = server
@@ -911,7 +970,7 @@ mod tests {
                 &ArtifactRequest {
                     kind: ArtifactKind::Source,
                     url: format!("{}/packages/digest/versions/0.6.37/source", server.url()),
-                    cache_file_name: "digest_0.6.37.tar.gz".to_string(),
+                    cache_file_name: "digest_0.6.37_download.tar.gz".to_string(),
                 },
             )
             .expect("download should succeed");
@@ -919,12 +978,12 @@ mod tests {
         mock.assert();
         let contents = fs::read(artifact.path()).expect("artifact should exist");
         assert_eq!(contents, b"fake-tarball");
-        clear_cached_artifact("digest", "0.6.37", "digest_0.6.37.tar.gz");
+        clear_cached_artifact("digest", "0.6.37", "digest_0.6.37_download.tar.gz");
     }
 
     #[test]
     fn surfaces_source_artifact_download_errors() {
-        clear_cached_artifact("digest", "0.6.37", "digest_0.6.37.tar.gz");
+        clear_cached_artifact("digest", "0.6.37", "digest_0.6.37_error.tar.gz");
 
         let mut server = Server::new();
         let mock = server
@@ -941,7 +1000,7 @@ mod tests {
                 &ArtifactRequest {
                     kind: ArtifactKind::Source,
                     url: format!("{}/packages/digest/versions/0.6.37/source", server.url()),
-                    cache_file_name: "digest_0.6.37.tar.gz".to_string(),
+                    cache_file_name: "digest_0.6.37_error.tar.gz".to_string(),
                 },
             )
             .expect_err("download should fail");
@@ -992,5 +1051,30 @@ mod tests {
     fn clear_cached_artifact(package: &str, version: &str, file_name: &str) {
         let path = artifact_cache_path(package, version, file_name);
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sends_bearer_auth_when_token_is_configured() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/packages")
+            .match_header("authorization", "Bearer secret-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+  "repositorySlug": "test",
+  "packages": []
+}"#,
+            )
+            .create();
+
+        let client = RegistryClient::with_token(server.url(), Some("secret-token".to_string()));
+        let response = client
+            .fetch_repository_packages()
+            .expect("repository listing should succeed");
+
+        mock.assert();
+        assert_eq!(response.repository_slug, "test");
     }
 }

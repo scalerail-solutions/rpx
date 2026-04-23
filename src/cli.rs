@@ -83,4 +83,31 @@ pub enum Commands {
         long_about = "Remove this project's isolated library and wipe rpx cache directories so the next sync or add starts from a clean local state."
     )]
     Clean,
+
+    #[command(about = "Manage additional repositories")]
+    Repo {
+        #[command(subcommand)]
+        command: RepoCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RepoCommands {
+    #[command(about = "Add an additional repository")]
+    Add {
+        #[arg(help = "Repository base URL", value_name = "URL", required = true)]
+        url: String,
+    },
+
+    #[command(about = "Remove an additional repository")]
+    Remove {
+        #[arg(help = "Repository base URL", value_name = "URL", required = true)]
+        url: String,
+
+        #[arg(long, help = "Also remove any stored API key for this repository")]
+        remove_credential: bool,
+    },
+
+    #[command(about = "List configured additional repositories")]
+    List,
 }

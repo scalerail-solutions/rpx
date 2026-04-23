@@ -18,7 +18,10 @@ use r_description::{
     lossy::{RDescription, Relation, Relations},
 };
 
-use crate::registry::{RegistryClient, ResolutionRoot, VersionSummary};
+use crate::{
+    registry::{ResolutionRoot, VersionSummary},
+    repository::{RepositorySet, RepositorySource},
+};
 
 const ROOT_PACKAGE: &str = "__rpx_root__";
 type VersionRange = Ranges<Version>;
@@ -71,10 +74,11 @@ impl From<String> for ResolverError {
 
 #[derive(Debug)]
 struct RegistryDependencyProvider<'a> {
-    client: &'a RegistryClient,
+    repositories: &'a RepositorySet,
     progress: ResolutionProgress,
     root_dependencies: Vec<PackageDependency>,
     versions_by_package: RefCell<BTreeMap<String, Vec<VersionSummary>>>,
+    source_by_package: RefCell<BTreeMap<String, RepositorySource>>,
     metadata_by_package_version: RefCell<BTreeMap<(String, String), PackageMetadata>>,
 }
 
@@ -87,7 +91,7 @@ struct ResolutionProgress {
 }
 
 impl<'a> RegistryDependencyProvider<'a> {
-    fn new(client: &'a RegistryClient, roots: &[ResolutionRoot]) -> Result<Self, ResolverError> {
+    fn new(repositories: &'a RepositorySet, roots: &[ResolutionRoot]) -> Result<Self, ResolverError> {
         let progress = ResolutionProgress::new();
         let root_dependencies = roots
             .iter()
@@ -106,10 +110,11 @@ impl<'a> RegistryDependencyProvider<'a> {
             .collect::<Result<Vec<_>, ResolverError>>()?;
 
         Ok(Self {
-            client,
+            repositories,
             progress,
             root_dependencies,
             versions_by_package: RefCell::new(BTreeMap::new()),
+            source_by_package: RefCell::new(BTreeMap::new()),
             metadata_by_package_version: RefCell::new(BTreeMap::new()),
         })
     }
@@ -121,13 +126,17 @@ impl<'a> RegistryDependencyProvider<'a> {
         }
 
         self.progress.on_version_load(package);
-        let mut versions = self.client.fetch_package_versions_with_retry(package)?.versions;
+        let sourced = self.repositories.fetch_package_versions_with_retry(package)?;
+        let mut versions = sourced.response.versions;
         versions.sort_by(|left, right| {
             let left_version = parse_version(&left.version).expect("registry version should parse");
             let right_version =
                 parse_version(&right.version).expect("registry version should parse");
             left_version.cmp(&right_version)
         });
+        self.source_by_package
+            .borrow_mut()
+            .insert(package.to_string(), sourced.source);
         self.versions_by_package
             .borrow_mut()
             .insert(package.to_string(), versions.clone());
@@ -156,9 +165,15 @@ impl<'a> RegistryDependencyProvider<'a> {
             .into_iter()
             .find(|entry| parse_version(&entry.version).ok().as_ref() == Some(version))
             .ok_or_else(|| ResolverError(format!("version {version} missing from registry for {package}")))?;
+        let source = self
+            .source_by_package
+            .borrow()
+            .get(package)
+            .cloned()
+            .ok_or_else(|| ResolverError(format!("missing repository source for {package}")))?;
         let description = self
-            .client
-            .fetch_description_with_retry(package, &version_entry.version)?;
+            .repositories
+            .fetch_description_with_retry(&source, package, &version_entry.version)?;
         let description = RDescription::from_str(&description)
             .map_err(|error| ResolverError(format!("failed to parse DESCRIPTION for {package}@{}: {error}", version_entry.version)))?;
         let metadata = PackageMetadata {
@@ -342,10 +357,11 @@ impl DependencyProvider for RegistryDependencyProvider<'_> {
 }
 
 pub fn resolve_from_registry(
-    client: &RegistryClient,
+    repositories: &RepositorySet,
     roots: &[ResolutionRoot],
 ) -> Result<Vec<ResolvedPackage>, String> {
-    let provider = RegistryDependencyProvider::new(client, roots).map_err(|error| error.to_string())?;
+    let provider =
+        RegistryDependencyProvider::new(repositories, roots).map_err(|error| error.to_string())?;
     let selected = match solve_selected_versions(&provider) {
         Ok(selected) => selected,
         Err(error) => {

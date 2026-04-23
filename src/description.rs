@@ -18,6 +18,7 @@ pub trait DescriptionExt {
 #[derive(Debug)]
 pub struct ProjectDescription {
     pub description: RDescription,
+    pub additional_repositories: Vec<String>,
 }
 
 pub fn read_description() -> Result<ProjectDescription, String> {
@@ -29,11 +30,20 @@ pub fn read_description() -> Result<ProjectDescription, String> {
         return Err("DESCRIPTION is missing Package".to_string());
     }
 
-    Ok(ProjectDescription { description })
+    Ok(ProjectDescription {
+        description,
+        additional_repositories: parse_additional_repositories(&contents),
+    })
 }
 
 pub fn write_description(project: &ProjectDescription) {
     let mut contents = format_description_for_write(&project.description);
+    if !project.additional_repositories.is_empty() {
+        contents.push('\n');
+        contents.push_str(&format_additional_repositories(
+            &project.additional_repositories,
+        ));
+    }
     contents.push('\n');
     fs::write(description_path(), contents).expect("failed to write DESCRIPTION");
 }
@@ -47,6 +57,7 @@ pub fn init_description() -> Result<String, String> {
     let package_name = package_name_from_current_directory()?;
     let description = ProjectDescription {
         description: initial_description(&package_name),
+        additional_repositories: vec![],
     };
 
     let mut contents = format_description_for_write(&description.description);
@@ -194,6 +205,21 @@ fn format_description_for_write(description: &RDescription) -> String {
         .join("\n")
 }
 
+fn format_additional_repositories(repositories: &[String]) -> String {
+    if repositories.is_empty() {
+        return String::new();
+    }
+
+    if repositories.len() == 1 {
+        return format!("Additional_repositories: {}", repositories[0]);
+    }
+
+    format!(
+        "Additional_repositories:\n    {}",
+        repositories.join(",\n    ")
+    )
+}
+
 fn format_description_line(line: &str) -> String {
     const MULTILINE_RELATION_FIELDS: &[&str] =
         &["Imports", "Depends", "Suggests", "Enhances", "LinkingTo"];
@@ -283,6 +309,42 @@ fn relation_with_constraint(package: &str, constraint: &str) -> Relation {
             version.parse().expect("constraint version should parse"),
         )),
     }
+}
+
+fn parse_additional_repositories(contents: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut lines = contents.lines().peekable();
+
+    while let Some(line) = lines.next() {
+        let Some(rest) = line.strip_prefix("Additional_repositories:") else {
+            continue;
+        };
+
+        values.extend(split_repository_entries(rest));
+
+        while let Some(next) = lines.peek() {
+            if next.starts_with(' ') || next.starts_with('\t') {
+                values.extend(split_repository_entries(next.trim()));
+                lines.next();
+                continue;
+            }
+            break;
+        }
+    }
+
+    values
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn split_repository_entries(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn parse_constraint(constraint: &str) -> (VersionConstraint, &str) {
@@ -412,7 +474,8 @@ fn title_from_package_name(package_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DescriptionExt, format_description_for_write, parse_constraint, relation_with_constraint,
+        DescriptionExt, format_additional_repositories, format_description_for_write,
+        parse_additional_repositories, parse_constraint, relation_with_constraint,
         sanitize_package_name, title_from_package_name,
     };
     use crate::registry::ResolutionRoot;
@@ -551,6 +614,32 @@ mod tests {
                     constraint: "> 1.0.0".to_string(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn parses_additional_repositories_from_description() {
+        let repositories = parse_additional_repositories(
+            "Package: testpkg\nAdditional_repositories:\n    https://one.example/repo,\n    https://two.example/repo\n",
+        );
+
+        assert_eq!(
+            repositories,
+            vec![
+                "https://one.example/repo".to_string(),
+                "https://two.example/repo".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn formats_additional_repositories_as_multiline_field() {
+        assert_eq!(
+            format_additional_repositories(&[
+                "https://one.example/repo".to_string(),
+                "https://two.example/repo".to_string(),
+            ]),
+            "Additional_repositories:\n    https://one.example/repo,\n    https://two.example/repo"
         );
     }
 }
