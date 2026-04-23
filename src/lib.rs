@@ -16,9 +16,10 @@ mod lockfile;
 mod project;
 mod r;
 mod registry;
+mod repository;
 mod resolver;
 
-use cli::{Cli, Commands};
+use cli::{Cli, Commands, RepoCommands};
 use description::{DescriptionExt, init_description, read_description, write_description};
 use lockfile::{Lockfile, read_lockfile, read_lockfile_optional, write_lockfile};
 use project::{
@@ -32,8 +33,9 @@ use r::{
 };
 use registry::{
     ArtifactKind, ArtifactRequest, DEFAULT_REGISTRY_BASE_URL, ResolutionRoot,
-    DownloadedArtifact, RegistryClient,
+    DownloadedArtifact,
 };
+use repository::{RepositorySet, RepositorySource, normalize_repository_url, repository_source_from_package_url};
 use resolver::{ResolvedPackage, resolve_from_registry};
 
 const SYNC_WORKERS: usize = 4;
@@ -50,6 +52,7 @@ pub fn run() {
         Commands::Status => cmd_status(),
         Commands::Sync => cmd_sync(),
         Commands::Clean => cmd_clean(),
+        Commands::Repo { command } => cmd_repo(command),
     }
 }
 
@@ -63,8 +66,7 @@ fn cmd_init() {
 fn cmd_add(packages: &[String]) {
     let mut project = read_description().expect("failed to read DESCRIPTION");
     let mut lockfile = read_lockfile_optional().expect("failed to read lockfile");
-    let registry = registry_base_url();
-    let client = RegistryClient::new(&registry);
+    let repositories = configured_repositories(&project);
     let mut new_packages = Vec::new();
 
     for package in packages {
@@ -81,7 +83,7 @@ fn cmd_add(packages: &[String]) {
             &project.description,
             lockfile.as_ref(),
             &new_packages,
-            &client,
+            &repositories,
         )
         .unwrap_or_else(|error| panic!("failed to add package from registry: {error}"));
 
@@ -97,7 +99,7 @@ fn cmd_add(packages: &[String]) {
 
         lockfile = Some(lockfile_from_resolution(
             project.description.resolution_roots(),
-            client.base_url(),
+            &default_registry_base_url(),
             &resolved_addition.resolved,
         ));
     }
@@ -110,6 +112,99 @@ fn cmd_add(packages: &[String]) {
     }
     let _ = sync_from_lockfile();
     println!("Added {}", packages.join(", "));
+}
+
+fn cmd_repo(command: RepoCommands) {
+    match command {
+        RepoCommands::Add { url } => cmd_repo_add(&url),
+        RepoCommands::Remove {
+            url,
+            remove_credential,
+        } => cmd_repo_remove(&url, remove_credential),
+        RepoCommands::List => cmd_repo_list(),
+    }
+}
+
+fn cmd_repo_add(url: &str) {
+    let mut project = read_description().expect("failed to read DESCRIPTION");
+    let source = RepositorySource::new(url);
+
+    if project
+        .additional_repositories
+        .iter()
+        .any(|existing| normalize_repository_url(existing) == source.base_url())
+    {
+        println!("Repository already configured: {}", source.base_url());
+        return;
+    }
+
+    let repositories = RepositorySet::new(vec![source.clone()]);
+    repositories
+        .fetch_repository_packages(&source)
+        .unwrap_or_else(|error| panic!("failed to add repository {}: {error}", source.base_url()));
+
+    project
+        .additional_repositories
+        .push(source.base_url().to_string());
+    write_description(&project);
+    println!("Added repository {}", source.base_url());
+}
+
+fn cmd_repo_remove(url: &str, remove_credential: bool) {
+    let mut project = read_description().expect("failed to read DESCRIPTION");
+    let source = RepositorySource::new(url);
+    let original_len = project.additional_repositories.len();
+    project
+        .additional_repositories
+        .retain(|repository| normalize_repository_url(repository) != source.base_url());
+
+    if project.additional_repositories.len() == original_len {
+        println!("Repository not configured: {}", source.base_url());
+        return;
+    }
+
+    write_description(&project);
+
+    if remove_credential {
+        RepositorySet::new(vec![source.clone()])
+            .remove_api_key(&source)
+            .unwrap_or_else(|error| panic!("failed to remove repository credential: {error}"));
+    }
+
+    println!("Removed repository {}", source.base_url());
+}
+
+fn cmd_repo_list() {
+    let project = read_description().expect("failed to read DESCRIPTION");
+
+    if project.additional_repositories.is_empty() {
+        println!("No additional repositories configured");
+        return;
+    }
+
+    let repositories = RepositorySet::new(
+        project
+            .additional_repositories
+            .iter()
+            .cloned()
+            .map(RepositorySource::new)
+            .collect(),
+    );
+
+    for source in repositories.sources() {
+        let credential = repositories
+            .has_stored_credential(source)
+            .unwrap_or_else(|error| panic!("failed to inspect repository credential: {error}"));
+        println!(
+            "{} [{}]",
+            source.base_url(),
+            if credential {
+                "credential stored"
+            } else {
+                "no credential"
+            }
+        );
+    }
 }
 
 fn cmd_remove(packages: &[String]) {
@@ -383,16 +478,16 @@ fn resolve_additions_from_latest(
     description: &r_description::lossy::RDescription,
     lockfile: Option<&Lockfile>,
     packages: &[String],
-    client: &RegistryClient,
+    repositories: &RepositorySet,
 ) -> Result<AddResolution, String> {
-    let constraints_by_package = latest_constraints_by_package(packages, client)?;
+    let constraints_by_package = latest_constraints_by_package(packages, repositories)?;
     let attempts = max_constraint_attempts(&constraints_by_package);
 
     for index in 0..attempts {
         let package_constraints = constraints_for_attempt(&constraints_by_package, index);
         let roots = add_resolution_roots(description, lockfile, &package_constraints);
 
-        if let Ok(resolved) = resolve_from_registry(client, &roots) {
+        if let Ok(resolved) = resolve_from_registry(repositories, &roots) {
             return Ok(AddResolution {
                 constraints: package_constraints
                     .into_iter()
@@ -466,40 +561,17 @@ fn pinned_existing_roots(
 
 fn latest_constraints_by_package(
     packages: &[String],
-    client: &RegistryClient,
+    repositories: &RepositorySet,
 ) -> Result<BTreeMap<String, Vec<String>>, String> {
     if packages.is_empty() {
         return Ok(BTreeMap::new());
     }
 
-    let queue = Arc::new(Mutex::new(VecDeque::from(packages.to_vec())));
-    let (sender, receiver) = mpsc::channel();
-
-    for _ in 0..SYNC_WORKERS.min(packages.len()) {
-        let queue = Arc::clone(&queue);
-        let sender = sender.clone();
-        let base_url = client.base_url().to_string();
-        thread::spawn(move || {
-            let client = RegistryClient::new(&base_url);
-            loop {
-                let Some(package) = queue.lock().expect("latest queue should lock").pop_front()
-                else {
-                    break;
-                };
-                let result = client
-                    .fetch_latest_version_with_retry(&package)
-                    .and_then(|latest| semver_add_constraints(&latest.version));
-                let _ = sender.send((package, result));
-            }
-        });
-    }
-    drop(sender);
-
     let mut constraints = BTreeMap::new();
-    for _ in 0..packages.len() {
-        let (package, result) = receiver
-            .recv()
-            .expect("latest worker should return a result");
+    for package in packages {
+        let result = repositories
+            .fetch_latest_version_with_retry(package)
+            .and_then(|latest| semver_add_constraints(&latest.response.version));
         constraints.insert(
             package.clone(),
             result.map_err(|error| format!("{package}: {error}"))?,
@@ -588,7 +660,8 @@ fn persisted_constraints(constraint: &str) -> Vec<String> {
 fn lock_from_description() -> LockOutcome {
     let project = read_description().expect("failed to read DESCRIPTION");
     let roots = project.description.resolution_roots();
-    let registry = registry_base_url();
+    let registry = default_registry_base_url();
+    let repositories = configured_repositories(&project);
     let existing_lockfile = read_lockfile_optional().expect("failed to read lockfile");
 
     if roots.is_empty() {
@@ -598,11 +671,10 @@ fn lock_from_description() -> LockOutcome {
         return LockOutcome { changed };
     }
 
-    let client = RegistryClient::new(&registry);
-    let resolved = resolve_from_registry(&client, &roots)
+    let resolved = resolve_from_registry(&repositories, &roots)
         .unwrap_or_else(|error| panic!("failed to resolve package set from registry: {error}"));
 
-    let lockfile = lockfile_from_resolution(roots, client.base_url(), &resolved);
+    let lockfile = lockfile_from_resolution(roots, &registry, &resolved);
     let changed = existing_lockfile.as_ref() != Some(&lockfile);
     write_lockfile(lockfile);
     LockOutcome { changed }
@@ -629,7 +701,7 @@ fn sync_from_lockfile() -> SyncOutcome {
 
     let installed = installed_packages_by_name();
     let runtime = runtime_info();
-    let client = RegistryClient::new(&lockfile.registry);
+    let repositories = repositories_for_sync(&project, &lockfile);
     let mut outcome = SyncOutcome::default();
     let ui = SyncUi::new();
     let mut satisfied = installed
@@ -643,7 +715,7 @@ fn sync_from_lockfile() -> SyncOutcome {
         })
         .collect::<BTreeSet<_>>();
 
-    let mut pending = collect_pending_installs(&lockfile, &installed, &runtime);
+    let mut pending = collect_pending_installs(&lockfile, &installed, &runtime, &repositories);
 
     let cached_names = pending
         .values()
@@ -670,7 +742,7 @@ fn sync_from_lockfile() -> SyncOutcome {
 
     let download_order = pending.values().cloned().collect::<Vec<_>>();
     ui.start_downloads(download_order.len());
-    let downloaded = download_artifacts_in_parallel(&client, &download_order, &ui)
+    let downloaded = download_artifacts_in_parallel(&repositories, &download_order, &ui)
         .unwrap_or_else(|error| panic!("failed to prepare source artifacts: {error}"));
     ui.finish_downloads();
 
@@ -786,11 +858,44 @@ pub(crate) fn exit_with_status(code: Option<i32>) {
     }
 }
 
-fn registry_base_url() -> String {
+fn default_registry_base_url() -> String {
     env::var("RPX_REGISTRY_BASE_URL")
         .unwrap_or_else(|_| DEFAULT_REGISTRY_BASE_URL.to_string())
         .trim_end_matches('/')
         .to_string()
+}
+
+fn configured_repositories(project: &description::ProjectDescription) -> RepositorySet {
+    RepositorySet::new(repository_sources_from_project(project))
+}
+
+fn repository_sources_from_project(
+    project: &description::ProjectDescription,
+) -> Vec<RepositorySource> {
+    let mut sources = vec![RepositorySource::new(default_registry_base_url())];
+    sources.extend(
+        project
+            .additional_repositories
+            .iter()
+            .cloned()
+            .map(RepositorySource::new),
+    );
+    sources
+}
+
+fn repositories_for_sync(
+    project: &description::ProjectDescription,
+    lockfile: &Lockfile,
+) -> RepositorySet {
+    let mut sources = repository_sources_from_project(project);
+    sources.extend(lockfile.packages.values().filter_map(|package| {
+        package
+            .source_url
+            .as_deref()
+            .and_then(repository_source_from_package_url)
+            .map(RepositorySource::new)
+    }));
+    RepositorySet::new(sources)
 }
 
 fn lockfile_from_resolution(
@@ -816,12 +921,8 @@ fn lockfile_from_resolution(
                     lockfile::LockedPackage {
                         package: package.name.clone(),
                         version: package.version.clone(),
-                        source: Some("registry".to_string()),
-                        source_url: Some(registry_source_url(
-                            registry,
-                            &package.name,
-                            &package.version,
-                        )),
+                        source: Some("repository".to_string()),
+                        source_url: Some(package.source_url.clone()),
                         dependencies: package
                             .dependencies
                             .iter()
@@ -847,23 +948,23 @@ fn registry_source_url(registry: &str, package: &str, version: &str) -> String {
 }
 
 fn preferred_artifact(
-    registry: &str,
+    source: &RepositorySource,
     package: &str,
     version: &str,
     source_url: &str,
     runtime: &RuntimeInfo,
 ) -> (ArtifactRequest, Option<ArtifactRequest>, String) {
-    let source = ArtifactRequest {
+    let source_artifact = ArtifactRequest {
         kind: ArtifactKind::Source,
         url: source_url.to_string(),
         cache_file_name: source_cache_file_name(package, version),
     };
 
-    let Some(binary) = binary_artifact_request(registry, package, version, runtime) else {
-        return (source, None, "source".to_string());
+    let Some(binary) = binary_artifact_request(source.base_url(), package, version, runtime) else {
+        return (source_artifact, None, "source".to_string());
     };
 
-    (binary, Some(source), runtime.pkg_type.clone())
+    (binary, Some(source_artifact), runtime.pkg_type.clone())
 }
 
 fn binary_artifact_request(
@@ -872,6 +973,10 @@ fn binary_artifact_request(
     version: &str,
     runtime: &RuntimeInfo,
 ) -> Option<ArtifactRequest> {
+    if !repository_supports_binary_artifacts(registry) {
+        return None;
+    }
+
     if runtime.pkg_type == "win.binary" {
         return Some(ArtifactRequest {
             kind: ArtifactKind::Binary,
@@ -894,6 +999,16 @@ fn binary_artifact_request(
         ),
         cache_file_name: macos_binary_cache_file_name(package, version),
     })
+}
+
+fn repository_supports_binary_artifacts(repository: &str) -> bool {
+    let repository = repository.trim_end_matches('/');
+    let without_scheme = repository
+        .strip_prefix("https://")
+        .or_else(|| repository.strip_prefix("http://"))
+        .unwrap_or(repository);
+    let path = without_scheme.split_once('/').map(|(_, path)| path).unwrap_or("");
+    path.is_empty()
 }
 
 fn source_cache_file_name(package: &str, version: &str) -> String {
@@ -922,6 +1037,7 @@ fn collect_pending_installs(
     lockfile: &Lockfile,
     installed: &BTreeMap<String, r::InstalledPackage>,
     runtime: &RuntimeInfo,
+    repositories: &RepositorySet,
 ) -> BTreeMap<String, PendingInstall> {
     lockfile
         .packages
@@ -932,8 +1048,11 @@ fn collect_pending_installs(
                 let source_url = package.source_url.clone().unwrap_or_else(|| {
                     registry_source_url(&lockfile.registry, name, &package.version)
                 });
+                let source = repositories
+                    .source_for_url(&source_url)
+                    .unwrap_or_else(|| RepositorySource::new(lockfile.registry.clone()));
                 let (artifact, fallback_artifact, install_type) = preferred_artifact(
-                    &lockfile.registry,
+                    &source,
                     name,
                     &package.version,
                     &source_url,
@@ -982,7 +1101,7 @@ fn restore_cached_package(package: &PendingInstall, target_library: &Path) -> Re
 }
 
 fn download_artifacts_in_parallel(
-    client: &RegistryClient,
+    repositories: &RepositorySet,
     packages: &[PendingInstall],
     ui: &SyncUi,
 ) -> Result<BTreeMap<String, DownloadedInstall>, String> {
@@ -996,9 +1115,8 @@ fn download_artifacts_in_parallel(
     for _ in 0..SYNC_WORKERS.min(packages.len()) {
         let queue = Arc::clone(&queue);
         let sender = sender.clone();
-        let base_url = client.base_url().to_string();
+        let repositories = repositories.clone();
         thread::spawn(move || {
-            let client = RegistryClient::new(&base_url);
             loop {
                 let Some(package) = queue
                     .lock()
@@ -1008,8 +1126,22 @@ fn download_artifacts_in_parallel(
                     break;
                 };
 
-                let result = client
-                    .download_artifact(&package.name, &package.version, &package.artifact)
+                let result = repositories
+                    .source_for_url(&package.artifact.url)
+                    .ok_or_else(|| {
+                        format!(
+                            "could not determine repository source for {}@{}",
+                            package.name, package.version
+                        )
+                    })
+                    .and_then(|source| {
+                        repositories.download_artifact(
+                            &source,
+                            &package.name,
+                            &package.version,
+                            &package.artifact,
+                        )
+                    })
                     .map(|artifact| DownloadedInstall {
                         artifact,
                         install_type: package.install_type.clone(),
@@ -1021,8 +1153,14 @@ fn download_artifacts_in_parallel(
                         if !should_fallback_to_source(&error) {
                             return Err(error);
                         }
-                        client
-                            .download_artifact(&package.name, &package.version, fallback)
+                        let source = repositories.source_for_url(&fallback.url).ok_or_else(|| {
+                            format!(
+                                "could not determine repository source for {}@{}",
+                                package.name, package.version
+                            )
+                        })?;
+                        repositories
+                            .download_artifact(&source, &package.name, &package.version, fallback)
                             .map(|artifact| DownloadedInstall {
                                 artifact,
                                 install_type: "source".to_string(),
@@ -1454,7 +1592,8 @@ impl SyncUi {
 mod tests {
     use super::{
         add_resolution_roots, binary_artifact_request, compiled_cache_key, locked_install_order,
-        lockfile_from_resolution, persisted_constraints, r_minor_version, registry_base_url,
+        default_registry_base_url, lockfile_from_resolution, persisted_constraints,
+        r_minor_version,
         semver_add_constraints, should_fallback_to_source,
     };
     use crate::{
@@ -1553,7 +1692,7 @@ mod tests {
         assert_eq!(lockfile.version, 1);
         assert_eq!(lockfile.roots[0].package, "digest");
         assert_eq!(lockfile.roots[1].package, "cli");
-        assert_eq!(lockfile.packages["cli"].source.as_deref(), Some("registry"));
+        assert_eq!(lockfile.packages["cli"].source.as_deref(), Some("repository"));
         assert_eq!(
             lockfile.packages["cli"].dependencies,
             vec![
@@ -1595,7 +1734,7 @@ mod tests {
             env::set_var("RPX_REGISTRY_BASE_URL", "https://example.test/");
         }
 
-        assert_eq!(registry_base_url(), "https://example.test");
+        assert_eq!(default_registry_base_url(), "https://example.test");
 
         unsafe {
             env::remove_var("RPX_REGISTRY_BASE_URL");
