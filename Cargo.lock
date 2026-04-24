@@ -1872,6 +1872,7 @@ name = "rpx"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "deb822-fast",
  "directories",
  "indicatif",
  "keyring",

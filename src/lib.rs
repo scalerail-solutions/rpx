@@ -475,7 +475,7 @@ struct DownloadedInstall {
 }
 
 fn resolve_additions_from_latest(
-    description: &r_description::lossy::RDescription,
+    description: &description::RDescription,
     lockfile: Option<&Lockfile>,
     packages: &[String],
     repositories: &RepositorySet,
@@ -505,7 +505,7 @@ fn resolve_additions_from_latest(
 }
 
 fn add_resolution_roots(
-    description: &r_description::lossy::RDescription,
+    description: &description::RDescription,
     lockfile: Option<&Lockfile>,
     new_packages: &BTreeMap<String, String>,
 ) -> Vec<ResolutionRoot> {
@@ -538,7 +538,7 @@ fn add_resolution_roots(
 }
 
 fn pinned_existing_roots(
-    description: &r_description::lossy::RDescription,
+    description: &description::RDescription,
     lockfile: Option<&Lockfile>,
     excluded_packages: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
@@ -1603,7 +1603,7 @@ mod tests {
         registry::ResolutionRoot,
         resolver::{ResolvedDependency, ResolvedPackage},
     };
-    use r_description::lossy::RDescription;
+    use crate::description::RDescription;
     use std::collections::BTreeMap;
     use std::{
         env,
