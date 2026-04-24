@@ -75,6 +75,7 @@ struct RegistryDependencyProvider<'a> {
     repositories: &'a RepositorySet,
     progress: ResolutionProgress,
     root_dependencies: Vec<PackageDependency>,
+    preferred_versions_by_package: BTreeMap<String, Version>,
     versions_by_package: RefCell<BTreeMap<String, Vec<VersionSummary>>>,
     source_by_package: RefCell<BTreeMap<String, RepositorySource>>,
     metadata_by_package_version: RefCell<BTreeMap<(String, String), PackageMetadata>>,
@@ -89,7 +90,11 @@ struct ResolutionProgress {
 }
 
 impl<'a> RegistryDependencyProvider<'a> {
-    fn new(repositories: &'a RepositorySet, roots: &[ResolutionRoot]) -> Result<Self, ResolverError> {
+    fn new(
+        repositories: &'a RepositorySet,
+        roots: &[ResolutionRoot],
+        preferred_versions_by_package: BTreeMap<String, Version>,
+    ) -> Result<Self, ResolverError> {
         let progress = ResolutionProgress::new();
         let root_dependencies = roots
             .iter()
@@ -111,6 +116,7 @@ impl<'a> RegistryDependencyProvider<'a> {
             repositories,
             progress,
             root_dependencies,
+            preferred_versions_by_package,
             versions_by_package: RefCell::new(BTreeMap::new()),
             source_by_package: RefCell::new(BTreeMap::new()),
             metadata_by_package_version: RefCell::new(BTreeMap::new()),
@@ -304,6 +310,12 @@ impl DependencyProvider for RegistryDependencyProvider<'_> {
             return Ok(range.contains(&version).then_some(version));
         }
 
+        if let Some(preferred_version) = self.preferred_versions_by_package.get(package) {
+            if range.contains(preferred_version) {
+                return Ok(Some(preferred_version.clone()));
+            }
+        }
+
         Ok(self
             .package_versions(package)?
             .into_iter()
@@ -357,9 +369,15 @@ impl DependencyProvider for RegistryDependencyProvider<'_> {
 pub fn resolve_from_registry(
     repositories: &RepositorySet,
     roots: &[ResolutionRoot],
+    preferred_versions_by_package: &BTreeMap<String, String>,
 ) -> Result<Vec<ResolvedPackage>, String> {
-    let provider =
-        RegistryDependencyProvider::new(repositories, roots).map_err(|error| error.to_string())?;
+    let preferred_versions_by_package = preferred_versions_by_package
+        .iter()
+        .map(|(package, version)| Ok((package.clone(), parse_version(version)?)))
+        .collect::<Result<BTreeMap<_, _>, ResolverError>>()
+        .map_err(|error| error.to_string())?;
+    let provider = RegistryDependencyProvider::new(repositories, roots, preferred_versions_by_package)
+        .map_err(|error| error.to_string())?;
     let selected = match solve_selected_versions(&provider) {
         Ok(selected) => selected,
         Err(error) => {
@@ -799,5 +817,43 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["dep@2.0.0".to_string(), "pkg@2.0.0".to_string()]
         );
+    }
+
+    #[test]
+    fn prefers_locked_version_when_it_satisfies_requested_range() {
+        let repositories = RepositorySet::new(vec![]);
+        let provider = RegistryDependencyProvider::new(
+            &repositories,
+            &[],
+            BTreeMap::from([(
+                "cli".to_string(),
+                parse_version("3.6.4").expect("version should parse"),
+            )]),
+        )
+        .expect("provider should build");
+
+        provider.versions_by_package.borrow_mut().insert(
+            "cli".to_string(),
+            vec![
+                VersionSummary {
+                    version: "3.6.4".to_string(),
+                    source_url: "https://example.test/cli/3.6.4".to_string(),
+                },
+                VersionSummary {
+                    version: "3.6.5".to_string(),
+                    source_url: "https://example.test/cli/3.6.5".to_string(),
+                },
+            ],
+        );
+
+        let chosen = provider
+            .choose_version(
+                &"cli".to_string(),
+                &parse_constraint_range(">= 3.6.0, < 4.0.0").expect("constraint should parse"),
+            )
+            .expect("selection should succeed")
+            .expect("selection should exist");
+
+        assert_eq!(chosen.to_string(), "3.6.4");
     }
 }
