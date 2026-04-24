@@ -13,12 +13,10 @@ use pubgrub::{
     Dependencies, DependencyConstraints, DependencyProvider, PackageResolutionStatistics, Ranges,
     resolve,
 };
-use r_description::{
-    Version, VersionConstraint,
-    lossy::{RDescription, Relation, Relations},
-};
+use r_description::{Version, VersionConstraint};
 
 use crate::{
+    description::{DescriptionDependency, RDescription},
     registry::{ResolutionRoot, VersionSummary},
     repository::{RepositorySet, RepositorySource},
 };
@@ -410,24 +408,33 @@ where
 fn description_dependencies(description: &RDescription) -> Result<Vec<PackageDependency>, ResolverError> {
     let mut dependencies = Vec::new();
 
-    if let Some(depends) = &description.depends {
-        dependencies.extend(relations_to_dependencies("Depends", depends)?);
-    }
+    dependencies.extend(relations_to_dependencies(
+        "Depends",
+        &description
+            .dependency_field("Depends")
+            .map_err(ResolverError)?,
+    )?);
 
-    if let Some(imports) = &description.imports {
-        dependencies.extend(relations_to_dependencies("Imports", imports)?);
-    }
+    dependencies.extend(relations_to_dependencies(
+        "Imports",
+        &description
+            .dependency_field("Imports")
+            .map_err(ResolverError)?,
+    )?);
 
-    if let Some(linking_to) = &description.linking_to {
-        dependencies.extend(relations_to_dependencies("LinkingTo", linking_to)?);
-    }
+    dependencies.extend(relations_to_dependencies(
+        "LinkingTo",
+        &description
+            .dependency_field("LinkingTo")
+            .map_err(ResolverError)?,
+    )?);
 
     Ok(dependencies)
 }
 
 fn relations_to_dependencies(
     kind: &str,
-    relations: &Relations,
+    relations: &[DescriptionDependency],
 ) -> Result<Vec<PackageDependency>, ResolverError> {
     relations
         .iter()
@@ -436,7 +443,10 @@ fn relations_to_dependencies(
         .collect()
 }
 
-fn relation_dependency(kind: &str, relation: &Relation) -> Result<PackageDependency, ResolverError> {
+fn relation_dependency(
+    kind: &str,
+    relation: &DescriptionDependency,
+) -> Result<PackageDependency, ResolverError> {
     let (min_version, max_version_exclusive) = relation_bounds(relation);
     Ok(PackageDependency {
         range: range_from_relation(relation),
@@ -449,7 +459,7 @@ fn relation_dependency(kind: &str, relation: &Relation) -> Result<PackageDepende
     })
 }
 
-fn relation_bounds(relation: &Relation) -> (Option<String>, Option<String>) {
+fn relation_bounds(relation: &DescriptionDependency) -> (Option<String>, Option<String>) {
     let Some((operator, version)) = relation.version.as_ref() else {
         return (None, None);
     };
@@ -465,7 +475,7 @@ fn relation_bounds(relation: &Relation) -> (Option<String>, Option<String>) {
     }
 }
 
-fn range_from_relation(relation: &Relation) -> VersionRange {
+fn range_from_relation(relation: &DescriptionDependency) -> VersionRange {
     let Some((operator, version)) = relation.version.as_ref() else {
         return VersionRange::full();
     };
@@ -653,6 +663,41 @@ mod tests {
                 ("cli".to_string(), "Depends".to_string()),
                 ("digest".to_string(), "Imports".to_string()),
                 ("cpp11".to_string(), "LinkingTo".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn extracts_cran_style_strict_constraints_from_registry_description() {
+        let description = RDescription::from_str(
+            "Package: Rdpack\nVersion: 2.6.6\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\nDepends: R (>= 2.15.0), methods\nImports: tools, utils, rbibutils (> 2.4)\n",
+        )
+        .expect("description should parse");
+
+        let dependencies = description_dependencies(&description).expect("dependencies should parse");
+
+        assert_eq!(
+            dependencies
+                .iter()
+                .map(|dependency| {
+                    (
+                        dependency.resolved.package.clone(),
+                        dependency.resolved.kind.clone(),
+                        dependency.resolved.min_version.clone(),
+                        dependency.resolved.max_version_exclusive.clone(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                ("methods".to_string(), "Depends".to_string(), None, None),
+                ("tools".to_string(), "Imports".to_string(), None, None),
+                ("utils".to_string(), "Imports".to_string(), None, None),
+                (
+                    "rbibutils".to_string(),
+                    "Imports".to_string(),
+                    Some("2.4".to_string()),
+                    None,
+                ),
             ]
         );
     }
