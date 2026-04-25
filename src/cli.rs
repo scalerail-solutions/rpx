@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser, Debug)]
 #[command(name = "rpx")]
 #[command(
+    version,
     about = "Manage R project dependencies with DESCRIPTION and rpx.lock",
     long_about = None
 )]

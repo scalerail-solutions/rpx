@@ -10,11 +10,40 @@ It uses `DESCRIPTION` as the manifest, keeps a resolved `rpx.lock` in the projec
 
 ## Usage
 
-Install from GitHub:
+`rpx` requires R to be installed and available on `PATH`.
+
+Install the latest release on macOS or Linux:
+
+```bash
+curl -LsSf https://github.com/scalerail-solutions/rpx/releases/latest/download/rpx-installer.sh | sh
+```
+
+Install the latest release on Windows:
+
+```powershell
+irm https://github.com/scalerail-solutions/rpx/releases/latest/download/rpx-installer.ps1 | iex
+```
+
+Rust users can also install from source:
 
 ```bash
 cargo install --git https://github.com/scalerail-solutions/rpx.git
 ```
+
+Use the Docker image directly:
+
+```bash
+docker run --rm ghcr.io/scalerail-solutions/rpx:latest --help
+```
+
+The Docker image contains the `rpx` binary but does not include R. For project workflows, copy `rpx` into an image that provides R:
+
+```dockerfile
+FROM r-base:latest
+COPY --link --from=ghcr.io/scalerail-solutions/rpx:latest /rpx /usr/local/bin/rpx
+```
+
+Releases are created by pushing a version tag such as `v0.1.0`. The release workflow builds precompiled binaries for Linux, macOS, and Windows, then uploads archives, checksums, and installers to GitHub Releases. The Docker workflow publishes `ghcr.io/scalerail-solutions/rpx` images for `linux/amd64` and `linux/arm64`.
 
 Example workflow for a new project:
 
