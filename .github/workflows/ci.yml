@@ -84,6 +84,24 @@ jobs:
           rustup show active-toolchain
           cargo --version
 
+      - id: rust-info
+        name: Capture Rust cache metadata
+        shell: bash
+        run: |
+          printf 'release=%s\n' "$(rustc -vV | awk '/^release: / { print $2 }')" >> "$GITHUB_OUTPUT"
+          printf 'host=%s\n' "$(rustc -vV | awk '/^host: / { print $2 }')" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust-info.outputs.host }}-${{ steps.rust-info.outputs.release }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust-info.outputs.host }}-${{ steps.rust-info.outputs.release }}-
+            cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust-info.outputs.host }}-
+
       - name: Run validation
         shell: bash
         run: ${{ matrix.command }}
