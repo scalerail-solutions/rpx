@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  release-intent:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate release intent
+        run: bash scripts/check-release-intent.sh
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            command: cargo test --locked
+          - os: macos-13
+            command: cargo test --locked --lib --bins --tests --no-run
+          - os: macos-14
+            command: cargo test --locked --lib --bins --tests --no-run
+          - os: windows-latest
+            command: cargo test --locked --lib --bins --tests --no-run
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Run validation
+        shell: bash
+        run: ${{ matrix.command }}

@@ -1,0 +1,221 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    outputs:
+      release_required: ${{ steps.version.outputs.release_required }}
+      version: ${{ steps.version.outputs.next_version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - id: version
+        name: Compute next version
+        run: bash scripts/next-release.sh
+
+      - name: Stop when there is no release intent
+        if: steps.version.outputs.release_required != 'true'
+        run: echo "No release intent files since the last tag"
+
+      - name: Bump Cargo version
+        if: steps.version.outputs.release_required == 'true'
+        run: bash scripts/bump-version.sh "${{ steps.version.outputs.next_version }}"
+
+      - name: Remove consumed release intent files
+        if: steps.version.outputs.release_required == 'true'
+        run: |
+          while IFS= read -r file; do
+            [[ -n "$file" ]] || continue
+            rm -f "$file"
+          done <<< "${{ steps.version.outputs.intent_files }}"
+
+      - name: Validate updated manifest
+        if: steps.version.outputs.release_required == 'true'
+        run: cargo metadata --no-deps --format-version 1 > /dev/null
+
+      - name: Configure git author
+        if: steps.version.outputs.release_required == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit and tag release
+        if: steps.version.outputs.release_required == 'true'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.next_version }}
+        run: |
+          git add -A Cargo.toml Cargo.lock .release
+          git commit -m "chore: release ${TAG}"
+          git tag "$TAG"
+          git push origin HEAD:main "refs/tags/${TAG}"
+
+  build-binaries:
+    needs: prepare
+    if: needs.prepare.outputs.release_required == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            binary_name: rpx
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+            binary_name: rpx
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+            binary_name: rpx
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            binary_name: rpx.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Package tarball
+        if: matrix.archive == 'tar.gz'
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          BINARY_NAME: ${{ matrix.binary_name }}
+        run: |
+          package_dir="rpx-${VERSION}-${TARGET}"
+          mkdir -p "$package_dir" dist
+          cp "target/${TARGET}/release/${BINARY_NAME}" "$package_dir/${BINARY_NAME}"
+          tar -czf "dist/${package_dir}.tar.gz" "$package_dir"
+
+      - name: Package zip
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          BINARY_NAME: ${{ matrix.binary_name }}
+        run: |
+          $packageDir = "rpx-$env:VERSION-$env:TARGET"
+          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/$env:TARGET/release/$env:BINARY_NAME" "$packageDir/$env:BINARY_NAME"
+          Compress-Archive -Path $packageDir -DestinationPath "dist/$packageDir.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+
+  checksums:
+    needs:
+      - prepare
+      - build-binaries
+    if: needs.prepare.outputs.release_required == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          shasum -a 256 dist/* > dist/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checksums
+          path: dist/SHA256SUMS
+
+  publish-release:
+    needs:
+      - prepare
+      - build-binaries
+      - checksums
+    if: needs.prepare.outputs.release_required == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" --title "$TAG" --generate-notes dist/*
+          fi
+
+  publish-image:
+    needs: prepare
+    if: needs.prepare.outputs.release_required == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.prepare.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.prepare.outputs.tag }}
+            type=semver,pattern={{major}},value=${{ needs.prepare.outputs.tag }}
+            type=raw,value=latest
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.release
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

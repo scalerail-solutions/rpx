@@ -16,6 +16,8 @@ Install from GitHub:
 cargo install --git https://github.com/scalerail-solutions/rpx.git
 ```
 
+Install a release binary from GitHub Releases by downloading the archive for your platform from the latest release.
+
 Example workflow for a new project:
 
 ```bash
@@ -58,3 +60,29 @@ cargo test
 The test suite depends on Docker and uses `testcontainers`.
 
 Integration tests run against the official `r-base` image and execute realistic package-management workflows inside containers. This keeps the tests close to real usage while avoiding changes to your local R installation or package library.
+
+## Release Process
+
+Every code-bearing pull request must add exactly one release intent file under `.release/`:
+
+- `.release/<slug>.patch`
+- `.release/<slug>.minor`
+- `.release/<slug>.major`
+
+The file can contain a short note explaining the intent. CI enforces that application changes include one release intent file, while docs-only and CI-only changes are exempt.
+
+On each merge to `main`, the release workflow:
+
+- collects unreleased intent files since the last tag
+- chooses the highest bump level (`major` > `minor` > `patch`)
+- bumps `Cargo.toml` and `Cargo.lock`
+- creates and pushes a `vX.Y.Z` tag
+- builds release archives for macOS, Linux, and Windows
+- publishes a GitHub Release with checksums
+- publishes a GHCR image for `COPY --from`
+
+Example Docker usage:
+
+```dockerfile
+COPY --from=ghcr.io/scalerail-solutions/rpx:vX.Y.Z /rpx /usr/local/bin/rpx
+```
