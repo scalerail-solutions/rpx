@@ -30,7 +30,20 @@ Rust users can also install from source:
 cargo install --git https://github.com/scalerail-solutions/rpx.git
 ```
 
-Releases are created by pushing a version tag such as `v0.1.0`. The release workflow builds precompiled binaries for Linux, macOS, and Windows, then uploads archives, checksums, and installers to GitHub Releases.
+Use the Docker image directly:
+
+```bash
+docker run --rm ghcr.io/scalerail-solutions/rpx:latest --help
+```
+
+The Docker image contains the `rpx` binary but does not include R. For project workflows, copy `rpx` into an image that provides R:
+
+```dockerfile
+FROM r-base:latest
+COPY --link --from=ghcr.io/scalerail-solutions/rpx:latest /rpx /usr/local/bin/rpx
+```
+
+Releases are created by pushing a version tag such as `v0.1.0`. The release workflow builds precompiled binaries for Linux, macOS, and Windows, then uploads archives, checksums, and installers to GitHub Releases. The Docker workflow publishes `ghcr.io/scalerail-solutions/rpx` images for `linux/amd64` and `linux/arm64`.
 
 Example workflow for a new project:
 
