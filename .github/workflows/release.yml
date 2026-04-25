@@ -45,6 +45,10 @@ jobs:
           rustup show active-toolchain
           cargo --version
 
+      - name: Install cargo-edit
+        shell: bash
+        run: cargo install cargo-edit --locked
+
       - id: prepare-rust-info
         name: Capture Rust cache metadata
         shell: bash
@@ -73,7 +77,9 @@ jobs:
 
       - name: Bump Cargo version
         if: steps.version.outputs.release_required == 'true'
-        run: bash scripts/bump-version.sh "${{ steps.version.outputs.next_version }}"
+        run: |
+          cargo set-version --bump "${{ steps.version.outputs.bump_level }}"
+          cargo update --workspace
 
       - name: Remove consumed release intent files
         if: steps.version.outputs.release_required == 'true'
