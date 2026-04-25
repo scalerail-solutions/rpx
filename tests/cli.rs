@@ -106,21 +106,22 @@ fn init_creates_project_that_can_add_dependencies() {
 fn clean_removes_project_library_and_cache_directories() {
     let container = start_container();
     let project_path = "/tmp/rpx-clean";
-    let setup_command = format!("mkdir -p {project_path} && cd {project_path} && rpx init && rpx add digest");
+    let setup_command =
+        format!("mkdir -p {project_path} && cd {project_path} && rpx init && rpx add digest");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &setup_command);
 
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
-    let library_path_command = format!(
-        "cd {project_path} && rpx run Rscript -e \"cat(.libPaths()[1])\""
-    );
+    let library_path_command =
+        format!("cd {project_path} && rpx run Rscript -e \"cat(.libPaths()[1])\"");
     let (exit_code, library_path, stderr) = run_shell_command(&container, &library_path_command);
-    assert_eq!(exit_code, 0, "stdout was: {library_path}\nstderr was: {stderr}");
+    assert_eq!(
+        exit_code, 0,
+        "stdout was: {library_path}\nstderr was: {stderr}"
+    );
 
     let library_path = library_path.trim();
-    let check_before_command = format!(
-        "test -d '{library_path}' && test -d /root/.cache/rpx"
-    );
+    let check_before_command = format!("test -d '{library_path}' && test -d /root/.cache/rpx");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &check_before_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
@@ -132,9 +133,7 @@ fn clean_removes_project_library_and_cache_directories() {
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 
-    let check_after_command = format!(
-        "test ! -d '{library_path}' && test ! -d /root/.cache/rpx"
-    );
+    let check_after_command = format!("test ! -d '{library_path}' && test ! -d /root/.cache/rpx");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &check_after_command);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 }

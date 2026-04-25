@@ -129,6 +129,12 @@ pub struct ArtifactRequest {
     pub cache_file_name: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadProgress {
+    ContentLength(u64),
+    Advanced(u64),
+}
+
 impl Default for RegistryClient {
     fn default() -> Self {
         Self::new(DEFAULT_REGISTRY_BASE_URL)
@@ -222,10 +228,7 @@ impl RegistryClient {
         let response = self
             .request(
                 reqwest::Method::GET,
-                format!(
-                "{}/packages/{package}/versions/latest",
-                self.base_url
-            ),
+                format!("{}/packages/{package}/versions/latest", self.base_url),
             )
             .send()
             .map_err(|error| format!("failed to contact registry: {error}"))?;
@@ -353,9 +356,9 @@ impl RegistryClient {
             .request(
                 reqwest::Method::GET,
                 format!(
-                "{}/packages/{package}/versions/{version}/description",
-                self.base_url
-            ),
+                    "{}/packages/{package}/versions/{version}/description",
+                    self.base_url
+                ),
             )
             .send()
             .map_err(|error| format!("failed to contact registry: {error}"))?;
@@ -394,6 +397,16 @@ impl RegistryClient {
         version: &str,
         artifact: &ArtifactRequest,
     ) -> Result<DownloadedArtifact, String> {
+        self.download_artifact_with_progress(package, version, artifact, |_| {})
+    }
+
+    pub fn download_artifact_with_progress(
+        &self,
+        package: &str,
+        version: &str,
+        artifact: &ArtifactRequest,
+        mut on_progress: impl FnMut(DownloadProgress),
+    ) -> Result<DownloadedArtifact, String> {
         let path = artifact_cache_path(package, version, &artifact.cache_file_name);
         if path.exists() {
             return Ok(DownloadedArtifact { path });
@@ -420,6 +433,10 @@ impl RegistryClient {
             return Err(format!("artifact download failed ({status}): {body}"));
         }
 
+        if let Some(length) = response.content_length() {
+            on_progress(DownloadProgress::ContentLength(length));
+        }
+
         let mut file = fs::File::create(&path)
             .map_err(|error| format!("failed to write {artifact_label}: {error}"))?;
         let mut response = response;
@@ -435,12 +452,17 @@ impl RegistryClient {
 
             file.write_all(&buffer[..read])
                 .map_err(|error| format!("failed to write {artifact_label}: {error}"))?;
+            on_progress(DownloadProgress::Advanced(read as u64));
         }
 
         Ok(DownloadedArtifact { path })
     }
 
-    fn request(&self, method: reqwest::Method, url: impl AsRef<str>) -> reqwest::blocking::RequestBuilder {
+    fn request(
+        &self,
+        method: reqwest::Method,
+        url: impl AsRef<str>,
+    ) -> reqwest::blocking::RequestBuilder {
         let builder = self.client.request(method, url.as_ref());
 
         match &self.token {
@@ -476,7 +498,9 @@ fn decode_json_response<T: serde::de::DeserializeOwned>(
     Err(unexpected_response_message(response))
 }
 
-fn decode_description_response(response: reqwest::blocking::Response) -> Result<DescriptionEnvelope, String> {
+fn decode_description_response(
+    response: reqwest::blocking::Response,
+) -> Result<DescriptionEnvelope, String> {
     let status = response.status();
 
     if status == StatusCode::ACCEPTED {
@@ -640,7 +664,9 @@ mod tests {
     }
 
     fn clear_registry_metadata_cache(base_url: &str) {
-        let path = cache_dir_path().join("registry").join(hash_string(base_url));
+        let path = cache_dir_path()
+            .join("registry")
+            .join(hash_string(base_url));
         if path.exists() {
             fs::remove_dir_all(path).expect("metadata cache should be removable");
         }

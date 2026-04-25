@@ -61,7 +61,12 @@ pub struct DescriptionDependency {
 impl std::fmt::Display for DescriptionDependency {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.version {
-            Some((operator, version)) => write!(f, "{} ({} {version})", self.name, relation_operator(operator)),
+            Some((operator, version)) => write!(
+                f,
+                "{} ({} {version})",
+                self.name,
+                relation_operator(operator)
+            ),
             None => f.write_str(&self.name),
         }
     }
@@ -136,7 +141,12 @@ pub fn read_description() -> Result<ProjectDescription, String> {
     let additional_repositories = description.additional_repositories();
     description.remove_field("Additional_repositories");
 
-    if description.package_name().unwrap_or_default().trim().is_empty() {
+    if description
+        .package_name()
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
         return Err("DESCRIPTION is missing Package".to_string());
     }
 
@@ -214,13 +224,11 @@ impl DescriptionExt for RDescription {
     }
 
     fn has_dependency(&self, package: &str) -> bool {
-        ["Imports", "Depends"]
-            .into_iter()
-            .any(|field| {
-                self.dependency_field(field)
-                    .map(|dependencies| dependencies.into_iter().any(|entry| entry.name == package))
-                    .unwrap_or(false)
-            })
+        ["Imports", "Depends"].into_iter().any(|field| {
+            self.dependency_field(field)
+                .map(|dependencies| dependencies.into_iter().any(|entry| entry.name == package))
+                .unwrap_or(false)
+        })
     }
 
     fn remove_from_field(&mut self, field_name: &str, package: &str) {
@@ -291,7 +299,8 @@ fn format_description_field(field: &str, value: &str) -> String {
         &["Imports", "Depends", "Suggests", "Enhances", "LinkingTo"];
 
     if MULTILINE_RELATION_FIELDS.contains(&field) {
-        let mut entries = parse_dependency_field(value).expect("stored dependency field should parse");
+        let mut entries =
+            parse_dependency_field(value).expect("stored dependency field should parse");
         if entries.is_empty() {
             return format!("{field}:");
         }
@@ -354,7 +363,10 @@ fn dependency_operator_rank(entry: &DescriptionDependency) -> u8 {
     }
 }
 
-fn relation_with_constraint(package: &str, constraint: &str) -> Result<DescriptionDependency, String> {
+fn relation_with_constraint(
+    package: &str,
+    constraint: &str,
+) -> Result<DescriptionDependency, String> {
     let constraint = constraint.trim();
 
     if constraint.is_empty() || constraint == "*" {
