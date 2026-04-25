@@ -1,0 +1,261 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 1
+
+      - id: version
+        name: Validate tag matches Cargo version
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="$(awk '
+            $0 == "[package]" { in_package = 1; next }
+            /^\[/ && $0 != "[package]" { in_package = 0 }
+            in_package && /^version = "/ {
+              gsub(/^version = "/, "")
+              gsub(/"$/, "")
+              print
+              exit
+            }
+          ' Cargo.toml)"
+          expected_tag="v${version}"
+          if [[ "$tag" != "$expected_tag" ]]; then
+            echo "tag $tag does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
+          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+  build-binaries:
+    needs: metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            binary_name: rpx
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+            binary_name: rpx
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: tar.gz
+            binary_name: rpx
+          - os: macos-15
+            target: aarch64-apple-darwin
+            archive: tar.gz
+            binary_name: rpx
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            binary_name: rpx.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ needs.metadata.outputs.tag }}
+
+      - name: Install Rust with rustup
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          case "$(uname -s)/$(uname -m)" in
+            Linux/x86_64) triple=x86_64-unknown-linux-gnu ;;
+            Linux/aarch64) triple=aarch64-unknown-linux-gnu ;;
+            Darwin/x86_64) triple=x86_64-apple-darwin ;;
+            Darwin/arm64) triple=aarch64-apple-darwin ;;
+            *)
+              echo "unsupported runner: $(uname -s)/$(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          base_url="https://static.rust-lang.org/rustup/dist/${triple}"
+          curl --proto '=https' --tlsv1.2 -sSf "$base_url/rustup-init" -o rustup-init
+          curl --proto '=https' --tlsv1.2 -sSf "$base_url/rustup-init.sha256" -o rustup-init.sha256
+          expected="$(awk '{print $1}' rustup-init.sha256)"
+          actual="$(shasum -a 256 rustup-init | awk '{print $1}')"
+          [[ "$actual" == "$expected" ]]
+          chmod +x rustup-init
+          ./rustup-init -y --profile minimal --default-toolchain stable --no-modify-path
+          printf '%s/.cargo/bin\n' "$HOME" >> "$GITHUB_PATH"
+
+      - name: Install Rust with rustup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $baseUrl = 'https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc'
+          Invoke-WebRequest "$baseUrl/rustup-init.exe" -OutFile rustup-init.exe
+          Invoke-WebRequest "$baseUrl/rustup-init.exe.sha256" -OutFile rustup-init.exe.sha256
+          $expected = ((Get-Content rustup-init.exe.sha256) -split '\s+')[0].Trim()
+          $actual = (Get-FileHash rustup-init.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected.ToLowerInvariant()) {
+            throw 'rustup-init.exe checksum verification failed'
+          }
+          ./rustup-init.exe -y --profile minimal --default-toolchain stable --no-modify-path
+          "$env:USERPROFILE\.cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Add Rust target
+        shell: bash
+        run: rustup target add "${{ matrix.target }}"
+
+      - name: Show Rust toolchain
+        shell: bash
+        run: |
+          rustup show active-toolchain
+          cargo --version
+
+      - id: build-rust-info
+        name: Capture Rust cache metadata
+        shell: bash
+        run: |
+          printf 'release=%s\n' "$(rustc -vV | awk '/^release: / { print $2 }')" >> "$GITHUB_OUTPUT"
+          printf 'host=%s\n' "$(rustc -vV | awk '/^host: / { print $2 }')" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ steps.build-rust-info.outputs.release }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ steps.build-rust-info.outputs.release }}-
+            cargo-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Package tarball
+        if: matrix.archive == 'tar.gz'
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+          BINARY_NAME: ${{ matrix.binary_name }}
+        run: |
+          package_dir="rpx-${VERSION}-${TARGET}"
+          mkdir -p "$package_dir" dist
+          cp "target/${TARGET}/release/${BINARY_NAME}" "$package_dir/${BINARY_NAME}"
+          tar -czf "dist/${package_dir}.tar.gz" "$package_dir"
+
+      - name: Package zip
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+          BINARY_NAME: ${{ matrix.binary_name }}
+        run: |
+          $packageDir = "rpx-$env:VERSION-$env:TARGET"
+          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/$env:TARGET/release/$env:BINARY_NAME" "$packageDir/$env:BINARY_NAME"
+          Compress-Archive -Path $packageDir -DestinationPath "dist/$packageDir.zip"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+
+  checksums:
+    needs:
+      - metadata
+      - build-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          shasum -a 256 dist/* > dist/SHA256SUMS
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: checksums
+          path: dist/SHA256SUMS
+
+  publish-release:
+    needs:
+      - metadata
+      - build-binaries
+      - checksums
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes dist/*
+          fi
+
+  publish-image:
+    needs: metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ needs.metadata.outputs.tag }}
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.metadata.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.metadata.outputs.tag }}
+            type=semver,pattern={{major}},value=${{ needs.metadata.outputs.tag }}
+            type=raw,value=latest
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          file: Dockerfile.release
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

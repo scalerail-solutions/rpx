@@ -16,6 +16,8 @@ Install from GitHub:
 cargo install --git https://github.com/scalerail-solutions/rpx.git
 ```
 
+Install a release binary from GitHub Releases by downloading the archive for your platform from the latest release.
+
 Example workflow for a new project:
 
 ```bash
@@ -58,3 +60,31 @@ cargo test
 The test suite depends on Docker and uses `testcontainers`.
 
 Integration tests run against the official `r-base` image and execute realistic package-management workflows inside containers. This keeps the tests close to real usage while avoiding changes to your local R installation or package library.
+
+## Release Process
+
+Releases are published from pushed Git tags.
+
+When you are ready to ship a version:
+
+1. Update `Cargo.toml` to the version you want to release.
+2. Merge that change to `main`.
+3. Create and push a matching tag, for example `v0.2.0`.
+
+The release workflow verifies that the pushed tag matches `Cargo.toml`, then:
+
+- builds release archives for five targets:
+  - `x86_64-unknown-linux-gnu`
+  - `aarch64-unknown-linux-gnu`
+  - `x86_64-apple-darwin`
+  - `aarch64-apple-darwin`
+  - `x86_64-pc-windows-msvc`
+- generates `SHA256SUMS`
+- creates a GitHub Release and uploads the artifacts
+- publishes a GHCR image for `COPY --from`
+
+Example Docker usage:
+
+```dockerfile
+COPY --from=ghcr.io/scalerail-solutions/rpx:vX.Y.Z /rpx /usr/local/bin/rpx
+```
