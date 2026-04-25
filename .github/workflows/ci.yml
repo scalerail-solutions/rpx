@@ -28,9 +28,9 @@ jobs:
         include:
           - os: ubuntu-latest
             command: cargo test --locked
-          - os: macos-13
+          - os: macos-15-intel
             command: cargo test --locked --lib --bins --tests --no-run
-          - os: macos-14
+          - os: macos-15
             command: cargo test --locked --lib --bins --tests --no-run
           - os: windows-latest
             command: cargo test --locked --lib --bins --tests --no-run
