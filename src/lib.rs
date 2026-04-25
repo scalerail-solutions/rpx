@@ -475,56 +475,43 @@ struct DownloadedInstall {
 }
 
 fn resolve_additions_from_latest(
-    description: &r_description::lossy::RDescription,
+    description: &description::RDescription,
     lockfile: Option<&Lockfile>,
     packages: &[String],
     repositories: &RepositorySet,
 ) -> Result<AddResolution, String> {
-    let constraints_by_package = latest_constraints_by_package(packages, repositories)?;
-    let attempts = max_constraint_attempts(&constraints_by_package);
+    let new_packages = packages
+        .iter()
+        .cloned()
+        .map(|package| (package, "*".to_string()))
+        .collect::<BTreeMap<_, _>>();
+    let preferred_versions = preferred_locked_versions(description, lockfile, &new_packages)?;
+    let roots = add_resolution_roots(description, &new_packages);
+    let resolved = resolve_from_registry(repositories, &roots, &preferred_versions).map_err(|error| {
+        format!(
+            "could not resolve a compatible dependency set for {}: {error}",
+            packages.join(", ")
+        )
+    })?;
 
-    for index in 0..attempts {
-        let package_constraints = constraints_for_attempt(&constraints_by_package, index);
-        let roots = add_resolution_roots(description, lockfile, &package_constraints);
-
-        if let Ok(resolved) = resolve_from_registry(repositories, &roots) {
-            return Ok(AddResolution {
-                constraints: package_constraints
-                    .into_iter()
-                    .map(|(package, constraint)| (package, persisted_constraints(&constraint)))
-                    .collect(),
-                resolved,
-            });
-        }
-    }
-
-    Err(format!(
-        "could not resolve a compatible dependency set for {}",
-        packages.join(", ")
-    ))
+    Ok(AddResolution {
+        constraints: constraints_from_resolved_roots(packages, &resolved)?,
+        resolved,
+    })
 }
 
 fn add_resolution_roots(
-    description: &r_description::lossy::RDescription,
-    lockfile: Option<&Lockfile>,
+    description: &description::RDescription,
     new_packages: &BTreeMap<String, String>,
 ) -> Vec<ResolutionRoot> {
     let mut roots = BTreeSet::new();
-    let locked_packages = pinned_existing_roots(description, lockfile, new_packages);
 
     for root in description.resolution_roots() {
-        if new_packages.contains_key(&root.name) || locked_packages.contains_key(&root.name) {
+        if new_packages.contains_key(&root.name) {
             continue;
         }
 
         roots.insert(root);
-    }
-
-    for (name, version) in locked_packages {
-        roots.insert(ResolutionRoot {
-            name,
-            constraint: format!("= {version}"),
-        });
     }
 
     for (name, constraint) in new_packages {
@@ -537,16 +524,16 @@ fn add_resolution_roots(
     roots.into_iter().collect()
 }
 
-fn pinned_existing_roots(
-    description: &r_description::lossy::RDescription,
+fn preferred_locked_versions(
+    description: &description::RDescription,
     lockfile: Option<&Lockfile>,
     excluded_packages: &BTreeMap<String, String>,
-) -> BTreeMap<String, String> {
+) -> Result<BTreeMap<String, String>, String> {
     let Some(lockfile) = lockfile else {
-        return BTreeMap::new();
+        return Ok(BTreeMap::new());
     };
 
-    description
+    let mut preferred_versions: BTreeMap<String, String> = description
         .requirements()
         .into_iter()
         .filter(|name| !excluded_packages.contains_key(name))
@@ -556,80 +543,24 @@ fn pinned_existing_roots(
                 .get(&name)
                 .map(|package| (name, package.version.clone()))
         })
-        .collect()
-}
+        .collect();
 
-fn latest_constraints_by_package(
-    packages: &[String],
-    repositories: &RepositorySet,
-) -> Result<BTreeMap<String, Vec<String>>, String> {
-    if packages.is_empty() {
-        return Ok(BTreeMap::new());
+    for package in excluded_packages.keys() {
+        if let Some(locked_package) = lockfile.packages.get(package) {
+            preferred_versions.insert(package.clone(), locked_package.version.clone());
+        }
     }
 
-    let mut constraints = BTreeMap::new();
-    for package in packages {
-        let result = repositories
-            .fetch_latest_version_with_retry(package)
-            .and_then(|latest| semver_add_constraints(&latest.response.version));
-        constraints.insert(
-            package.clone(),
-            result.map_err(|error| format!("{package}: {error}"))?,
-        );
-    }
-    Ok(constraints)
+    Ok(preferred_versions)
 }
 
-fn max_constraint_attempts(constraints_by_package: &BTreeMap<String, Vec<String>>) -> usize {
-    constraints_by_package
-        .values()
-        .map(Vec::len)
-        .max()
-        .unwrap_or(0)
-}
-
-fn constraints_for_attempt(
-    constraints_by_package: &BTreeMap<String, Vec<String>>,
-    index: usize,
-) -> BTreeMap<String, String> {
-    constraints_by_package
-        .iter()
-        .map(|(package, constraints)| {
-            let constraint = constraints
-                .get(index)
-                .or_else(|| constraints.last())
-                .expect("each package should have at least one constraint")
-                .clone();
-            (package.clone(), constraint)
-        })
-        .collect()
-}
-
-fn semver_add_constraints(version: &str) -> Result<Vec<String>, String> {
+fn semver_add_constraint(version: &str) -> Result<String, String> {
     let parts = semver_prefixes(version)?;
     let major = *parts
         .first()
         .ok_or_else(|| format!("latest version is not semver-like: {version}"))?;
     let upper_bound = format!("< {}.0.0", major + 1);
-    let mut constraints = Vec::new();
-
-    constraints.push(format!(">= {version}, {upper_bound}"));
-
-    if parts.len() >= 2 {
-        constraints.push(format!(">= {}.{}, {upper_bound}", parts[0], parts[1]));
-    }
-
-    constraints.push(format!(">= {major}, {upper_bound}"));
-    constraints.push("*".to_string());
-
-    let mut deduped = Vec::new();
-    for constraint in constraints {
-        if !deduped.contains(&constraint) {
-            deduped.push(constraint);
-        }
-    }
-
-    Ok(deduped)
+    Ok(format!(">= {version}, {upper_bound}"))
 }
 
 fn semver_prefixes(version: &str) -> Result<Vec<u64>, String> {
@@ -657,6 +588,29 @@ fn persisted_constraints(constraint: &str) -> Vec<String> {
         .collect()
 }
 
+fn constraints_from_resolved_roots(
+    packages: &[String],
+    resolved: &[ResolvedPackage],
+) -> Result<BTreeMap<String, Vec<String>>, String> {
+    let resolved_by_package = resolved
+        .iter()
+        .map(|package| (package.name.as_str(), package.version.as_str()))
+        .collect::<BTreeMap<_, _>>();
+
+    packages
+        .iter()
+        .map(|package| {
+            let version = resolved_by_package
+                .get(package.as_str())
+                .ok_or_else(|| format!("missing resolved version for {package}"))?;
+            Ok((
+                package.clone(),
+                persisted_constraints(&semver_add_constraint(version)?),
+            ))
+        })
+        .collect()
+}
+
 fn lock_from_description() -> LockOutcome {
     let project = read_description().expect("failed to read DESCRIPTION");
     let roots = project.description.resolution_roots();
@@ -671,7 +625,7 @@ fn lock_from_description() -> LockOutcome {
         return LockOutcome { changed };
     }
 
-    let resolved = resolve_from_registry(&repositories, &roots)
+    let resolved = resolve_from_registry(&repositories, &roots, &BTreeMap::new())
         .unwrap_or_else(|error| panic!("failed to resolve package set from registry: {error}"));
 
     let lockfile = lockfile_from_resolution(roots, &registry, &resolved);
@@ -1592,9 +1546,10 @@ impl SyncUi {
 mod tests {
     use super::{
         add_resolution_roots, binary_artifact_request, compiled_cache_key, locked_install_order,
-        default_registry_base_url, lockfile_from_resolution, persisted_constraints,
+        constraints_from_resolved_roots, default_registry_base_url, lockfile_from_resolution,
+        persisted_constraints,
         r_minor_version,
-        semver_add_constraints, should_fallback_to_source,
+        semver_add_constraint, should_fallback_to_source,
     };
     use crate::{
         description::DescriptionExt,
@@ -1603,7 +1558,7 @@ mod tests {
         registry::ResolutionRoot,
         resolver::{ResolvedDependency, ResolvedPackage},
     };
-    use r_description::lossy::RDescription;
+    use crate::description::RDescription;
     use std::collections::BTreeMap;
     use std::{
         env,
@@ -1742,23 +1697,18 @@ mod tests {
     }
 
     #[test]
-    fn builds_semver_retry_constraints_from_latest_version() {
+    fn builds_semver_constraint_from_resolved_version() {
         assert_eq!(
-            semver_add_constraints("1.1.4").unwrap(),
-            vec![
-                ">= 1.1.4, < 2.0.0".to_string(),
-                ">= 1.1, < 2.0.0".to_string(),
-                ">= 1, < 2.0.0".to_string(),
-                "*".to_string(),
-            ]
+            semver_add_constraint("1.1.4").unwrap(),
+            ">= 1.1.4, < 2.0.0".to_string()
         );
     }
 
     #[test]
-    fn deduplicates_short_semver_retry_constraints() {
+    fn builds_semver_constraint_for_short_version() {
         assert_eq!(
-            semver_add_constraints("1").unwrap(),
-            vec![">= 1, < 2.0.0".to_string(), "*".to_string(),]
+            semver_add_constraint("1").unwrap(),
+            ">= 1, < 2.0.0".to_string()
         );
     }
 
@@ -1772,40 +1722,37 @@ mod tests {
     }
 
     #[test]
-    fn pins_existing_roots_from_lockfile_when_adding_new_package() {
+    fn derives_constraints_from_resolved_root_versions() {
+        let constraints = constraints_from_resolved_roots(
+            &["digest".to_string()],
+            &[ResolvedPackage {
+                name: "digest".to_string(),
+                version: "0.6.37".to_string(),
+                source_url: "https://api.rrepo.org/packages/digest/versions/0.6.37/source"
+                    .to_string(),
+                dependencies: vec![],
+            }],
+        )
+        .expect("constraints should derive");
+
+        assert_eq!(
+            constraints,
+            BTreeMap::from([(
+                "digest".to_string(),
+                vec![">= 0.6.37".to_string(), "< 1.0.0".to_string()],
+            )])
+        );
+    }
+
+    #[test]
+    fn keeps_existing_roots_when_adding_new_package() {
         let description = RDescription::from_str(
             "Package: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\nImports: cli\n",
         )
         .expect("description should parse");
-        let lockfile = Lockfile {
-            version: 1,
-            registry: "https://api.rrepo.org".to_string(),
-            roots: vec![LockedRoot {
-                package: "cli".to_string(),
-                constraint: "*".to_string(),
-            }],
-            packages: BTreeMap::from([(
-                "cli".to_string(),
-                LockedPackage {
-                    package: "cli".to_string(),
-                    version: "3.6.5".to_string(),
-                    source: Some("registry".to_string()),
-                    source_url: Some(
-                        "https://api.rrepo.org/packages/cli/versions/3.6.5/source".to_string(),
-                    ),
-                    dependencies: vec![LockedDependency {
-                        package: "R".to_string(),
-                        kind: "Depends".to_string(),
-                        min_version: Some("4.3".to_string()),
-                        max_version_exclusive: None,
-                    }],
-                },
-            )]),
-        };
 
         let roots = add_resolution_roots(
             &description,
-            Some(&lockfile),
             &BTreeMap::from([("digest".to_string(), ">= 0.6.37, < 1.0.0".to_string())]),
         );
 
@@ -1814,7 +1761,7 @@ mod tests {
             vec![
                 ResolutionRoot {
                     name: "cli".to_string(),
-                    constraint: "= 3.6.5".to_string(),
+                    constraint: "*".to_string(),
                 },
                 ResolutionRoot {
                     name: "digest".to_string(),

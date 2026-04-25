@@ -1,10 +1,36 @@
-use r_description::{
-    Version, VersionConstraint, lossy::RDescription, lossy::Relation, lossy::Relations,
-};
+use deb822_fast::Paragraph;
+use r_description::{Version, VersionConstraint};
 use std::{collections::BTreeSet, fs, str::FromStr};
 
 use crate::project::{current_description_path, description_path};
 use crate::registry::ResolutionRoot;
+
+const DESCRIPTION_FIELD_ORDER: &[&str] = &[
+    "Package",
+    "Version",
+    "Title",
+    "Authors@R",
+    "Author",
+    "Maintainer",
+    "Description",
+    "License",
+    "Depends",
+    "Imports",
+    "Suggests",
+    "Enhances",
+    "LinkingTo",
+    "Additional_repositories",
+    "URL",
+    "BugReports",
+    "Encoding",
+    "Repository",
+    "Date",
+    "VignetteBuilder",
+    "SystemRequirements",
+    "Language",
+    "Collate",
+    "LazyData",
+];
 
 pub trait DescriptionExt {
     fn add_to_imports(&mut self, package: &str);
@@ -15,24 +41,108 @@ pub trait DescriptionExt {
     fn requirements(&self) -> Vec<String>;
 }
 
+#[derive(Debug, Clone)]
+pub struct RDescription {
+    paragraph: Paragraph,
+}
+
 #[derive(Debug)]
 pub struct ProjectDescription {
     pub description: RDescription,
     pub additional_repositories: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescriptionDependency {
+    pub name: String,
+    pub version: Option<(VersionConstraint, Version)>,
+}
+
+impl std::fmt::Display for DescriptionDependency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.version {
+            Some((operator, version)) => write!(f, "{} ({} {version})", self.name, relation_operator(operator)),
+            None => f.write_str(&self.name),
+        }
+    }
+}
+
+impl std::str::FromStr for RDescription {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let paragraph = Paragraph::from_str(s).map_err(|error| error.to_string())?;
+        Ok(Self { paragraph })
+    }
+}
+
+impl std::fmt::Display for RDescription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.paragraph)
+    }
+}
+
+impl RDescription {
+    pub fn package_name(&self) -> Option<&str> {
+        self.paragraph.get("Package")
+    }
+
+    pub fn dependency_field(&self, field_name: &str) -> Result<Vec<DescriptionDependency>, String> {
+        match self.paragraph.get(field_name) {
+            Some(contents) => parse_dependency_field(contents),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    pub fn additional_repositories(&self) -> Vec<String> {
+        self.paragraph
+            .get("Additional_repositories")
+            .map(split_repository_entries)
+            .unwrap_or_default()
+    }
+
+    pub fn remove_field(&mut self, field_name: &str) {
+        self.paragraph.remove(field_name);
+    }
+
+    fn set_field(&mut self, field_name: &str, value: &str) {
+        self.paragraph
+            .set_with_field_order(field_name, value, DESCRIPTION_FIELD_ORDER);
+    }
+
+    fn set_dependency_field(&mut self, field_name: &str, dependencies: &[DescriptionDependency]) {
+        if dependencies.is_empty() {
+            self.paragraph.remove(field_name);
+            return;
+        }
+
+        let value = dependencies
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.set_field(field_name, &value);
+    }
+
+    fn field_pairs(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.paragraph.iter()
+    }
+}
+
 pub fn read_description() -> Result<ProjectDescription, String> {
     let path = description_path();
     let contents = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-    let description = RDescription::from_str(&contents).map_err(|error| error.to_string())?;
+    let mut description = RDescription::from_str(&contents)?;
+    let additional_repositories = description.additional_repositories();
+    description.remove_field("Additional_repositories");
 
-    if description.name.trim().is_empty() {
+    if description.package_name().unwrap_or_default().trim().is_empty() {
         return Err("DESCRIPTION is missing Package".to_string());
     }
 
     Ok(ProjectDescription {
         description,
-        additional_repositories: parse_additional_repositories(&contents),
+        additional_repositories,
     })
 }
 
@@ -77,97 +187,68 @@ impl DescriptionExt for RDescription {
             return;
         }
 
-        let mut imports = self.imports.clone().unwrap_or_default();
+        let mut imports = self
+            .dependency_field("Imports")
+            .expect("existing Imports should parse");
 
         if constraints.is_empty()
             || constraints
                 .iter()
                 .all(|constraint| constraint.trim() == "*")
         {
-            imports.0.push(Relation {
+            imports.push(DescriptionDependency {
                 name: package.to_string(),
                 version: None,
             });
         } else {
-            imports.0.extend(
+            imports.extend(
                 constraints
                     .iter()
-                    .map(|constraint| relation_with_constraint(package, constraint)),
+                    .map(|constraint| relation_with_constraint(package, constraint))
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("constraints should parse"),
             );
         }
 
-        self.imports = Some(imports);
+        self.set_dependency_field("Imports", &imports);
     }
 
     fn has_dependency(&self, package: &str) -> bool {
-        let present_in_imports = self
-            .imports
-            .as_ref()
-            .map(|imports| imports.iter().any(|entry| entry.name == package))
-            .unwrap_or(false);
-
-        if present_in_imports {
-            return true;
-        }
-
-        self.depends
-            .as_ref()
-            .map(|depends| depends.iter().any(|entry| entry.name == package))
-            .unwrap_or(false)
+        ["Imports", "Depends"]
+            .into_iter()
+            .any(|field| {
+                self.dependency_field(field)
+                    .map(|dependencies| dependencies.into_iter().any(|entry| entry.name == package))
+                    .unwrap_or(false)
+            })
     }
 
     fn remove_from_field(&mut self, field_name: &str, package: &str) {
-        match field_name {
-            "Imports" => {
-                let filtered = self
-                    .imports
-                    .clone()
-                    .unwrap_or_default()
-                    .0
-                    .into_iter()
-                    .filter(|entry| entry.name != package)
-                    .collect::<Vec<_>>();
-
-                self.imports = if filtered.is_empty() {
-                    None
-                } else {
-                    Some(Relations(filtered))
-                };
-            }
-            "Depends" => {
-                let filtered = self
-                    .depends
-                    .clone()
-                    .unwrap_or_default()
-                    .iter()
-                    .filter(|relation| relation.name != package)
-                    .cloned()
-                    .collect::<Vec<_>>();
-
-                self.depends = if filtered.is_empty() {
-                    None
-                } else {
-                    Some(Relations(filtered))
-                };
-            }
-            _ => {}
-        }
+        let filtered = self
+            .dependency_field(field_name)
+            .expect("dependency field should parse")
+            .into_iter()
+            .filter(|entry| entry.name != package)
+            .collect::<Vec<_>>();
+        self.set_dependency_field(field_name, &filtered);
     }
 
     fn resolution_roots(&self) -> Vec<ResolutionRoot> {
         let mut roots = BTreeSet::new();
 
-        if let Some(imports) = &self.imports {
-            for relation in imports.iter() {
-                roots.insert(resolution_root_from_relation(relation));
-            }
+        for relation in self
+            .dependency_field("Imports")
+            .expect("Imports should parse")
+        {
+            roots.insert(resolution_root_from_relation(&relation));
         }
 
-        if let Some(depends) = &self.depends {
-            for relation in depends.iter() {
-                if relation.name != "R" {
-                    roots.insert(resolution_root_from_relation(relation));
-                }
+        for relation in self
+            .dependency_field("Depends")
+            .expect("Depends should parse")
+        {
+            if relation.name != "R" {
+                roots.insert(resolution_root_from_relation(&relation));
             }
         }
 
@@ -177,18 +258,19 @@ impl DescriptionExt for RDescription {
     fn requirements(&self) -> Vec<String> {
         let mut requirements = BTreeSet::new();
 
-        if let Some(imports) = &self.imports {
-            for relation in imports.iter() {
-                requirements.insert(relation.name.clone());
-            }
+        for relation in self
+            .dependency_field("Imports")
+            .expect("Imports should parse")
+        {
+            requirements.insert(relation.name);
         }
 
-        if let Some(depends) = &self.depends {
-            for relation in depends.iter() {
-                let name = relation.name.clone();
-                if name != "R" {
-                    requirements.insert(name);
-                }
+        for relation in self
+            .dependency_field("Depends")
+            .expect("Depends should parse")
+        {
+            if relation.name != "R" {
+                requirements.insert(relation.name);
             }
         }
 
@@ -197,12 +279,41 @@ impl DescriptionExt for RDescription {
 }
 
 fn format_description_for_write(description: &RDescription) -> String {
-    format!("{description}")
-        .trim_end()
-        .lines()
-        .map(format_description_line)
+    description
+        .field_pairs()
+        .map(|(field, value)| format_description_field(field, value))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn format_description_field(field: &str, value: &str) -> String {
+    const MULTILINE_RELATION_FIELDS: &[&str] =
+        &["Imports", "Depends", "Suggests", "Enhances", "LinkingTo"];
+
+    if MULTILINE_RELATION_FIELDS.contains(&field) {
+        let mut entries = parse_dependency_field(value).expect("stored dependency field should parse");
+        if entries.is_empty() {
+            return format!("{field}:");
+        }
+
+        entries.sort_by(compare_dependencies);
+
+        let mut lines = vec![format!("{field}:")];
+        for (index, entry) in entries.iter().enumerate() {
+            let suffix = if index + 1 < entries.len() { "," } else { "" };
+            lines.push(format!("    {entry}{suffix}"));
+        }
+        return lines.join("\n");
+    }
+
+    let value_lines = value.lines().collect::<Vec<_>>();
+    if value_lines.len() <= 1 {
+        return format!("{field}: {value}");
+    }
+
+    let mut lines = vec![format!("{field}:")];
+    lines.extend(value_lines.into_iter().map(|line| format!(" {line}")));
+    lines.join("\n")
 }
 
 fn format_additional_repositories(repositories: &[String]) -> String {
@@ -220,122 +331,78 @@ fn format_additional_repositories(repositories: &[String]) -> String {
     )
 }
 
-fn format_description_line(line: &str) -> String {
-    const MULTILINE_RELATION_FIELDS: &[&str] =
-        &["Imports", "Depends", "Suggests", "Enhances", "LinkingTo"];
-
-    let Some((field, value)) = line.split_once(':') else {
-        return line.to_string();
-    };
-
-    if !MULTILINE_RELATION_FIELDS.contains(&field) {
-        return line.to_string();
-    }
-
-    let value = value.trim();
-    if value.is_empty() {
-        return line.to_string();
-    }
-
-    let entries = value
-        .split(", ")
-        .filter(|entry| !entry.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-
-    if entries.is_empty() {
-        return line.to_string();
-    }
-
-    let mut entries = entries;
-    entries.sort_by(|left, right| compare_dependency_entries(left, right));
-
-    format!("{field}:\n    {}", entries.join(",\n    "))
-}
-
-fn compare_dependency_entries(left: &str, right: &str) -> std::cmp::Ordering {
-    dependency_entry_name(left)
+fn compare_dependencies(
+    left: &DescriptionDependency,
+    right: &DescriptionDependency,
+) -> std::cmp::Ordering {
+    left.name
         .to_ascii_lowercase()
-        .cmp(&dependency_entry_name(right).to_ascii_lowercase())
-        .then_with(|| dependency_entry_name(left).cmp(dependency_entry_name(right)))
-        .then_with(|| {
-            dependency_entry_operator_rank(left).cmp(&dependency_entry_operator_rank(right))
-        })
-        .then_with(|| left.cmp(right))
+        .cmp(&right.name.to_ascii_lowercase())
+        .then_with(|| left.name.cmp(&right.name))
+        .then_with(|| dependency_operator_rank(left).cmp(&dependency_operator_rank(right)))
+        .then_with(|| left.to_string().cmp(&right.to_string()))
 }
 
-fn dependency_entry_name(entry: &str) -> &str {
-    entry
-        .split_once(" (")
-        .map(|(name, _)| name)
-        .unwrap_or(entry)
-}
-
-fn dependency_entry_operator_rank(entry: &str) -> u8 {
-    let Some((_, rest)) = entry.split_once(" (") else {
-        return 0;
-    };
-    let operator = rest
-        .trim_end_matches(')')
-        .split_whitespace()
-        .next()
-        .unwrap_or("");
-    match operator {
-        ">=" => 1,
-        ">>" => 2,
-        "=" => 3,
-        "<=" => 4,
-        "<<" => 5,
-        _ => 6,
+fn dependency_operator_rank(entry: &DescriptionDependency) -> u8 {
+    match entry.version.as_ref().map(|(operator, _)| operator) {
+        None => 0,
+        Some(VersionConstraint::GreaterThanEqual) => 1,
+        Some(VersionConstraint::GreaterThan) => 2,
+        Some(VersionConstraint::Equal) => 3,
+        Some(VersionConstraint::LessThanEqual) => 4,
+        Some(VersionConstraint::LessThan) => 5,
     }
 }
 
-fn relation_with_constraint(package: &str, constraint: &str) -> Relation {
+fn relation_with_constraint(package: &str, constraint: &str) -> Result<DescriptionDependency, String> {
     let constraint = constraint.trim();
 
     if constraint.is_empty() || constraint == "*" {
-        return Relation {
+        return Ok(DescriptionDependency {
             name: package.to_string(),
             version: None,
-        };
+        });
     }
 
-    let (operator, version) = parse_constraint(constraint);
+    let (operator, version) = parse_constraint(constraint)?;
 
-    Relation {
+    Ok(DescriptionDependency {
         name: package.to_string(),
         version: Some((
             operator,
-            version.parse().expect("constraint version should parse"),
+            version.parse().map_err(|error: String| error.to_string())?,
         )),
-    }
+    })
 }
 
-fn parse_additional_repositories(contents: &str) -> Vec<String> {
-    let mut values = Vec::new();
-    let mut lines = contents.lines().peekable();
+fn parse_dependency_field(value: &str) -> Result<Vec<DescriptionDependency>, String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(parse_dependency_entry)
+        .collect()
+}
 
-    while let Some(line) = lines.next() {
-        let Some(rest) = line.strip_prefix("Additional_repositories:") else {
-            continue;
-        };
+fn parse_dependency_entry(entry: &str) -> Result<DescriptionDependency, String> {
+    let Some((name, rest)) = entry.split_once('(') else {
+        return Ok(DescriptionDependency {
+            name: entry.trim().to_string(),
+            version: None,
+        });
+    };
 
-        values.extend(split_repository_entries(rest));
-
-        while let Some(next) = lines.peek() {
-            if next.starts_with(' ') || next.starts_with('\t') {
-                values.extend(split_repository_entries(next.trim()));
-                lines.next();
-                continue;
-            }
-            break;
-        }
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(format!("invalid dependency entry: {entry}"));
     }
 
-    values
-        .into_iter()
-        .filter(|value| !value.is_empty())
-        .collect()
+    let rest = rest.trim();
+    let Some(constraint) = rest.strip_suffix(')') else {
+        return Err(format!("invalid dependency entry: {entry}"));
+    };
+
+    relation_with_constraint(name, constraint.trim())
 }
 
 fn split_repository_entries(value: &str) -> Vec<String> {
@@ -347,12 +414,13 @@ fn split_repository_entries(value: &str) -> Vec<String> {
         .collect()
 }
 
-fn parse_constraint(constraint: &str) -> (VersionConstraint, &str) {
+fn parse_constraint(constraint: &str) -> Result<(VersionConstraint, &str), String> {
     for (prefix, operator) in [
         (">=", VersionConstraint::GreaterThanEqual),
         ("<=", VersionConstraint::LessThanEqual),
         ("<<", VersionConstraint::LessThan),
         (">>", VersionConstraint::GreaterThan),
+        ("==", VersionConstraint::Equal),
         ("=", VersionConstraint::Equal),
         ("<", VersionConstraint::LessThan),
         (">", VersionConstraint::GreaterThan),
@@ -360,15 +428,15 @@ fn parse_constraint(constraint: &str) -> (VersionConstraint, &str) {
         if let Some(version) = constraint.strip_prefix(prefix) {
             let version = version.trim();
             if !version.is_empty() {
-                return (operator, version);
+                return Ok((operator, version));
             }
         }
     }
 
-    panic!("invalid dependency constraint: {constraint}");
+    Err(format!("invalid dependency constraint: {constraint}"))
 }
 
-fn resolution_root_from_relation(relation: &Relation) -> ResolutionRoot {
+fn resolution_root_from_relation(relation: &DescriptionDependency) -> ResolutionRoot {
     let constraint = relation
         .version
         .as_ref()
@@ -392,30 +460,15 @@ fn relation_operator(operator: &VersionConstraint) -> &'static str {
 }
 
 fn initial_description(package_name: &str) -> RDescription {
-    RDescription {
-        name: package_name.to_string(),
-        description: "Add a package description.".to_string(),
-        title: title_from_package_name(package_name),
-        maintainer: Some("Your Name <you@example.com>".to_string()),
-        author: Some("Your Name".to_string()),
-        authors: None,
-        version: "0.1.0".parse::<Version>().expect("version should parse"),
-        encoding: None,
-        license: "MIT".to_string(),
-        url: None,
-        bug_reports: None,
-        imports: None,
-        suggests: None,
-        depends: None,
-        linking_to: None,
-        lazy_data: None,
-        collate: None,
-        vignette_builder: None,
-        system_requirements: None,
-        date: None,
-        language: None,
-        repository: None,
-    }
+    let mut paragraph = Paragraph::from(Vec::new());
+    paragraph.insert("Package", package_name);
+    paragraph.insert("Version", "0.1.0");
+    paragraph.insert("Title", &title_from_package_name(package_name));
+    paragraph.insert("Description", "Add a package description.");
+    paragraph.insert("License", "MIT");
+    paragraph.insert("Author", "Your Name");
+    paragraph.insert("Maintainer", "Your Name <you@example.com>");
+    RDescription { paragraph }
 }
 
 fn package_name_from_current_directory() -> Result<String, String> {
@@ -474,12 +527,12 @@ fn title_from_package_name(package_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DescriptionExt, format_additional_repositories, format_description_for_write,
-        parse_additional_repositories, parse_constraint, relation_with_constraint,
-        sanitize_package_name, title_from_package_name,
+        DescriptionExt, RDescription, format_additional_repositories, format_description_for_write,
+        parse_constraint, relation_with_constraint, sanitize_package_name,
+        split_repository_entries, title_from_package_name,
     };
     use crate::registry::ResolutionRoot;
-    use r_description::{VersionConstraint, lossy::RDescription};
+    use r_description::VersionConstraint;
     use std::str::FromStr;
 
     #[test]
@@ -518,10 +571,12 @@ mod tests {
             &[">= 1.1.4".to_string(), "< 2.0.0".to_string()],
         );
 
-        let imports = description.imports.expect("imports should exist");
-        assert_eq!(imports.0.len(), 2);
-        assert_eq!(imports.0[0].to_string(), "dplyr (>= 1.1.4)");
-        assert_eq!(imports.0[1].to_string(), "dplyr (<< 2.0.0)");
+        let imports = description
+            .dependency_field("Imports")
+            .expect("imports should parse");
+        assert_eq!(imports.len(), 2);
+        assert_eq!(imports[0].to_string(), "dplyr (>= 1.1.4)");
+        assert_eq!(imports[1].to_string(), "dplyr (< 2.0.0)");
     }
 
     #[test]
@@ -539,17 +594,31 @@ mod tests {
     #[test]
     fn parses_strict_less_than_constraints() {
         assert_eq!(
-            parse_constraint("< 2.0.0"),
+            parse_constraint("< 2.0.0").unwrap(),
             (VersionConstraint::LessThan, "2.0.0")
         );
         assert_eq!(
-            parse_constraint("<< 2.0.0"),
+            parse_constraint("<< 2.0.0").unwrap(),
             (VersionConstraint::LessThan, "2.0.0")
         );
         assert_eq!(
-            relation_with_constraint("dplyr", "< 2.0.0").to_string(),
-            "dplyr (<< 2.0.0)"
+            relation_with_constraint("dplyr", "< 2.0.0")
+                .unwrap()
+                .to_string(),
+            "dplyr (< 2.0.0)"
         );
+    }
+
+    #[test]
+    fn canonicalizes_cran_style_greater_than_constraints() {
+        let description = RDescription::from_str(
+            "Package: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\nImports: rbibutils (> 2.4)\n",
+        )
+        .expect("description should parse");
+
+        let formatted = format_description_for_write(&description);
+
+        assert!(formatted.contains("Imports:\n    rbibutils (> 2.4)"));
     }
 
     #[test]
@@ -579,7 +648,7 @@ mod tests {
 
         let formatted = format_description_for_write(&description);
 
-        assert!(formatted.contains("Imports:\n    dplyr (>= 1.1.4),\n    dplyr (<< 2.0.0)"));
+        assert!(formatted.contains("Imports:\n    dplyr (>= 1.1.4),\n    dplyr (< 2.0.0)"));
     }
 
     #[test]
@@ -619,9 +688,11 @@ mod tests {
 
     #[test]
     fn parses_additional_repositories_from_description() {
-        let repositories = parse_additional_repositories(
+        let description = RDescription::from_str(
             "Package: testpkg\nAdditional_repositories:\n    https://one.example/repo,\n    https://two.example/repo\n",
-        );
+        )
+        .expect("description should parse");
+        let repositories = description.additional_repositories();
 
         assert_eq!(
             repositories,
@@ -640,6 +711,17 @@ mod tests {
                 "https://two.example/repo".to_string(),
             ]),
             "Additional_repositories:\n    https://one.example/repo,\n    https://two.example/repo"
+        );
+    }
+
+    #[test]
+    fn splits_repository_entries_from_folded_field_value() {
+        assert_eq!(
+            split_repository_entries("https://one.example/repo,\nhttps://two.example/repo"),
+            vec![
+                "https://one.example/repo".to_string(),
+                "https://two.example/repo".to_string(),
+            ]
         );
     }
 }

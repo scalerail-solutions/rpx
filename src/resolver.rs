@@ -13,12 +13,10 @@ use pubgrub::{
     Dependencies, DependencyConstraints, DependencyProvider, PackageResolutionStatistics, Ranges,
     resolve,
 };
-use r_description::{
-    Version, VersionConstraint,
-    lossy::{RDescription, Relation, Relations},
-};
+use r_description::{Version, VersionConstraint};
 
 use crate::{
+    description::{DescriptionDependency, RDescription},
     registry::{ResolutionRoot, VersionSummary},
     repository::{RepositorySet, RepositorySource},
 };
@@ -77,6 +75,7 @@ struct RegistryDependencyProvider<'a> {
     repositories: &'a RepositorySet,
     progress: ResolutionProgress,
     root_dependencies: Vec<PackageDependency>,
+    preferred_versions_by_package: BTreeMap<String, Version>,
     versions_by_package: RefCell<BTreeMap<String, Vec<VersionSummary>>>,
     source_by_package: RefCell<BTreeMap<String, RepositorySource>>,
     metadata_by_package_version: RefCell<BTreeMap<(String, String), PackageMetadata>>,
@@ -91,7 +90,11 @@ struct ResolutionProgress {
 }
 
 impl<'a> RegistryDependencyProvider<'a> {
-    fn new(repositories: &'a RepositorySet, roots: &[ResolutionRoot]) -> Result<Self, ResolverError> {
+    fn new(
+        repositories: &'a RepositorySet,
+        roots: &[ResolutionRoot],
+        preferred_versions_by_package: BTreeMap<String, Version>,
+    ) -> Result<Self, ResolverError> {
         let progress = ResolutionProgress::new();
         let root_dependencies = roots
             .iter()
@@ -113,6 +116,7 @@ impl<'a> RegistryDependencyProvider<'a> {
             repositories,
             progress,
             root_dependencies,
+            preferred_versions_by_package,
             versions_by_package: RefCell::new(BTreeMap::new()),
             source_by_package: RefCell::new(BTreeMap::new()),
             metadata_by_package_version: RefCell::new(BTreeMap::new()),
@@ -306,6 +310,12 @@ impl DependencyProvider for RegistryDependencyProvider<'_> {
             return Ok(range.contains(&version).then_some(version));
         }
 
+        if let Some(preferred_version) = self.preferred_versions_by_package.get(package) {
+            if range.contains(preferred_version) {
+                return Ok(Some(preferred_version.clone()));
+            }
+        }
+
         Ok(self
             .package_versions(package)?
             .into_iter()
@@ -359,9 +369,15 @@ impl DependencyProvider for RegistryDependencyProvider<'_> {
 pub fn resolve_from_registry(
     repositories: &RepositorySet,
     roots: &[ResolutionRoot],
+    preferred_versions_by_package: &BTreeMap<String, String>,
 ) -> Result<Vec<ResolvedPackage>, String> {
-    let provider =
-        RegistryDependencyProvider::new(repositories, roots).map_err(|error| error.to_string())?;
+    let preferred_versions_by_package = preferred_versions_by_package
+        .iter()
+        .map(|(package, version)| Ok((package.clone(), parse_version(version)?)))
+        .collect::<Result<BTreeMap<_, _>, ResolverError>>()
+        .map_err(|error| error.to_string())?;
+    let provider = RegistryDependencyProvider::new(repositories, roots, preferred_versions_by_package)
+        .map_err(|error| error.to_string())?;
     let selected = match solve_selected_versions(&provider) {
         Ok(selected) => selected,
         Err(error) => {
@@ -410,24 +426,33 @@ where
 fn description_dependencies(description: &RDescription) -> Result<Vec<PackageDependency>, ResolverError> {
     let mut dependencies = Vec::new();
 
-    if let Some(depends) = &description.depends {
-        dependencies.extend(relations_to_dependencies("Depends", depends)?);
-    }
+    dependencies.extend(relations_to_dependencies(
+        "Depends",
+        &description
+            .dependency_field("Depends")
+            .map_err(ResolverError)?,
+    )?);
 
-    if let Some(imports) = &description.imports {
-        dependencies.extend(relations_to_dependencies("Imports", imports)?);
-    }
+    dependencies.extend(relations_to_dependencies(
+        "Imports",
+        &description
+            .dependency_field("Imports")
+            .map_err(ResolverError)?,
+    )?);
 
-    if let Some(linking_to) = &description.linking_to {
-        dependencies.extend(relations_to_dependencies("LinkingTo", linking_to)?);
-    }
+    dependencies.extend(relations_to_dependencies(
+        "LinkingTo",
+        &description
+            .dependency_field("LinkingTo")
+            .map_err(ResolverError)?,
+    )?);
 
     Ok(dependencies)
 }
 
 fn relations_to_dependencies(
     kind: &str,
-    relations: &Relations,
+    relations: &[DescriptionDependency],
 ) -> Result<Vec<PackageDependency>, ResolverError> {
     relations
         .iter()
@@ -436,7 +461,10 @@ fn relations_to_dependencies(
         .collect()
 }
 
-fn relation_dependency(kind: &str, relation: &Relation) -> Result<PackageDependency, ResolverError> {
+fn relation_dependency(
+    kind: &str,
+    relation: &DescriptionDependency,
+) -> Result<PackageDependency, ResolverError> {
     let (min_version, max_version_exclusive) = relation_bounds(relation);
     Ok(PackageDependency {
         range: range_from_relation(relation),
@@ -449,7 +477,7 @@ fn relation_dependency(kind: &str, relation: &Relation) -> Result<PackageDepende
     })
 }
 
-fn relation_bounds(relation: &Relation) -> (Option<String>, Option<String>) {
+fn relation_bounds(relation: &DescriptionDependency) -> (Option<String>, Option<String>) {
     let Some((operator, version)) = relation.version.as_ref() else {
         return (None, None);
     };
@@ -465,7 +493,7 @@ fn relation_bounds(relation: &Relation) -> (Option<String>, Option<String>) {
     }
 }
 
-fn range_from_relation(relation: &Relation) -> VersionRange {
+fn range_from_relation(relation: &DescriptionDependency) -> VersionRange {
     let Some((operator, version)) = relation.version.as_ref() else {
         return VersionRange::full();
     };
@@ -658,6 +686,41 @@ mod tests {
     }
 
     #[test]
+    fn extracts_cran_style_strict_constraints_from_registry_description() {
+        let description = RDescription::from_str(
+            "Package: Rdpack\nVersion: 2.6.6\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\nDepends: R (>= 2.15.0), methods\nImports: tools, utils, rbibutils (> 2.4)\n",
+        )
+        .expect("description should parse");
+
+        let dependencies = description_dependencies(&description).expect("dependencies should parse");
+
+        assert_eq!(
+            dependencies
+                .iter()
+                .map(|dependency| {
+                    (
+                        dependency.resolved.package.clone(),
+                        dependency.resolved.kind.clone(),
+                        dependency.resolved.min_version.clone(),
+                        dependency.resolved.max_version_exclusive.clone(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                ("methods".to_string(), "Depends".to_string(), None, None),
+                ("tools".to_string(), "Imports".to_string(), None, None),
+                ("utils".to_string(), "Imports".to_string(), None, None),
+                (
+                    "rbibutils".to_string(),
+                    "Imports".to_string(),
+                    Some("2.4".to_string()),
+                    None,
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn resolves_transitives_to_highest_compatible_versions() {
         let provider = TestProvider {
             root_dependencies: vec![("dplyr".to_string(), VersionRange::full())],
@@ -754,5 +817,43 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["dep@2.0.0".to_string(), "pkg@2.0.0".to_string()]
         );
+    }
+
+    #[test]
+    fn prefers_locked_version_when_it_satisfies_requested_range() {
+        let repositories = RepositorySet::new(vec![]);
+        let provider = RegistryDependencyProvider::new(
+            &repositories,
+            &[],
+            BTreeMap::from([(
+                "cli".to_string(),
+                parse_version("3.6.4").expect("version should parse"),
+            )]),
+        )
+        .expect("provider should build");
+
+        provider.versions_by_package.borrow_mut().insert(
+            "cli".to_string(),
+            vec![
+                VersionSummary {
+                    version: "3.6.4".to_string(),
+                    source_url: "https://example.test/cli/3.6.4".to_string(),
+                },
+                VersionSummary {
+                    version: "3.6.5".to_string(),
+                    source_url: "https://example.test/cli/3.6.5".to_string(),
+                },
+            ],
+        );
+
+        let chosen = provider
+            .choose_version(
+                &"cli".to_string(),
+                &parse_constraint_range(">= 3.6.0, < 4.0.0").expect("constraint should parse"),
+            )
+            .expect("selection should succeed")
+            .expect("selection should exist");
+
+        assert_eq!(chosen.to_string(), "3.6.4");
     }
 }
