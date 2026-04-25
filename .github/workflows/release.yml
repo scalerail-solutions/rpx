@@ -22,11 +22,28 @@ jobs:
       version: ${{ steps.version.outputs.next_version }}
       tag: ${{ steps.version.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust with rustup
+        shell: bash
+        run: |
+          base_url='https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu'
+          curl --proto '=https' --tlsv1.2 -sSf "$base_url/rustup-init" -o rustup-init
+          curl --proto '=https' --tlsv1.2 -sSf "$base_url/rustup-init.sha256" -o rustup-init.sha256
+          expected="$(tr -d '[:space:]' < rustup-init.sha256)"
+          actual="$(shasum -a 256 rustup-init | awk '{print $1}')"
+          [[ "$actual" == "$expected" ]]
+          chmod +x rustup-init
+          ./rustup-init -y --profile minimal --default-toolchain stable --no-modify-path
+          printf '%s/.cargo/bin\n' "$HOME" >> "$GITHUB_PATH"
+
+      - name: Show Rust toolchain
+        shell: bash
+        run: |
+          rustup show active-toolchain
+          cargo --version
 
       - id: version
         name: Compute next version
@@ -96,13 +113,57 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: ${{ needs.prepare.outputs.tag }}
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      - name: Install Rust with rustup
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          case "$(uname -s)/$(uname -m)" in
+            Linux/x86_64) triple=x86_64-unknown-linux-gnu ;;
+            Darwin/x86_64) triple=x86_64-apple-darwin ;;
+            Darwin/arm64) triple=aarch64-apple-darwin ;;
+            *)
+              echo "unsupported runner: $(uname -s)/$(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          base_url="https://static.rust-lang.org/rustup/dist/${triple}"
+          curl --proto '=https' --tlsv1.2 -sSf "$base_url/rustup-init" -o rustup-init
+          curl --proto '=https' --tlsv1.2 -sSf "$base_url/rustup-init.sha256" -o rustup-init.sha256
+          expected="$(tr -d '[:space:]' < rustup-init.sha256)"
+          actual="$(shasum -a 256 rustup-init | awk '{print $1}')"
+          [[ "$actual" == "$expected" ]]
+          chmod +x rustup-init
+          ./rustup-init -y --profile minimal --default-toolchain stable --no-modify-path
+          printf '%s/.cargo/bin\n' "$HOME" >> "$GITHUB_PATH"
+
+      - name: Install Rust with rustup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $baseUrl = 'https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc'
+          Invoke-WebRequest "$baseUrl/rustup-init.exe" -OutFile rustup-init.exe
+          Invoke-WebRequest "$baseUrl/rustup-init.exe.sha256" -OutFile rustup-init.exe.sha256
+          $expected = (Get-Content rustup-init.exe.sha256).Trim()
+          $actual = (Get-FileHash rustup-init.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected.ToLowerInvariant()) {
+            throw 'rustup-init.exe checksum verification failed'
+          }
+          ./rustup-init.exe -y --profile minimal --default-toolchain stable --no-modify-path
+          "$env:USERPROFILE\.cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Add Rust target
+        shell: bash
+        run: rustup target add "${{ matrix.target }}"
+
+      - name: Show Rust toolchain
+        shell: bash
+        run: |
+          rustup show active-toolchain
+          cargo --version
 
       - name: Build release binary
         shell: bash
@@ -134,7 +195,7 @@ jobs:
           Copy-Item "target/$env:TARGET/release/$env:BINARY_NAME" "$packageDir/$env:BINARY_NAME"
           Compress-Archive -Path $packageDir -DestinationPath "dist/$packageDir.zip"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: ${{ matrix.target }}
           path: dist/*
@@ -146,7 +207,7 @@ jobs:
     if: needs.prepare.outputs.release_required == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           path: dist
           merge-multiple: true
@@ -155,7 +216,7 @@ jobs:
         run: |
           shasum -a 256 dist/* > dist/SHA256SUMS
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: checksums
           path: dist/SHA256SUMS
@@ -168,7 +229,7 @@ jobs:
     if: needs.prepare.outputs.release_required == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           path: dist
           merge-multiple: true
@@ -189,18 +250,18 @@ jobs:
     if: needs.prepare.outputs.release_required == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: ${{ needs.prepare.outputs.tag }}
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
       - id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
@@ -209,9 +270,9 @@ jobs:
             type=semver,pattern={{major}},value=${{ needs.prepare.outputs.tag }}
             type=raw,value=latest
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
 
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
           context: .
           file: Dockerfile.release
