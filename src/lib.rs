@@ -1,9 +1,7 @@
 use clap::Parser;
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     env, fs,
-    io::IsTerminal,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
     thread,
@@ -18,6 +16,7 @@ mod r;
 mod registry;
 mod repository;
 mod resolver;
+mod ui;
 
 use cli::{Cli, Commands, RepoCommands};
 use description::{DescriptionExt, init_description, read_description, write_description};
@@ -32,11 +31,14 @@ use r::{
     remove_installed_packages, runtime_info,
 };
 use registry::{
-    ArtifactKind, ArtifactRequest, DEFAULT_REGISTRY_BASE_URL, ResolutionRoot,
-    DownloadedArtifact,
+    ArtifactKind, ArtifactRequest, DEFAULT_REGISTRY_BASE_URL, DownloadProgress, DownloadedArtifact,
+    ResolutionRoot,
 };
-use repository::{RepositorySet, RepositorySource, normalize_repository_url, repository_source_from_package_url};
+use repository::{
+    RepositorySet, RepositorySource, normalize_repository_url, repository_source_from_package_url,
+};
 use resolver::{ResolvedPackage, resolve_from_registry};
+use ui::{InstallKind, SyncUi};
 
 const SYNC_WORKERS: usize = 4;
 
@@ -415,9 +417,8 @@ fn remove_dir_if_exists(path: &Path, label: &str) -> bool {
         return false;
     }
 
-    fs::remove_dir_all(path).unwrap_or_else(|error| {
-        panic!("failed to remove {label} at {}: {error}", path.display())
-    });
+    fs::remove_dir_all(path)
+        .unwrap_or_else(|error| panic!("failed to remove {label} at {}: {error}", path.display()));
     true
 }
 
@@ -456,6 +457,7 @@ struct PendingInstall {
     version: String,
     artifact: ArtifactRequest,
     fallback_artifact: Option<ArtifactRequest>,
+    install_kind: InstallKind,
     install_type: String,
     dependencies: BTreeSet<String>,
     cache_key: String,
@@ -471,7 +473,33 @@ struct CompletedBuild {
 #[derive(Debug)]
 struct DownloadedInstall {
     artifact: DownloadedArtifact,
+    install_kind: InstallKind,
     install_type: String,
+}
+
+#[derive(Debug)]
+enum DownloadEvent {
+    Started {
+        name: String,
+        version: String,
+        kind: ArtifactKind,
+    },
+    ContentLength {
+        name: String,
+        length: u64,
+    },
+    Advanced {
+        name: String,
+        bytes: u64,
+    },
+    FallbackToSource {
+        name: String,
+        version: String,
+    },
+    Finished {
+        package: PendingInstall,
+        result: Result<DownloadedInstall, String>,
+    },
 }
 
 fn resolve_additions_from_latest(
@@ -487,12 +515,13 @@ fn resolve_additions_from_latest(
         .collect::<BTreeMap<_, _>>();
     let preferred_versions = preferred_locked_versions(description, lockfile, &new_packages)?;
     let roots = add_resolution_roots(description, &new_packages);
-    let resolved = resolve_from_registry(repositories, &roots, &preferred_versions).map_err(|error| {
-        format!(
-            "could not resolve a compatible dependency set for {}: {error}",
-            packages.join(", ")
-        )
-    })?;
+    let resolved =
+        resolve_from_registry(repositories, &roots, &preferred_versions).map_err(|error| {
+            format!(
+                "could not resolve a compatible dependency set for {}: {error}",
+                packages.join(", ")
+            )
+        })?;
 
     Ok(AddResolution {
         constraints: constraints_from_resolved_roots(packages, &resolved)?,
@@ -701,7 +730,12 @@ fn sync_from_lockfile() -> SyncOutcome {
     ui.finish_downloads();
 
     let project_library = project_library_path();
-    ui.start_builds(downloaded.len());
+    let binary_installs = downloaded
+        .values()
+        .filter(|download| download.install_kind == InstallKind::Binary)
+        .count();
+    let source_builds = downloaded.len().saturating_sub(binary_installs);
+    ui.start_installs(binary_installs, source_builds);
     while !pending.is_empty() {
         let ready_names = ready_install_batch(&pending, &satisfied, SYNC_WORKERS);
         if ready_names.is_empty() {
@@ -720,7 +754,16 @@ fn sync_from_lockfile() -> SyncOutcome {
                     .expect("ready package should be pending")
             })
             .collect::<Vec<_>>();
-        ui.start_build_batch(&batch);
+        ui.start_install_batch(batch.iter().map(|package| {
+            let downloaded = downloaded
+                .get(&package.name)
+                .expect("artifact should exist for pending package");
+            (
+                package.name.clone(),
+                package.version.clone(),
+                downloaded.install_kind,
+            )
+        }));
         let results = build_batch(&batch, &downloaded, &project_library);
         for result in results {
             match result {
@@ -733,17 +776,25 @@ fn sync_from_lockfile() -> SyncOutcome {
                     });
                     satisfied.insert(completed.package.name.clone());
                     outcome.installed += 1;
-                    ui.finish_build(&completed.package.name, &completed.package.version);
+                    let install_kind = downloaded
+                        .get(&completed.package.name)
+                        .expect("artifact should exist for completed package")
+                        .install_kind;
+                    ui.finish_install(
+                        &completed.package.name,
+                        &completed.package.version,
+                        install_kind,
+                    );
                 }
                 Err((package, error)) => {
-                    ui.fail_build(&package.name, &package.version);
+                    ui.fail_install(&package.name, &package.version);
                     report_install_failure(&package.name, &package.version, &error);
                     std::process::exit(error.exit_code.unwrap_or(1));
                 }
             }
         }
     }
-    ui.finish_builds();
+    ui.finish_installs();
 
     let extras = installed_packages_by_name()
         .into_keys()
@@ -907,7 +958,12 @@ fn preferred_artifact(
     version: &str,
     source_url: &str,
     runtime: &RuntimeInfo,
-) -> (ArtifactRequest, Option<ArtifactRequest>, String) {
+) -> (
+    ArtifactRequest,
+    Option<ArtifactRequest>,
+    InstallKind,
+    String,
+) {
     let source_artifact = ArtifactRequest {
         kind: ArtifactKind::Source,
         url: source_url.to_string(),
@@ -915,10 +971,20 @@ fn preferred_artifact(
     };
 
     let Some(binary) = binary_artifact_request(source.base_url(), package, version, runtime) else {
-        return (source_artifact, None, "source".to_string());
+        return (
+            source_artifact,
+            None,
+            InstallKind::Source,
+            "source".to_string(),
+        );
     };
 
-    (binary, Some(source_artifact), runtime.pkg_type.clone())
+    (
+        binary,
+        Some(source_artifact),
+        InstallKind::Binary,
+        runtime.pkg_type.clone(),
+    )
 }
 
 fn binary_artifact_request(
@@ -961,7 +1027,10 @@ fn repository_supports_binary_artifacts(repository: &str) -> bool {
         .strip_prefix("https://")
         .or_else(|| repository.strip_prefix("http://"))
         .unwrap_or(repository);
-    let path = without_scheme.split_once('/').map(|(_, path)| path).unwrap_or("");
+    let path = without_scheme
+        .split_once('/')
+        .map(|(_, path)| path)
+        .unwrap_or("");
     path.is_empty()
 }
 
@@ -1005,13 +1074,8 @@ fn collect_pending_installs(
                 let source = repositories
                     .source_for_url(&source_url)
                     .unwrap_or_else(|| RepositorySource::new(lockfile.registry.clone()));
-                let (artifact, fallback_artifact, install_type) = preferred_artifact(
-                    &source,
-                    name,
-                    &package.version,
-                    &source_url,
-                    runtime,
-                );
+                let (artifact, fallback_artifact, install_kind, install_type) =
+                    preferred_artifact(&source, name, &package.version, &source_url, runtime);
                 let dependencies = package
                     .dependencies
                     .iter()
@@ -1028,6 +1092,7 @@ fn collect_pending_installs(
                         version: package.version.clone(),
                         artifact,
                         fallback_artifact,
+                        install_kind,
                         install_type,
                         dependencies,
                         cache_key,
@@ -1080,6 +1145,14 @@ fn download_artifacts_in_parallel(
                     break;
                 };
 
+                let _ = sender.send(DownloadEvent::Started {
+                    name: package.name.clone(),
+                    version: package.version.clone(),
+                    kind: package.artifact.kind,
+                });
+
+                let progress_sender = sender.clone();
+                let progress_name = package.name.clone();
                 let result = repositories
                     .source_for_url(&package.artifact.url)
                     .ok_or_else(|| {
@@ -1089,15 +1162,30 @@ fn download_artifacts_in_parallel(
                         )
                     })
                     .and_then(|source| {
-                        repositories.download_artifact(
+                        repositories.download_artifact_with_progress(
                             &source,
                             &package.name,
                             &package.version,
                             &package.artifact,
+                            move |progress| match progress {
+                                DownloadProgress::ContentLength(length) => {
+                                    let _ = progress_sender.send(DownloadEvent::ContentLength {
+                                        name: progress_name.clone(),
+                                        length,
+                                    });
+                                }
+                                DownloadProgress::Advanced(bytes) => {
+                                    let _ = progress_sender.send(DownloadEvent::Advanced {
+                                        name: progress_name.clone(),
+                                        bytes,
+                                    });
+                                }
+                            },
                         )
                     })
                     .map(|artifact| DownloadedInstall {
                         artifact,
+                        install_kind: package.install_kind,
                         install_type: package.install_type.clone(),
                     })
                     .or_else(|error| {
@@ -1107,34 +1195,83 @@ fn download_artifacts_in_parallel(
                         if !should_fallback_to_source(&error) {
                             return Err(error);
                         }
-                        let source = repositories.source_for_url(&fallback.url).ok_or_else(|| {
-                            format!(
-                                "could not determine repository source for {}@{}",
-                                package.name, package.version
-                            )
-                        })?;
+                        let _ = sender.send(DownloadEvent::FallbackToSource {
+                            name: package.name.clone(),
+                            version: package.version.clone(),
+                        });
+                        let _ = sender.send(DownloadEvent::Started {
+                            name: package.name.clone(),
+                            version: package.version.clone(),
+                            kind: fallback.kind,
+                        });
+                        let source =
+                            repositories.source_for_url(&fallback.url).ok_or_else(|| {
+                                format!(
+                                    "could not determine repository source for {}@{}",
+                                    package.name, package.version
+                                )
+                            })?;
+                        let progress_sender = sender.clone();
+                        let progress_name = package.name.clone();
                         repositories
-                            .download_artifact(&source, &package.name, &package.version, fallback)
+                            .download_artifact_with_progress(
+                                &source,
+                                &package.name,
+                                &package.version,
+                                fallback,
+                                move |progress| match progress {
+                                    DownloadProgress::ContentLength(length) => {
+                                        let _ =
+                                            progress_sender.send(DownloadEvent::ContentLength {
+                                                name: progress_name.clone(),
+                                                length,
+                                            });
+                                    }
+                                    DownloadProgress::Advanced(bytes) => {
+                                        let _ = progress_sender.send(DownloadEvent::Advanced {
+                                            name: progress_name.clone(),
+                                            bytes,
+                                        });
+                                    }
+                                },
+                            )
                             .map(|artifact| DownloadedInstall {
                                 artifact,
+                                install_kind: InstallKind::Source,
                                 install_type: "source".to_string(),
                             })
                     });
-                let _ = sender.send((package, result));
+                let _ = sender.send(DownloadEvent::Finished { package, result });
             }
         });
     }
     drop(sender);
 
     let mut downloaded = BTreeMap::new();
-    for _ in 0..packages.len() {
-        let (package, result) = receiver
+    let mut finished = 0;
+    while finished < packages.len() {
+        match receiver
             .recv()
-            .expect("download worker should return a result");
-        let artifact =
-            result.map_err(|error| format!("{}@{}: {error}", package.name, package.version))?;
-        ui.finish_download(&package.name, &package.version);
-        downloaded.insert(package.name.clone(), artifact);
+            .expect("download worker should return a result")
+        {
+            DownloadEvent::Started {
+                name,
+                version,
+                kind,
+            } => ui.start_download(&name, &version, kind),
+            DownloadEvent::ContentLength { name, length } => ui.set_download_length(&name, length),
+            DownloadEvent::Advanced { name, bytes } => ui.advance_download(&name, bytes),
+            DownloadEvent::FallbackToSource { name, version } => {
+                ui.fallback_to_source(&name, &version)
+            }
+            DownloadEvent::Finished { package, result } => {
+                finished += 1;
+                let artifact = result
+                    .map_err(|error| format!("{}@{}: {error}", package.name, package.version))?;
+                ui.finish_download(&package.name, &package.version, artifact.install_kind);
+                downloaded.insert(package.name.clone(), artifact);
+            }
+        }
     }
 
     Ok(downloaded)
@@ -1360,197 +1497,15 @@ fn read_log_tail(path: &Path, max_lines: usize) -> String {
     lines[start..].join("\n")
 }
 
-struct SyncUi {
-    interactive: bool,
-    downloads: ProgressBar,
-    builds: ProgressBar,
-    status: ProgressBar,
-}
-
-impl SyncUi {
-    fn new() -> Self {
-        let interactive = std::io::stderr().is_terminal();
-
-        if interactive {
-            let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr());
-            let downloads = multi.add(ProgressBar::new(0));
-            downloads.set_style(
-                ProgressStyle::with_template("downloads [{bar:30.cyan/blue}] {pos}/{len}")
-                    .expect("progress template should parse")
-                    .progress_chars("##-"),
-            );
-            let builds = multi.add(ProgressBar::new(0));
-            builds.set_style(
-                ProgressStyle::with_template("builds    [{bar:30.green/blue}] {pos}/{len}")
-                    .expect("progress template should parse")
-                    .progress_chars("##-"),
-            );
-            let status = multi.add(ProgressBar::new_spinner());
-            status.set_style(
-                ProgressStyle::with_template("{spinner} {msg}")
-                    .expect("progress template should parse"),
-            );
-            status.enable_steady_tick(std::time::Duration::from_millis(100));
-
-            Self {
-                interactive,
-                downloads,
-                builds,
-                status,
-            }
-        } else {
-            Self {
-                interactive,
-                downloads: ProgressBar::hidden(),
-                builds: ProgressBar::hidden(),
-                status: ProgressBar::hidden(),
-            }
-        }
-    }
-
-    fn start_restores(&self, total: usize) {
-        if total == 0 {
-            return;
-        }
-
-        if self.interactive {
-            self.downloads.set_length(total as u64);
-            self.downloads.set_position(0);
-            self.status
-                .set_message("restoring cached packages".to_string());
-        } else {
-            eprintln!("Restoring {total} cached packages");
-        }
-    }
-
-    fn finish_restore(&self, name: &str, version: &str) {
-        self.downloads.inc(1);
-        if self.interactive {
-            self.status
-                .set_message(format!("restored {name}@{version} from cache"));
-        } else {
-            eprintln!("Restored {name}@{version} from cache");
-        }
-    }
-
-    fn finish_restores(&self) {
-        if self.interactive && self.downloads.length().unwrap_or(0) > 0 {
-            self.downloads.finish_and_clear();
-        }
-    }
-
-    fn start_downloads(&self, total: usize) {
-        if self.interactive {
-            self.downloads.set_length(total as u64);
-            self.downloads.set_position(0);
-            self.status
-                .set_message("downloading package artifacts".to_string());
-        } else {
-            eprintln!("Downloading {total} packages");
-        }
-    }
-
-    fn finish_download(&self, name: &str, version: &str) {
-        self.downloads.inc(1);
-        if self.interactive {
-            self.status
-                .set_message(format!("downloaded {name}@{version}"));
-        } else {
-            eprintln!("Downloaded {name}@{version}");
-        }
-    }
-
-    fn finish_downloads(&self) {
-        if self.interactive {
-            self.downloads.finish_and_clear();
-        }
-    }
-
-    fn start_builds(&self, total: usize) {
-        if self.interactive {
-            self.builds.set_length(total as u64);
-            self.builds.set_position(0);
-            self.status.set_message("building packages".to_string());
-        } else {
-            eprintln!("Building {total} packages");
-        }
-    }
-
-    fn start_build_batch(&self, batch: &[PendingInstall]) {
-        if self.interactive {
-            let names = batch
-                .iter()
-                .map(|package| package.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            self.status.set_message(format!("building {names}"));
-        } else {
-            let names = batch
-                .iter()
-                .map(|package| format!("{}@{}", package.name, package.version))
-                .collect::<Vec<_>>()
-                .join(", ");
-            eprintln!("Building {names}");
-        }
-    }
-
-    fn finish_build(&self, name: &str, version: &str) {
-        self.builds.inc(1);
-        if self.interactive {
-            self.status.set_message(format!("built {name}@{version}"));
-        } else {
-            eprintln!("Built {name}@{version}");
-        }
-    }
-
-    fn fail_build(&self, name: &str, version: &str) {
-        if self.interactive {
-            self.status.set_message(format!("failed {name}@{version}"));
-        }
-    }
-
-    fn finish_builds(&self) {
-        if self.interactive {
-            self.builds.finish_and_clear();
-        }
-    }
-
-    fn start_removals(&self, total: usize) {
-        if total == 0 {
-            return;
-        }
-
-        if self.interactive {
-            self.status
-                .set_message("removing extra packages".to_string());
-        } else {
-            eprintln!("Removing {total} extra packages");
-        }
-    }
-
-    fn finish_removals(&self) {
-        if self.interactive {
-            self.status
-                .set_message("removed extra packages".to_string());
-        }
-    }
-
-    fn finish(&self) {
-        if self.interactive {
-            self.status.finish_and_clear();
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        add_resolution_roots, binary_artifact_request, compiled_cache_key, locked_install_order,
-        constraints_from_resolved_roots, default_registry_base_url, lockfile_from_resolution,
-        persisted_constraints,
-        r_minor_version,
-        semver_add_constraint, should_fallback_to_source,
+        add_resolution_roots, binary_artifact_request, compiled_cache_key,
+        constraints_from_resolved_roots, default_registry_base_url, locked_install_order,
+        lockfile_from_resolution, persisted_constraints, r_minor_version, semver_add_constraint,
+        should_fallback_to_source,
     };
+    use crate::description::RDescription;
     use crate::{
         description::DescriptionExt,
         lockfile::{LockedDependency, LockedPackage, LockedRoot, Lockfile},
@@ -1558,7 +1513,6 @@ mod tests {
         registry::ResolutionRoot,
         resolver::{ResolvedDependency, ResolvedPackage},
     };
-    use crate::description::RDescription;
     use std::collections::BTreeMap;
     use std::{
         env,
@@ -1647,7 +1601,10 @@ mod tests {
         assert_eq!(lockfile.version, 1);
         assert_eq!(lockfile.roots[0].package, "digest");
         assert_eq!(lockfile.roots[1].package, "cli");
-        assert_eq!(lockfile.packages["cli"].source.as_deref(), Some("repository"));
+        assert_eq!(
+            lockfile.packages["cli"].source.as_deref(),
+            Some("repository")
+        );
         assert_eq!(
             lockfile.packages["cli"].dependencies,
             vec![

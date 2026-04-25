@@ -188,6 +188,19 @@ impl RepositorySet {
         })
     }
 
+    pub fn download_artifact_with_progress(
+        &self,
+        source: &RepositorySource,
+        package: &str,
+        version: &str,
+        artifact: &crate::registry::ArtifactRequest,
+        mut on_progress: impl FnMut(crate::registry::DownloadProgress),
+    ) -> Result<crate::registry::DownloadedArtifact, String> {
+        self.with_authorized_client(source, |client| {
+            client.download_artifact_with_progress(package, version, artifact, &mut on_progress)
+        })
+    }
+
     pub fn has_stored_credential(&self, source: &RepositorySource) -> Result<bool, String> {
         Ok(self.credentials.get(source)?.is_some())
     }
@@ -212,7 +225,7 @@ impl RepositorySet {
     fn with_authorized_client<T>(
         &self,
         source: &RepositorySource,
-        action: impl Fn(&RegistryClient) -> Result<T, String>,
+        mut action: impl FnMut(&RegistryClient) -> Result<T, String>,
     ) -> Result<T, String> {
         let stored_token = self.credentials.get(source)?;
         let client = RegistryClient::with_token(source.base_url(), stored_token.clone());
@@ -343,7 +356,12 @@ mod tests {
 
     impl CredentialStore for MemoryCredentialStore {
         fn get(&self, source: &RepositorySource) -> Result<Option<String>, String> {
-            Ok(self.values.lock().expect("memory store should lock").get(source.base_url()).cloned())
+            Ok(self
+                .values
+                .lock()
+                .expect("memory store should lock")
+                .get(source.base_url())
+                .cloned())
         }
 
         fn set(&self, source: &RepositorySource, token: &str) -> Result<(), String> {
@@ -368,7 +386,11 @@ mod tests {
     }
 
     impl ApiKeyPrompter for StaticPrompter {
-        fn prompt(&self, _source: &RepositorySource, _had_stored_token: bool) -> Result<String, String> {
+        fn prompt(
+            &self,
+            _source: &RepositorySource,
+            _had_stored_token: bool,
+        ) -> Result<String, String> {
             Ok(self.token.clone())
         }
     }
@@ -406,7 +428,9 @@ mod tests {
         );
 
         let source = repositories
-            .source_for_url("https://scalerail.rrepo.dev/test/packages/rpxsmoke/versions/0.0.1/source")
+            .source_for_url(
+                "https://scalerail.rrepo.dev/test/packages/rpxsmoke/versions/0.0.1/source",
+            )
             .expect("source should be derived");
 
         assert_eq!(source.base_url(), "https://scalerail.rrepo.dev/test");
