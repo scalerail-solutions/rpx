@@ -32,7 +32,7 @@ jobs:
           base_url='https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu'
           curl --proto '=https' --tlsv1.2 -sSf "$base_url/rustup-init" -o rustup-init
           curl --proto '=https' --tlsv1.2 -sSf "$base_url/rustup-init.sha256" -o rustup-init.sha256
-          expected="$(tr -d '[:space:]' < rustup-init.sha256)"
+          expected="$(awk '{print $1}' rustup-init.sha256)"
           actual="$(shasum -a 256 rustup-init | awk '{print $1}')"
           [[ "$actual" == "$expected" ]]
           chmod +x rustup-init
@@ -151,7 +151,7 @@ jobs:
           base_url="https://static.rust-lang.org/rustup/dist/${triple}"
           curl --proto '=https' --tlsv1.2 -sSf "$base_url/rustup-init" -o rustup-init
           curl --proto '=https' --tlsv1.2 -sSf "$base_url/rustup-init.sha256" -o rustup-init.sha256
-          expected="$(tr -d '[:space:]' < rustup-init.sha256)"
+          expected="$(awk '{print $1}' rustup-init.sha256)"
           actual="$(shasum -a 256 rustup-init | awk '{print $1}')"
           [[ "$actual" == "$expected" ]]
           chmod +x rustup-init
@@ -165,7 +165,7 @@ jobs:
           $baseUrl = 'https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc'
           Invoke-WebRequest "$baseUrl/rustup-init.exe" -OutFile rustup-init.exe
           Invoke-WebRequest "$baseUrl/rustup-init.exe.sha256" -OutFile rustup-init.exe.sha256
-          $expected = (Get-Content rustup-init.exe.sha256).Trim()
+          $expected = ((Get-Content rustup-init.exe.sha256) -split '\s+')[0].Trim()
           $actual = (Get-FileHash rustup-init.exe -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($actual -ne $expected.ToLowerInvariant()) {
             throw 'rustup-init.exe checksum verification failed'
