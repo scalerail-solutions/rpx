@@ -2,6 +2,11 @@
 name = "rpx"
 version = "0.1.0"
 edition = "2024"
+description = "Rust CLI for managing R package project dependencies"
+repository = "https://github.com/scalerail-solutions/rpx"
+readme = "README.md"
+keywords = ["r", "packages", "cli", "dependencies"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 clap = { version = "4.6.0", features = ["derive"] }
@@ -18,3 +23,8 @@ serde_json = "1.0"
 [dev-dependencies]
 mockito = "1.7.0"
 testcontainers = { version = "0.27.2", features = ["blocking"] }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
