@@ -63,22 +63,24 @@ Integration tests run against the official `r-base` image and execute realistic 
 
 ## Release Process
 
-Every code-bearing pull request must add exactly one release intent file under `.release/`:
+Releases are published from pushed Git tags.
 
-- `.release/<slug>.patch`
-- `.release/<slug>.minor`
-- `.release/<slug>.major`
+When you are ready to ship a version:
 
-The file can contain a short note explaining the intent. CI enforces that application changes include one release intent file, while docs-only and CI-only changes are exempt.
+1. Update `Cargo.toml` to the version you want to release.
+2. Merge that change to `main`.
+3. Create and push a matching tag, for example `v0.2.0`.
 
-On each merge to `main`, the release workflow:
+The release workflow verifies that the pushed tag matches `Cargo.toml`, then:
 
-- collects unreleased intent files since the last tag
-- chooses the highest bump level (`major` > `minor` > `patch`)
-- bumps `Cargo.toml` and `Cargo.lock`
-- creates and pushes a `vX.Y.Z` tag
-- builds release archives for macOS, Linux, and Windows
-- publishes a GitHub Release with checksums
+- builds release archives for five targets:
+  - `x86_64-unknown-linux-gnu`
+  - `aarch64-unknown-linux-gnu`
+  - `x86_64-apple-darwin`
+  - `aarch64-apple-darwin`
+  - `x86_64-pc-windows-msvc`
+- generates `SHA256SUMS`
+- creates a GitHub Release and uploads the artifacts
 - publishes a GHCR image for `COPY --from`
 
 Example Docker usage:

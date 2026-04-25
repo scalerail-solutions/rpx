@@ -2,123 +2,62 @@ name: Release
 
 on:
   push:
-    branches:
-      - main
+    tags:
+      - 'v*'
 
 permissions:
   contents: write
   packages: write
 
 concurrency:
-  group: release-main
+  group: release-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
-  prepare:
-    if: github.actor != 'github-actions[bot]'
+  metadata:
     runs-on: ubuntu-latest
     outputs:
-      release_required: ${{ steps.version.outputs.release_required }}
-      version: ${{ steps.version.outputs.next_version }}
+      version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          fetch-depth: 0
-
-      - name: Install Rust with rustup
-        shell: bash
-        run: |
-          base_url='https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu'
-          curl --proto '=https' --tlsv1.2 -sSf "$base_url/rustup-init" -o rustup-init
-          curl --proto '=https' --tlsv1.2 -sSf "$base_url/rustup-init.sha256" -o rustup-init.sha256
-          expected="$(awk '{print $1}' rustup-init.sha256)"
-          actual="$(shasum -a 256 rustup-init | awk '{print $1}')"
-          [[ "$actual" == "$expected" ]]
-          chmod +x rustup-init
-          ./rustup-init -y --profile minimal --default-toolchain stable --no-modify-path
-          printf '%s/.cargo/bin\n' "$HOME" >> "$GITHUB_PATH"
-
-      - name: Show Rust toolchain
-        shell: bash
-        run: |
-          rustup show active-toolchain
-          cargo --version
-
-      - name: Install cargo-edit
-        shell: bash
-        run: cargo install cargo-edit --locked
-
-      - id: prepare-rust-info
-        name: Capture Rust cache metadata
-        shell: bash
-        run: |
-          printf 'release=%s\n' "$(rustc -vV | awk '/^release: / { print $2 }')" >> "$GITHUB_OUTPUT"
-          printf 'host=%s\n' "$(rustc -vV | awk '/^host: / { print $2 }')" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.prepare-rust-info.outputs.host }}-${{ steps.prepare-rust-info.outputs.release }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.prepare-rust-info.outputs.host }}-${{ steps.prepare-rust-info.outputs.release }}-
-            cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.prepare-rust-info.outputs.host }}-
+          fetch-depth: 1
 
       - id: version
-        name: Compute next version
-        run: bash scripts/next-release.sh
-
-      - name: Stop when there is no release intent
-        if: steps.version.outputs.release_required != 'true'
-        run: echo "No release intent files since the last tag"
-
-      - name: Bump Cargo version
-        if: steps.version.outputs.release_required == 'true'
+        name: Validate tag matches Cargo version
         run: |
-          cargo set-version --bump "${{ steps.version.outputs.bump_level }}"
-          cargo update --workspace
-
-      - name: Remove consumed release intent files
-        if: steps.version.outputs.release_required == 'true'
-        run: |
-          while IFS= read -r file; do
-            [[ -n "$file" ]] || continue
-            rm -f "$file"
-          done <<< "${{ steps.version.outputs.intent_files }}"
-
-      - name: Validate updated manifest
-        if: steps.version.outputs.release_required == 'true'
-        run: cargo metadata --no-deps --format-version 1 > /dev/null
-
-      - name: Configure git author
-        if: steps.version.outputs.release_required == 'true'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-      - name: Commit and tag release
-        if: steps.version.outputs.release_required == 'true'
-        env:
-          TAG: ${{ steps.version.outputs.tag }}
-          VERSION: ${{ steps.version.outputs.next_version }}
-        run: |
-          git add -A Cargo.toml Cargo.lock .release
-          git commit -m "chore: release ${TAG}"
-          git tag "$TAG"
-          git push origin HEAD:main "refs/tags/${TAG}"
+          tag="${GITHUB_REF_NAME}"
+          version="$(awk '
+            $0 == "[package]" { in_package = 1; next }
+            /^\[/ && $0 != "[package]" { in_package = 0 }
+            in_package && /^version = "/ {
+              gsub(/^version = "/, "")
+              gsub(/"$/, "")
+              print
+              exit
+            }
+          ' Cargo.toml)"
+          expected_tag="v${version}"
+          if [[ "$tag" != "$expected_tag" ]]; then
+            echo "tag $tag does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
+          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
 
   build-binaries:
-    needs: prepare
-    if: needs.prepare.outputs.release_required == 'true'
+    needs: metadata
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            binary_name: rpx
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
             archive: tar.gz
             binary_name: rpx
           - os: macos-15-intel
@@ -139,7 +78,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: ${{ needs.prepare.outputs.tag }}
+          ref: ${{ needs.metadata.outputs.tag }}
 
       - name: Install Rust with rustup
         if: runner.os != 'Windows'
@@ -147,6 +86,7 @@ jobs:
         run: |
           case "$(uname -s)/$(uname -m)" in
             Linux/x86_64) triple=x86_64-unknown-linux-gnu ;;
+            Linux/aarch64) triple=aarch64-unknown-linux-gnu ;;
             Darwin/x86_64) triple=x86_64-apple-darwin ;;
             Darwin/arm64) triple=aarch64-apple-darwin ;;
             *)
@@ -215,7 +155,7 @@ jobs:
         if: matrix.archive == 'tar.gz'
         env:
           TARGET: ${{ matrix.target }}
-          VERSION: ${{ needs.prepare.outputs.version }}
+          VERSION: ${{ needs.metadata.outputs.version }}
           BINARY_NAME: ${{ matrix.binary_name }}
         run: |
           package_dir="rpx-${VERSION}-${TARGET}"
@@ -228,7 +168,7 @@ jobs:
         shell: pwsh
         env:
           TARGET: ${{ matrix.target }}
-          VERSION: ${{ needs.prepare.outputs.version }}
+          VERSION: ${{ needs.metadata.outputs.version }}
           BINARY_NAME: ${{ matrix.binary_name }}
         run: |
           $packageDir = "rpx-$env:VERSION-$env:TARGET"
@@ -244,9 +184,8 @@ jobs:
 
   checksums:
     needs:
-      - prepare
+      - metadata
       - build-binaries
-    if: needs.prepare.outputs.release_required == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
@@ -265,10 +204,9 @@ jobs:
 
   publish-release:
     needs:
-      - prepare
+      - metadata
       - build-binaries
       - checksums
-    if: needs.prepare.outputs.release_required == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
@@ -279,22 +217,21 @@ jobs:
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.prepare.outputs.tag }}
+          TAG: ${{ needs.metadata.outputs.tag }}
         run: |
           if gh release view "$TAG" > /dev/null 2>&1; then
             gh release upload "$TAG" dist/* --clobber
           else
-            gh release create "$TAG" --title "$TAG" --generate-notes dist/*
+            gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes dist/*
           fi
 
   publish-image:
-    needs: prepare
-    if: needs.prepare.outputs.release_required == 'true'
+    needs: metadata
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: ${{ needs.prepare.outputs.tag }}
+          ref: ${{ needs.metadata.outputs.tag }}
 
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
@@ -307,9 +244,9 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=semver,pattern={{version}},value=${{ needs.prepare.outputs.tag }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.prepare.outputs.tag }}
-            type=semver,pattern={{major}},value=${{ needs.prepare.outputs.tag }}
+            type=semver,pattern={{version}},value=${{ needs.metadata.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.metadata.outputs.tag }}
+            type=semver,pattern={{major}},value=${{ needs.metadata.outputs.tag }}
             type=raw,value=latest
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f

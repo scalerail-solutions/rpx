@@ -10,17 +10,6 @@ permissions:
   contents: read
 
 jobs:
-  release-intent:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          fetch-depth: 0
-
-      - name: Validate release intent
-        run: bash scripts/check-release-intent.sh
-
   test:
     strategy:
       fail-fast: false
@@ -46,6 +35,7 @@ jobs:
         run: |
           case "$(uname -s)/$(uname -m)" in
             Linux/x86_64) triple=x86_64-unknown-linux-gnu ;;
+            Linux/aarch64) triple=aarch64-unknown-linux-gnu ;;
             Darwin/x86_64) triple=x86_64-apple-darwin ;;
             Darwin/arm64) triple=aarch64-apple-darwin ;;
             *)
