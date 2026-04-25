@@ -219,10 +219,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.metadata.outputs.tag }}
         run: |
-          if gh release view "$TAG" > /dev/null 2>&1; then
-            gh release upload "$TAG" dist/* --clobber
+          if gh release view "$TAG" --repo "${{ github.repository }}" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber --repo "${{ github.repository }}"
           else
-            gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes dist/*
+            gh release create "$TAG" --repo "${{ github.repository }}" --verify-tag --title "$TAG" --generate-notes dist/*
           fi
 
   publish-image:
