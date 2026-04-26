@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-pub const DEFAULT_REGISTRY_BASE_URL: &str = "https://api.rrepo.org";
+pub const DEFAULT_REGISTRY_BASE_URL: &str = "https://upstream.rrepo.dev/cran";
 const VERSION_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
