@@ -993,10 +993,6 @@ fn binary_artifact_request(
     version: &str,
     runtime: &RuntimeInfo,
 ) -> Option<ArtifactRequest> {
-    if !repository_supports_binary_artifacts(registry) {
-        return None;
-    }
-
     if runtime.pkg_type == "win.binary" {
         return Some(ArtifactRequest {
             kind: ArtifactKind::Binary,
@@ -1019,19 +1015,6 @@ fn binary_artifact_request(
         ),
         cache_file_name: macos_binary_cache_file_name(package, version),
     })
-}
-
-fn repository_supports_binary_artifacts(repository: &str) -> bool {
-    let repository = repository.trim_end_matches('/');
-    let without_scheme = repository
-        .strip_prefix("https://")
-        .or_else(|| repository.strip_prefix("http://"))
-        .unwrap_or(repository);
-    let path = without_scheme
-        .split_once('/')
-        .map(|(_, path)| path)
-        .unwrap_or("");
-    path.is_empty()
 }
 
 fn source_cache_file_name(package: &str, version: &str) -> String {
@@ -1858,6 +1841,28 @@ mod tests {
             "https://api.rrepo.org/packages/digest/versions/0.6.37/binaries/windows/4.5"
         );
         assert_eq!(artifact.cache_file_name, "digest_0.6.37.zip");
+    }
+
+    #[test]
+    fn derives_binary_artifact_url_from_path_based_repository() {
+        let runtime = RuntimeInfo {
+            version: "4.5.2".to_string(),
+            platform: "x86_64-w64-mingw32".to_string(),
+            pkg_type: "win.binary".to_string(),
+        };
+
+        let artifact = binary_artifact_request(
+            "https://upstream.rrepo.dev/cran",
+            "digest",
+            "0.6.37",
+            &runtime,
+        )
+        .expect("path-based repository binaries should be attempted");
+
+        assert_eq!(
+            artifact.url,
+            "https://upstream.rrepo.dev/cran/packages/digest/versions/0.6.37/binaries/windows/4.5"
+        );
     }
 
     #[test]

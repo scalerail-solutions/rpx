@@ -191,11 +191,11 @@ Imports: digest",
 
     let lockfile = read_project_file(&container, project_path, "rpx.lock");
     assert!(
-        lockfile.contains("\"registry\": \"https://api.rrepo.org\""),
+        lockfile.contains("\"registry\": \"https://upstream.rrepo.dev/cran\""),
         "lockfile was: {lockfile}"
     );
     assert!(
-        lockfile.contains("https://api.rrepo.org/packages/digest/versions/"),
+        lockfile.contains("https://upstream.rrepo.dev/cran/packages/digest/versions/"),
         "lockfile was: {lockfile}"
     );
 }

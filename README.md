@@ -4,7 +4,7 @@
 
 It uses `DESCRIPTION` as the manifest, keeps a resolved `rpx.lock` in the project root, and manages an isolated package library outside the repository.
 
-`rpx` resolves and installs packages through `https://api.rrepo.org`.
+`rpx` resolves and installs packages through `https://upstream.rrepo.dev/cran` by default. Set `RPX_REGISTRY_BASE_URL` to use a different root repository.
 
 `rpx` works with R package projects. Use `rpx init` to create a `DESCRIPTION` file for a new project.
 
@@ -72,7 +72,7 @@ rpx remove digest
 - `DESCRIPTION` is required.
 - `rpx.lock` records the resolved package set and the registry origin.
 - `rpx` manages an isolated library for each project.
-- `rpx lock` resolves from `DESCRIPTION` through `api.rrepo.org`; it does not install packages.
+- `rpx lock` resolves from `DESCRIPTION` through the configured root repository; it does not install packages.
 - `rpx sync` installs the exact locked package set from downloaded source artifacts.
 - Custom repositories are not supported.
 
