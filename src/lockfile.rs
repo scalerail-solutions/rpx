@@ -2,6 +2,8 @@ use crate::project::{LOCKFILE_NAME, lockfile_path};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs};
 
+pub const LOCKFILE_VERSION: u32 = 2;
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Lockfile {
     pub version: u32,
@@ -73,12 +75,12 @@ pub fn write_lockfile(lockfile: Lockfile) {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{LockedDependency, LockedPackage, LockedR, LockedRoot, Lockfile};
+    use super::{LOCKFILE_VERSION, LockedDependency, LockedPackage, LockedR, LockedRoot, Lockfile};
 
     #[test]
     fn serializes_new_registry_lockfile_shape() {
         let lockfile = Lockfile {
-            version: 1,
+            version: LOCKFILE_VERSION,
             registry: "https://api.rrepo.org".to_string(),
             r: LockedR {
                 version: "4.4.1".to_string(),
@@ -109,7 +111,7 @@ mod tests {
 
         let json = serde_json::to_string_pretty(&lockfile).expect("lockfile should serialize");
 
-        assert!(json.contains("\"version\": 1"));
+        assert!(json.contains("\"version\": 2"));
         assert!(json.contains("\"registry\": \"https://api.rrepo.org\""));
         assert!(json.contains("\"r\""));
         assert!(json.contains("\"base_packages\""));

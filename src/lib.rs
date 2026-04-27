@@ -20,7 +20,9 @@ mod ui;
 
 use cli::{Cli, Commands, RepoCommands};
 use description::{DescriptionExt, init_description, read_description, write_description};
-use lockfile::{LockedR, Lockfile, read_lockfile, read_lockfile_optional, write_lockfile};
+use lockfile::{
+    LOCKFILE_VERSION, LockedR, Lockfile, read_lockfile, read_lockfile_optional, write_lockfile,
+};
 use project::{
     build_temp_library_path, cache_dir_path, compiled_cache_package_path, project_library_path,
     project_library_root_path,
@@ -298,6 +300,13 @@ fn cmd_status() {
             std::process::exit(1);
         }
     };
+
+    if lockfile.version < LOCKFILE_VERSION {
+        println!("Lockfile is out of date");
+        println!();
+        print_relock_message();
+        std::process::exit(1);
+    }
 
     let manifest_requirements = project
         .description
@@ -687,6 +696,7 @@ fn sync_from_lockfile() -> SyncOutcome {
         .into_iter()
         .collect::<BTreeSet<_>>();
     let lockfile = read_lockfile().expect("failed to read lockfile");
+    validate_lockfile_version_for_sync(&lockfile);
     validate_runtime_for_sync(&lockfile);
     let lock_requirements = lockfile
         .roots
@@ -928,7 +938,7 @@ fn lockfile_from_resolution(
 ) -> Lockfile {
     let required_base_packages = locked_base_packages(&roots, resolved);
     Lockfile {
-        version: 1,
+        version: LOCKFILE_VERSION,
         registry: registry.to_string(),
         r: LockedR {
             version: runtime_info().version,
@@ -966,6 +976,21 @@ fn lockfile_from_resolution(
             })
             .collect(),
     }
+}
+
+fn print_relock_message() {
+    println!("Your lockfile was created by an older rpx version and needs to be updated.");
+    println!("Run: rpx lock");
+}
+
+fn validate_lockfile_version_for_sync(lockfile: &Lockfile) {
+    if lockfile.version >= LOCKFILE_VERSION {
+        return;
+    }
+
+    eprintln!("Your lockfile was created by an older rpx version and needs to be updated.");
+    eprintln!("Run: rpx lock");
+    std::process::exit(1);
 }
 
 fn locked_base_packages(roots: &[ResolutionRoot], resolved: &[ResolvedPackage]) -> Vec<String> {
@@ -1615,7 +1640,7 @@ mod tests {
     use crate::description::RDescription;
     use crate::{
         description::DescriptionExt,
-        lockfile::{LockedDependency, LockedPackage, LockedR, Lockfile},
+        lockfile::{LOCKFILE_VERSION, LockedDependency, LockedPackage, LockedR, Lockfile},
         r::RuntimeInfo,
         registry::ResolutionRoot,
         resolver::{ResolvedDependency, ResolvedPackage},
@@ -1705,7 +1730,7 @@ mod tests {
         );
 
         assert_eq!(lockfile.registry, "https://api.rrepo.org");
-        assert_eq!(lockfile.version, 1);
+        assert_eq!(lockfile.version, LOCKFILE_VERSION);
         assert_eq!(lockfile.r.base_packages, vec!["base", "utils"]);
         assert_eq!(lockfile.roots[0].package, "digest");
         assert_eq!(lockfile.roots[1].package, "cli");
@@ -1862,7 +1887,7 @@ mod tests {
     #[test]
     fn installs_locked_packages_in_dependency_order() {
         let lockfile = Lockfile {
-            version: 1,
+            version: LOCKFILE_VERSION,
             registry: "https://api.rrepo.org".to_string(),
             r: LockedR::default(),
             roots: vec![],
@@ -1932,7 +1957,7 @@ mod tests {
     #[test]
     fn rejects_cyclic_locked_dependencies() {
         let lockfile = Lockfile {
-            version: 1,
+            version: LOCKFILE_VERSION,
             registry: "https://api.rrepo.org".to_string(),
             r: LockedR::default(),
             roots: vec![],
