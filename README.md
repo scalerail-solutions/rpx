@@ -29,7 +29,7 @@ curl -LsSf https://github.com/scalerail-solutions/rpx/releases/latest/download/r
 Install the latest release on Windows:
 
 ```powershell
-irm https://github.com/scalerail-solutions/rpx/releases/latest/download/rpx-installer.ps1 | iex
+powershell -ExecutionPolicy Bypass -Command "irm https://github.com/scalerail-solutions/rpx/releases/latest/download/rpx-installer.ps1 | iex"
 ```
 
 Rust users can install from source:
