@@ -14,6 +14,22 @@ use crate::{
 };
 
 const ROOT_PACKAGE: &str = "__rpx_root__";
+const BASE_PACKAGES: &[&str] = &[
+    "base",
+    "compiler",
+    "datasets",
+    "graphics",
+    "grDevices",
+    "grid",
+    "methods",
+    "parallel",
+    "splines",
+    "stats",
+    "stats4",
+    "tcltk",
+    "tools",
+    "utils",
+];
 type VersionRange = Ranges<Version>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +98,7 @@ impl<'a> RegistryDependencyProvider<'a> {
         let progress = ResolutionUi::new();
         let root_dependencies = roots
             .iter()
+            .filter(|root| !is_base_package(&root.name))
             .map(|root| {
                 let range = parse_constraint_range(&root.constraint)?;
                 Ok(PackageDependency {
@@ -298,6 +315,7 @@ impl DependencyProvider for RegistryDependencyProvider<'_> {
             metadata
                 .dependencies
                 .into_iter()
+                .filter(|dependency| !is_base_package(&dependency.resolved.package))
                 .filter_map(|dependency| {
                     match self.registry_contains_package(&dependency.resolved.package) {
                         Ok(true) => {
@@ -312,6 +330,10 @@ impl DependencyProvider for RegistryDependencyProvider<'_> {
                 .collect::<DependencyConstraints<_, _>>(),
         ))
     }
+}
+
+pub fn is_base_package(package: &str) -> bool {
+    BASE_PACKAGES.contains(&package)
 }
 
 pub fn resolve_from_registry(

@@ -2,12 +2,24 @@ use crate::project::{LOCKFILE_NAME, lockfile_path};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs};
 
+pub const LOCKFILE_VERSION: u32 = 2;
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Lockfile {
     pub version: u32,
     pub registry: String,
+    #[serde(default)]
+    pub r: LockedR,
     pub roots: Vec<LockedRoot>,
     pub packages: BTreeMap<String, LockedPackage>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LockedR {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub version: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub base_packages: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -63,13 +75,17 @@ pub fn write_lockfile(lockfile: Lockfile) {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{LockedDependency, LockedPackage, LockedRoot, Lockfile};
+    use super::{LOCKFILE_VERSION, LockedDependency, LockedPackage, LockedR, LockedRoot, Lockfile};
 
     #[test]
     fn serializes_new_registry_lockfile_shape() {
         let lockfile = Lockfile {
-            version: 1,
+            version: LOCKFILE_VERSION,
             registry: "https://api.rrepo.org".to_string(),
+            r: LockedR {
+                version: "4.4.1".to_string(),
+                base_packages: vec!["utils".to_string()],
+            },
             roots: vec![LockedRoot {
                 package: "digest".to_string(),
                 constraint: "*".to_string(),
@@ -95,8 +111,10 @@ mod tests {
 
         let json = serde_json::to_string_pretty(&lockfile).expect("lockfile should serialize");
 
-        assert!(json.contains("\"version\": 1"));
+        assert!(json.contains("\"version\": 2"));
         assert!(json.contains("\"registry\": \"https://api.rrepo.org\""));
+        assert!(json.contains("\"r\""));
+        assert!(json.contains("\"base_packages\""));
         assert!(json.contains("\"roots\""));
         assert!(json.contains("\"source_url\""));
         assert!(json.contains("\"dependencies\""));
@@ -118,5 +136,19 @@ mod tests {
 
         assert!(!json.contains("source_url"));
         assert!(!json.contains("source"));
+    }
+
+    #[test]
+    fn reads_lockfile_without_runtime_requirements() {
+        let json = r#"{
+  "version": 1,
+  "registry": "https://api.rrepo.org",
+  "roots": [],
+  "packages": {}
+}"#;
+
+        let lockfile: Lockfile = serde_json::from_str(json).expect("lockfile should parse");
+
+        assert_eq!(lockfile.r, LockedR::default());
     }
 }

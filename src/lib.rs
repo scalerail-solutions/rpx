@@ -20,13 +20,15 @@ mod ui;
 
 use cli::{Cli, Commands, RepoCommands};
 use description::{DescriptionExt, init_description, read_description, write_description};
-use lockfile::{Lockfile, read_lockfile, read_lockfile_optional, write_lockfile};
+use lockfile::{
+    LOCKFILE_VERSION, LockedR, Lockfile, read_lockfile, read_lockfile_optional, write_lockfile,
+};
 use project::{
     build_temp_library_path, cache_dir_path, compiled_cache_package_path, project_library_path,
     project_library_root_path,
 };
 use r::{
-    InstallFailure, RuntimeInfo, install_local_package, installed_packages,
+    InstallFailure, RuntimeInfo, base_packages, install_local_package, installed_packages,
     installed_packages_by_name, project_command, remove_installed_package_dir,
     remove_installed_packages, runtime_info,
 };
@@ -37,7 +39,7 @@ use registry::{
 use repository::{
     RepositorySet, RepositorySource, normalize_repository_url, repository_source_from_package_url,
 };
-use resolver::{ResolvedPackage, resolve_from_registry};
+use resolver::{ResolvedPackage, is_base_package, resolve_from_registry};
 use ui::{InstallKind, SyncUi};
 
 const SYNC_WORKERS: usize = 4;
@@ -299,6 +301,13 @@ fn cmd_status() {
         }
     };
 
+    if lockfile.version < LOCKFILE_VERSION {
+        println!("Lockfile is out of date");
+        println!();
+        print_relock_message();
+        std::process::exit(1);
+    }
+
     let manifest_requirements = project
         .description
         .requirements()
@@ -318,7 +327,8 @@ fn cmd_status() {
         .iter()
         .map(|package| (package.package.clone(), package.version.clone()))
         .collect::<std::collections::BTreeMap<_, _>>();
-    let locked_names = lockfile.packages.keys().cloned().collect::<BTreeSet<_>>();
+    let locked_names = locked_package_names(&lockfile);
+    let runtime_status = runtime_status(&lockfile);
 
     let missing_from_lockfile = manifest_requirements
         .difference(&lock_requirements)
@@ -339,6 +349,7 @@ fn cmd_status() {
     let version_mismatches = lockfile
         .packages
         .iter()
+        .filter(|(name, _)| !is_base_package(name))
         .filter_map(|(name, package)| {
             installed_versions
                 .get(name)
@@ -357,7 +368,9 @@ fn cmd_status() {
         && missing_from_library.is_empty()
         && extra_in_library.is_empty()
         && version_mismatches.is_empty()
+        && runtime_status.missing_base_packages.is_empty()
     {
+        print_runtime_version_warning(&runtime_status);
         println!("Project is in sync");
         return;
     }
@@ -366,6 +379,7 @@ fn cmd_status() {
     let library_out_of_date = !missing_from_library.is_empty()
         || !extra_in_library.is_empty()
         || !version_mismatches.is_empty();
+    let runtime_out_of_date = !runtime_status.missing_base_packages.is_empty();
 
     if lockfile_out_of_date && library_out_of_date {
         println!("Project is out of sync");
@@ -375,6 +389,8 @@ fn cmd_status() {
         println!("Lockfile is out of date");
         println!();
         println!("Run: rpx lock");
+    } else if runtime_out_of_date {
+        println!("R runtime is out of sync");
     } else {
         println!("Project library is out of sync");
         println!();
@@ -394,6 +410,11 @@ fn cmd_status() {
     print_status_group(
         "Installed versions that differ from rpx.lock:",
         &version_mismatches,
+    );
+    print_runtime_version_warning(&runtime_status);
+    print_status_group(
+        "R runtime is missing locked base packages:",
+        &runtime_status.missing_base_packages,
     );
 
     std::process::exit(1);
@@ -629,6 +650,10 @@ fn constraints_from_resolved_roots(
     packages
         .iter()
         .map(|package| {
+            if is_base_package(package) {
+                return Ok((package.clone(), vec![]));
+            }
+
             let version = resolved_by_package
                 .get(package.as_str())
                 .ok_or_else(|| format!("missing resolved version for {package}"))?;
@@ -671,6 +696,8 @@ fn sync_from_lockfile() -> SyncOutcome {
         .into_iter()
         .collect::<BTreeSet<_>>();
     let lockfile = read_lockfile().expect("failed to read lockfile");
+    validate_lockfile_version_for_sync(&lockfile);
+    validate_runtime_for_sync(&lockfile);
     let lock_requirements = lockfile
         .roots
         .iter()
@@ -796,9 +823,10 @@ fn sync_from_lockfile() -> SyncOutcome {
     }
     ui.finish_installs();
 
+    let locked_names = locked_package_names(&lockfile);
     let extras = installed_packages_by_name()
         .into_keys()
-        .filter(|name| !lockfile.packages.contains_key(name))
+        .filter(|name| !locked_names.contains(name))
         .collect::<Vec<_>>();
     outcome.removed = extras.len();
     ui.start_removals(extras.len());
@@ -806,20 +834,20 @@ fn sync_from_lockfile() -> SyncOutcome {
     ui.finish_removals();
 
     let final_state = installed_packages_by_name();
-    let missing = lockfile
-        .packages
-        .keys()
+    let missing = locked_names
+        .iter()
         .filter(|name| !final_state.contains_key(*name))
         .cloned()
         .collect::<Vec<_>>();
     let extras = final_state
         .keys()
-        .filter(|name| !lockfile.packages.contains_key(*name))
+        .filter(|name| !locked_names.contains(*name))
         .cloned()
         .collect::<Vec<_>>();
     let version_mismatches = lockfile
         .packages
         .iter()
+        .filter(|(name, _)| !is_base_package(name))
         .filter_map(|(name, package)| {
             final_state
                 .get(name)
@@ -908,9 +936,14 @@ fn lockfile_from_resolution(
     registry: &str,
     resolved: &[ResolvedPackage],
 ) -> Lockfile {
+    let required_base_packages = locked_base_packages(&roots, resolved);
     Lockfile {
-        version: 1,
+        version: LOCKFILE_VERSION,
         registry: registry.to_string(),
+        r: LockedR {
+            version: runtime_info().version,
+            base_packages: required_base_packages,
+        },
         roots: roots
             .into_iter()
             .map(|root| lockfile::LockedRoot {
@@ -943,6 +976,121 @@ fn lockfile_from_resolution(
             })
             .collect(),
     }
+}
+
+fn print_relock_message() {
+    println!("Your lockfile was created by an older rpx version and needs to be updated.");
+    println!("Run: rpx lock");
+}
+
+fn validate_lockfile_version_for_sync(lockfile: &Lockfile) {
+    if lockfile.version >= LOCKFILE_VERSION {
+        return;
+    }
+
+    eprintln!("Your lockfile was created by an older rpx version and needs to be updated.");
+    eprintln!("Run: rpx lock");
+    std::process::exit(1);
+}
+
+fn locked_base_packages(roots: &[ResolutionRoot], resolved: &[ResolvedPackage]) -> Vec<String> {
+    let mut packages = BTreeSet::new();
+
+    packages.extend(
+        roots
+            .iter()
+            .filter(|root| is_base_package(&root.name))
+            .map(|root| root.name.clone()),
+    );
+    packages.extend(
+        resolved
+            .iter()
+            .flat_map(|package| &package.dependencies)
+            .filter(|dependency| is_base_package(&dependency.package))
+            .map(|dependency| dependency.package.clone()),
+    );
+
+    packages.into_iter().collect()
+}
+
+fn locked_package_names(lockfile: &Lockfile) -> BTreeSet<String> {
+    lockfile
+        .packages
+        .keys()
+        .filter(|name| !is_base_package(name))
+        .cloned()
+        .collect()
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RuntimeStatus {
+    version_mismatch: Option<String>,
+    missing_base_packages: Vec<String>,
+}
+
+fn runtime_status(lockfile: &Lockfile) -> RuntimeStatus {
+    let runtime = runtime_info();
+    let version_mismatch =
+        (!lockfile.r.version.is_empty() && lockfile.r.version != runtime.version).then(|| {
+            format!(
+                "R {} installed, R {} locked",
+                runtime.version, lockfile.r.version
+            )
+        });
+    let available_base_packages = base_packages().into_iter().collect::<BTreeSet<_>>();
+    let locked_base_packages = lockfile
+        .r
+        .base_packages
+        .iter()
+        .chain(lockfile.roots.iter().map(|root| &root.package))
+        .chain(lockfile.packages.keys())
+        .filter(|package| is_base_package(package))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let missing_base_packages = lockfile
+        .r
+        .base_packages
+        .iter()
+        .chain(locked_base_packages.iter())
+        .filter(|package| !available_base_packages.contains(*package))
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    RuntimeStatus {
+        version_mismatch,
+        missing_base_packages,
+    }
+}
+
+fn print_runtime_version_warning(status: &RuntimeStatus) {
+    let Some(version_mismatch) = &status.version_mismatch else {
+        return;
+    };
+
+    println!();
+    println!("R runtime differs from lockfile:");
+    println!("- {version_mismatch}");
+}
+
+fn validate_runtime_for_sync(lockfile: &Lockfile) {
+    let status = runtime_status(lockfile);
+
+    if let Some(version_mismatch) = status.version_mismatch {
+        eprintln!("warning: {version_mismatch}");
+    }
+
+    if status.missing_base_packages.is_empty() {
+        return;
+    }
+
+    for package in &status.missing_base_packages {
+        eprintln!("R runtime is missing required base package: {package}");
+    }
+    eprintln!("These packages are part of R itself and cannot be installed by rpx.");
+    eprintln!("Use a complete R installation compatible with this project.");
+    std::process::exit(1);
 }
 
 fn registry_source_url(registry: &str, package: &str, version: &str) -> String {
@@ -1048,6 +1196,7 @@ fn collect_pending_installs(
     lockfile
         .packages
         .iter()
+        .filter(|(name, _)| !is_base_package(name))
         .filter_map(|(name, package)| match installed.get(name) {
             Some(installed_package) if installed_package.version == package.version => None,
             _ => {
@@ -1491,7 +1640,7 @@ mod tests {
     use crate::description::RDescription;
     use crate::{
         description::DescriptionExt,
-        lockfile::{LockedDependency, LockedPackage, LockedRoot, Lockfile},
+        lockfile::{LOCKFILE_VERSION, LockedDependency, LockedPackage, LockedR, Lockfile},
         r::RuntimeInfo,
         registry::ResolutionRoot,
         resolver::{ResolvedDependency, ResolvedPackage},
@@ -1581,7 +1730,8 @@ mod tests {
         );
 
         assert_eq!(lockfile.registry, "https://api.rrepo.org");
-        assert_eq!(lockfile.version, 1);
+        assert_eq!(lockfile.version, LOCKFILE_VERSION);
+        assert_eq!(lockfile.r.base_packages, vec!["base", "utils"]);
         assert_eq!(lockfile.roots[0].package, "digest");
         assert_eq!(lockfile.roots[1].package, "cli");
         assert_eq!(
@@ -1685,6 +1835,29 @@ mod tests {
     }
 
     #[test]
+    fn derives_empty_constraints_for_base_package_roots() {
+        let constraints = constraints_from_resolved_roots(&["grid".to_string()], &[])
+            .expect("base package constraints should derive");
+
+        assert_eq!(constraints, BTreeMap::from([("grid".to_string(), vec![])]));
+    }
+
+    #[test]
+    fn records_direct_base_roots_as_runtime_requirements() {
+        let lockfile = lockfile_from_resolution(
+            vec![ResolutionRoot {
+                name: "grid".to_string(),
+                constraint: "*".to_string(),
+            }],
+            "https://api.rrepo.org",
+            &[],
+        );
+
+        assert_eq!(lockfile.r.base_packages, vec!["grid"]);
+        assert!(!lockfile.packages.contains_key("grid"));
+    }
+
+    #[test]
     fn keeps_existing_roots_when_adding_new_package() {
         let description = RDescription::from_str(
             "Package: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\nImports: cli\n",
@@ -1714,8 +1887,9 @@ mod tests {
     #[test]
     fn installs_locked_packages_in_dependency_order() {
         let lockfile = Lockfile {
-            version: 1,
+            version: LOCKFILE_VERSION,
             registry: "https://api.rrepo.org".to_string(),
+            r: LockedR::default(),
             roots: vec![],
             packages: BTreeMap::from([
                 (
@@ -1783,8 +1957,9 @@ mod tests {
     #[test]
     fn rejects_cyclic_locked_dependencies() {
         let lockfile = Lockfile {
-            version: 1,
+            version: LOCKFILE_VERSION,
             registry: "https://api.rrepo.org".to_string(),
+            r: LockedR::default(),
             roots: vec![],
             packages: BTreeMap::from([
                 (

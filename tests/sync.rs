@@ -165,7 +165,7 @@ fn runs_rpx_sync_restores_locked_versions() {
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
     let seed_lockfile = format!(
-        "mkdir -p {project_path} && cd {project_path} && cat > rpx.lock <<'EOF'\n{{\n  \"version\": 1,\n  \"registry\": \"https://api.rrepo.org\",\n  \"roots\": [\n    {{\n      \"package\": \"digest\",\n      \"constraint\": \"*\"\n    }}\n  ],\n  \"packages\": {{\n    \"digest\": {{\n      \"package\": \"digest\",\n      \"version\": \"0.6.37\",\n      \"source\": \"registry\",\n      \"source_url\": \"https://api.rrepo.org/packages/digest/versions/0.6.37/source\"\n    }}\n  }}\n}}\nEOF"
+        "mkdir -p {project_path} && cd {project_path} && cat > rpx.lock <<'EOF'\n{{\n  \"version\": 2,\n  \"registry\": \"https://api.rrepo.org\",\n  \"roots\": [\n    {{\n      \"package\": \"digest\",\n      \"constraint\": \"*\"\n    }}\n  ],\n  \"packages\": {{\n    \"digest\": {{\n      \"package\": \"digest\",\n      \"version\": \"0.6.37\",\n      \"source\": \"registry\",\n      \"source_url\": \"https://api.rrepo.org/packages/digest/versions/0.6.37/source\"\n    }}\n  }}\n}}\nEOF"
     );
     let (exit_code, stdout, stderr) = run_shell_command(&container, &seed_lockfile);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
@@ -182,6 +182,31 @@ fn runs_rpx_sync_restores_locked_versions() {
     assert_eq!(
         after, before,
         "lockfile changed during strict sync\nbefore:\n{before}\nafter:\n{after}"
+    );
+}
+
+#[test]
+fn refuses_to_sync_old_lockfile() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-sync-old-lockfile";
+    create_package_project(&container, project_path);
+    let seed_lockfile = format!(
+        "mkdir -p {project_path} && cd {project_path} && cat > rpx.lock <<'EOF'\n{{\n  \"version\": 1,\n  \"registry\": \"https://api.rrepo.org\",\n  \"roots\": [],\n  \"packages\": {{}}\n}}\nEOF"
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &seed_lockfile);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let sync_command = format!("cd {project_path} && rpx sync");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &sync_command);
+    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stderr
+            .contains("Your lockfile was created by an older rpx version and needs to be updated."),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("Run: rpx lock"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }
 
