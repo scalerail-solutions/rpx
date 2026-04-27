@@ -30,6 +30,7 @@ pub struct RuntimeInfo {
 }
 
 static RUNTIME_INFO: OnceLock<RuntimeInfo> = OnceLock::new();
+static BASE_PACKAGES: OnceLock<Vec<String>> = OnceLock::new();
 
 pub fn project_command(program: impl AsRef<str>) -> Command {
     library_command(program, &project_library_path(), &[])
@@ -118,6 +119,10 @@ pub fn install_local_package(
 
 pub fn runtime_info() -> RuntimeInfo {
     RUNTIME_INFO.get_or_init(fetch_runtime_info).clone()
+}
+
+pub fn base_packages() -> Vec<String> {
+    BASE_PACKAGES.get_or_init(fetch_base_packages).clone()
 }
 
 pub fn installed_packages() -> Vec<InstalledPackage> {
@@ -232,6 +237,23 @@ fn fetch_runtime_info() -> RuntimeInfo {
             .expect("R package type should be present")
             .to_string(),
     }
+}
+
+fn fetch_base_packages() -> Vec<String> {
+    let output = Command::new("Rscript")
+        .arg("-e")
+        .arg("writeLines(rownames(installed.packages(priority = 'base')))")
+        .output()
+        .expect("failed to run Rscript");
+
+    crate::exit_with_status(output.status.code());
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn summarize_install_output(stdout: &[u8], stderr: &[u8]) -> String {

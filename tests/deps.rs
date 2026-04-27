@@ -84,6 +84,34 @@ fn runs_rpx_add_inside_custom_r_image() {
 }
 
 #[test]
+fn records_base_package_as_runtime_requirement() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-add-base-package";
+    create_package_project(&container, project_path);
+
+    let command = format!("mkdir -p {project_path} && cd {project_path} && rpx add grid");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
+
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stdout.contains("Added grid"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert_package_state(&container, project_path, "grid", "FALSE");
+
+    let lockfile = read_project_file(&container, project_path, "rpx.lock");
+    assert!(lockfile.contains("\"r\""), "lockfile was: {lockfile}");
+    assert!(
+        lockfile.contains("\"base_packages\": [\n      \"grid\"\n    ]"),
+        "lockfile was: {lockfile}"
+    );
+    assert!(
+        lockfile.contains("\"packages\": {}"),
+        "lockfile was: {lockfile}"
+    );
+}
+
+#[test]
 fn runs_rpx_remove_inside_custom_r_image() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-remove";
