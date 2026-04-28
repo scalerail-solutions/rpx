@@ -7,6 +7,7 @@ members = ["cargo:."]
 cargo-dist-version = "0.31.0"
 # The generated release workflow has a custom Azure Artifact Signing block.
 # Re-add that block if regenerating .github/workflows/release.yml with dist.
+allow-dirty = ["ci"]
 # CI backends to support
 ci = "github"
 # The installers to generate for each app
