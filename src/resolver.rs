@@ -1,10 +1,18 @@
-use std::{cell::RefCell, cmp::Reverse, collections::BTreeMap, error::Error, fmt, str::FromStr};
+use std::{
+    cell::RefCell,
+    cmp::{Ordering, Reverse},
+    collections::BTreeMap,
+    error::Error,
+    fmt,
+    hash::{Hash, Hasher},
+    str::FromStr,
+};
 
 use pubgrub::{
     Dependencies, DependencyConstraints, DependencyProvider, PackageResolutionStatistics, Ranges,
     resolve,
 };
-use r_description::{Version, VersionConstraint};
+use r_description::VersionConstraint;
 
 use crate::{
     description::{DescriptionDependency, RDescription},
@@ -30,7 +38,73 @@ const BASE_PACKAGES: &[&str] = &[
     "tools",
     "utils",
 ];
-type VersionRange = Ranges<Version>;
+type VersionRange = Ranges<RPackageVersion>;
+
+#[derive(Debug, Clone, Eq)]
+struct RPackageVersion {
+    raw: String,
+    components: Vec<u32>,
+}
+
+impl PartialEq for RPackageVersion {
+    fn eq(&self, other: &Self) -> bool {
+        self.components == other.components
+    }
+}
+
+impl Hash for RPackageVersion {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.components.hash(state);
+    }
+}
+
+impl fmt::Display for RPackageVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.raw)
+    }
+}
+
+impl FromStr for RPackageVersion {
+    type Err = String;
+
+    fn from_str(version: &str) -> Result<Self, Self::Err> {
+        let components = version
+            .split(['.', '-'])
+            .map(|part| {
+                if part.is_empty() {
+                    return Err(format!("invalid version {version}"));
+                }
+
+                part.parse::<u32>()
+                    .map_err(|_| format!("invalid version {version}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            raw: version.to_string(),
+            components,
+        })
+    }
+}
+
+impl Ord for RPackageVersion {
+    fn cmp(&self, other: &Self) -> Ordering {
+        for (left, right) in self.components.iter().zip(&other.components) {
+            match left.cmp(right) {
+                Ordering::Equal => continue,
+                ordering => return ordering,
+            }
+        }
+
+        self.components.len().cmp(&other.components.len())
+    }
+}
+
+impl PartialOrd for RPackageVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedPackage {
@@ -83,7 +157,7 @@ struct RegistryDependencyProvider<'a> {
     repositories: &'a RepositorySet,
     progress: ResolutionUi,
     root_dependencies: Vec<PackageDependency>,
-    preferred_versions_by_package: BTreeMap<String, Version>,
+    preferred_versions_by_package: BTreeMap<String, RPackageVersion>,
     versions_by_package: RefCell<BTreeMap<String, Vec<VersionSummary>>>,
     source_by_package: RefCell<BTreeMap<String, RepositorySource>>,
     metadata_by_package_version: RefCell<BTreeMap<(String, String), PackageMetadata>>,
@@ -93,7 +167,7 @@ impl<'a> RegistryDependencyProvider<'a> {
     fn new(
         repositories: &'a RepositorySet,
         roots: &[ResolutionRoot],
-        preferred_versions_by_package: BTreeMap<String, Version>,
+        preferred_versions_by_package: BTreeMap<String, RPackageVersion>,
     ) -> Result<Self, ResolverError> {
         let progress = ResolutionUi::new();
         let root_dependencies = roots
@@ -162,7 +236,7 @@ impl<'a> RegistryDependencyProvider<'a> {
     fn package_metadata(
         &self,
         package: &str,
-        version: &Version,
+        version: &RPackageVersion,
     ) -> Result<PackageMetadata, ResolverError> {
         let key = (package.to_string(), version.to_string());
         if let Some(metadata) = self.metadata_by_package_version.borrow().get(&key) {
@@ -212,7 +286,7 @@ impl<'a> RegistryDependencyProvider<'a> {
     fn resolved_package(
         &self,
         package: &str,
-        version: &Version,
+        version: &RPackageVersion,
     ) -> Result<ResolvedPackage, ResolverError> {
         let metadata = self.package_metadata(package, version)?;
         Ok(ResolvedPackage {
@@ -234,7 +308,7 @@ impl<'a> RegistryDependencyProvider<'a> {
 
 impl DependencyProvider for RegistryDependencyProvider<'_> {
     type P = String;
-    type V = Version;
+    type V = RPackageVersion;
     type VS = VersionRange;
     type Priority = (u32, Reverse<usize>);
     type M = String;
@@ -369,9 +443,9 @@ pub fn resolve_from_registry(
     Ok(resolved)
 }
 
-fn solve_selected_versions<DP>(provider: &DP) -> Result<Vec<(String, Version)>, String>
+fn solve_selected_versions<DP>(provider: &DP) -> Result<Vec<(String, RPackageVersion)>, String>
 where
-    DP: DependencyProvider<P = String, V = Version, VS = VersionRange, M = String>,
+    DP: DependencyProvider<P = String, V = RPackageVersion, VS = VersionRange, M = String>,
     DP::Err: fmt::Display,
 {
     let selected = resolve(provider, ROOT_PACKAGE.to_string(), root_version())
@@ -430,7 +504,7 @@ fn relation_dependency(
 ) -> Result<PackageDependency, ResolverError> {
     let (min_version, max_version_exclusive) = relation_bounds(relation);
     Ok(PackageDependency {
-        range: range_from_relation(relation),
+        range: range_from_relation(relation)?,
         resolved: ResolvedDependency {
             package: relation.name.clone(),
             kind: kind.to_string(),
@@ -456,18 +530,19 @@ fn relation_bounds(relation: &DescriptionDependency) -> (Option<String>, Option<
     }
 }
 
-fn range_from_relation(relation: &DescriptionDependency) -> VersionRange {
+fn range_from_relation(relation: &DescriptionDependency) -> Result<VersionRange, ResolverError> {
     let Some((operator, version)) = relation.version.as_ref() else {
-        return VersionRange::full();
+        return Ok(VersionRange::full());
     };
+    let version = parse_version(&version.to_string())?;
 
-    match operator {
+    Ok(match operator {
         VersionConstraint::Equal => VersionRange::singleton(version.clone()),
         VersionConstraint::GreaterThan => VersionRange::strictly_higher_than(version.clone()),
         VersionConstraint::GreaterThanEqual => VersionRange::higher_than(version.clone()),
         VersionConstraint::LessThan => VersionRange::strictly_lower_than(version.clone()),
         VersionConstraint::LessThanEqual => VersionRange::lower_than(version.clone()),
-    }
+    })
 }
 
 fn parse_constraint_range(constraint: &str) -> Result<VersionRange, ResolverError> {
@@ -519,14 +594,14 @@ fn parse_constraint_part(constraint: &str) -> (ParsedConstraint, &str) {
     (ParsedConstraint::Eq, constraint.trim())
 }
 
-fn parse_version(version: &str) -> Result<Version, ResolverError> {
+fn parse_version(version: &str) -> Result<RPackageVersion, ResolverError> {
     version
-        .parse::<Version>()
+        .parse::<RPackageVersion>()
         .map_err(|error| ResolverError(format!("invalid version {version}: {error}")))
 }
 
-fn root_version() -> Version {
-    Version::from_str("0.0.0").expect("root version should parse")
+fn root_version() -> RPackageVersion {
+    RPackageVersion::from_str("0.0.0").expect("root version should parse")
 }
 
 fn is_not_found_error(error: &str) -> bool {
@@ -548,7 +623,7 @@ mod tests {
 
     #[derive(Debug, Clone)]
     struct TestPackageVersion {
-        version: Version,
+        version: RPackageVersion,
         dependencies: Vec<(String, VersionRange)>,
     }
 
@@ -560,7 +635,7 @@ mod tests {
 
     impl DependencyProvider for TestProvider {
         type P = String;
-        type V = Version;
+        type V = RPackageVersion;
         type VS = VersionRange;
         type Priority = (u32, Reverse<usize>);
         type M = String;
@@ -628,6 +703,12 @@ mod tests {
                 .unwrap_or_default();
             Ok(Dependencies::Available(dependencies.into_iter().collect()))
         }
+    }
+
+    #[test]
+    fn compares_cran_hyphen_versions_numerically() {
+        assert!(parse_version("7.3-65").unwrap() > parse_version("7.3-9").unwrap());
+        assert!(parse_version("7.3-60.2").unwrap() > parse_version("7.3-60").unwrap());
     }
 
     #[test]
