@@ -16,6 +16,7 @@
 name: Release
 permissions:
   "contents": "write"
+  "id-token": "write"
 
 # This task will run whenever you push a git tag that looks like a version
 # like "1.0.0", "v0.1.0-prerelease.1", "my-app/0.1.0", "releases/v1.0.0", etc.
@@ -144,6 +145,51 @@ jobs:
           # Actually do builds and make zips and whatnot
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
+      # CUSTOM AZURE SIGNING START
+      # cargo-dist regenerates this workflow; if this file is regenerated,
+      # re-add this block after `dist build` and before the cargo-dist Post-build step.
+      - name: Prepare Windows artifact for signing
+        if: ${{ needs.plan.outputs.publishing == 'true' && contains(join(matrix.targets, ','), 'windows') }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Get-ChildItem -Path target/distrib -Filter 'rpx-*-pc-windows-*.zip' | Select-Object -First 1
+          if (-not $zip) {
+            throw 'Windows release archive not found'
+          }
+          $signDir = Join-Path $env:RUNNER_TEMP 'rpx-signing'
+          Remove-Item $signDir -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $signDir | Out-Null
+          Expand-Archive -Path $zip.FullName -DestinationPath $signDir -Force
+          "RPX_SIGNING_DIR=$signDir" >> $env:GITHUB_ENV
+          "RPX_SIGNING_ZIP=$($zip.FullName)" >> $env:GITHUB_ENV
+      - name: Azure login
+        if: ${{ needs.plan.outputs.publishing == 'true' && contains(join(matrix.targets, ','), 'windows') }}
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Sign Windows binary with Azure Artifact Signing
+        if: ${{ needs.plan.outputs.publishing == 'true' && contains(join(matrix.targets, ','), 'windows') }}
+        uses: azure/artifact-signing-action@v1
+        with:
+          endpoint: ${{ secrets.AZURE_CODESIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_CODESIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ secrets.AZURE_CODESIGNING_CERT_PROFILE_NAME }}
+          files-folder: ${{ env.RPX_SIGNING_DIR }}
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+      - name: Repack signed Windows artifact
+        if: ${{ needs.plan.outputs.publishing == 'true' && contains(join(matrix.targets, ','), 'windows') }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Remove-Item $env:RPX_SIGNING_ZIP -Force
+          Compress-Archive -Path (Join-Path $env:RPX_SIGNING_DIR '*') -DestinationPath $env:RPX_SIGNING_ZIP -Force
+      # CUSTOM AZURE SIGNING END
       - id: cargo-dist
         name: Post-build
         # We force bash here just because github makes it really hard to get values up
