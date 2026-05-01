@@ -126,6 +126,15 @@ pub(crate) fn latest_snapshot() -> Result<SysreqDbSnapshot, String> {
     Ok(snapshot)
 }
 
+pub(crate) fn cached_latest_snapshot() -> Result<Option<SysreqDbSnapshot>, String> {
+    let cache_path = latest_snapshot_cache_path();
+    let Some(cached) = read_json_cache::<LatestSnapshotCache>(&cache_path)? else {
+        return Ok(None);
+    };
+
+    snapshot_for_commit(&cached.commit).map(Some)
+}
+
 pub(crate) fn snapshot_for_commit(commit: &str) -> Result<SysreqDbSnapshot, String> {
     let cache_path = db_snapshot_cache_path(commit);
     if cache_path.exists() {
@@ -135,6 +144,14 @@ pub(crate) fn snapshot_for_commit(commit: &str) -> Result<SysreqDbSnapshot, Stri
     let snapshot = download_snapshot(commit)?;
     write_json(&cache_path, &snapshot)?;
     Ok(snapshot)
+}
+
+pub(crate) fn empty_snapshot() -> SysreqDbSnapshot {
+    SysreqDbSnapshot {
+        commit: String::new(),
+        rules: vec![],
+        scripts: BTreeMap::new(),
+    }
 }
 
 pub(crate) fn match_rules(spec: Option<&str>, db: &SysreqDbSnapshot) -> Vec<String> {
@@ -701,6 +718,17 @@ where
         .map_err(|error| format!("failed to read sysreq cache {}: {error}", path.display()))?;
     serde_json::from_str(&contents)
         .map_err(|error| format!("failed to parse sysreq cache {}: {error}", path.display()))
+}
+
+fn read_json_cache<T>(path: &PathBuf) -> Result<Option<T>, String>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    read_json(path).map(Some)
 }
 
 fn write_json<T>(path: &PathBuf, value: &T) -> Result<(), String>

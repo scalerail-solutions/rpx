@@ -44,7 +44,8 @@ use repository::{
 };
 use resolver::{ResolvedPackage, is_base_package, resolve_from_registry};
 use sysreqs::{
-    SystemDependencyPlan, current_host_platform, install as install_system_dependencies,
+    SystemDependencyPlan, cached_latest_snapshot, current_host_platform,
+    empty_snapshot as empty_sysreq_snapshot, install as install_system_dependencies,
     latest_snapshot as latest_sysreq_snapshot, preview_commands as sysreq_preview_commands,
     resolve_plan as resolve_system_plan,
 };
@@ -94,8 +95,7 @@ fn cmd_add(packages: &[String]) {
     }
 
     if !new_packages.is_empty() {
-        let sysreq_db =
-            latest_sysreq_snapshot().expect("failed to load system requirements database");
+        let sysreq_db = load_sysreq_snapshot_for_lock(lockfile.as_ref());
         let resolved_addition = resolve_additions_from_latest(
             &project.description,
             lockfile.as_ref(),
@@ -709,7 +709,7 @@ fn lock_from_description() -> LockOutcome {
     let registry = default_registry_base_url();
     let repositories = configured_repositories(&project);
     let existing_lockfile = read_lockfile_optional().expect("failed to read lockfile");
-    let sysreq_db = latest_sysreq_snapshot().expect("failed to load system requirements database");
+    let sysreq_db = load_sysreq_snapshot_for_lock(existing_lockfile.as_ref());
 
     if roots.is_empty() {
         let lockfile = lockfile_from_resolution(vec![], &registry, &[], &sysreq_db);
@@ -725,6 +725,36 @@ fn lock_from_description() -> LockOutcome {
     let changed = existing_lockfile.as_ref() != Some(&lockfile);
     write_lockfile(lockfile);
     LockOutcome { changed }
+}
+
+fn load_sysreq_snapshot_for_lock(
+    existing_lockfile: Option<&Lockfile>,
+) -> sysreqs::SysreqDbSnapshot {
+    if let Ok(snapshot) = latest_sysreq_snapshot() {
+        return snapshot;
+    }
+
+    if let Ok(Some(snapshot)) = cached_latest_snapshot() {
+        eprintln!("warning: using cached system requirements database snapshot");
+        return snapshot;
+    }
+
+    if let Some(commit) = existing_lockfile
+        .map(|lockfile| lockfile.sysreqs.db_commit.as_str())
+        .filter(|commit| !commit.is_empty())
+    {
+        if let Ok(snapshot) = sysreqs::snapshot_for_commit(commit) {
+            eprintln!(
+                "warning: using system requirements database pinned by the existing lockfile ({commit})"
+            );
+            return snapshot;
+        }
+    }
+
+    eprintln!(
+        "warning: system requirements database unavailable; continuing without updating locked system dependency rules"
+    );
+    empty_sysreq_snapshot()
 }
 
 fn sync_from_lockfile(install_system: bool, install_only_system: bool) -> SyncOutcome {
