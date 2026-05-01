@@ -1196,17 +1196,6 @@ fn handle_system_requirements(
         }
     }
 
-    if let Some(error) = &plan.installed_query_error {
-        if explicit_install {
-            eprintln!("rpx could not verify system package availability with apt.");
-            eprintln!();
-            eprintln!("Apt reported:");
-            eprintln!("{error}");
-        } else {
-            eprintln!("warning: {error}");
-        }
-    }
-
     if plan.missing_packages.is_empty() {
         if install_only_system {
             println!("System dependencies are already installed");
@@ -1214,12 +1203,7 @@ fn handle_system_requirements(
         return !install_only_system;
     }
 
-    if plan.installed_query_error.is_some() {
-        print_system_package_summary(
-            "Requested system packages for this project:",
-            &plan.install_packages,
-        );
-    } else {
+    if plan.installed_query_error.is_none() {
         print_system_package_summary(
             &format!("Missing system packages for {}:", plan.host.label()),
             &plan.missing_packages,
@@ -1227,11 +1211,7 @@ fn handle_system_requirements(
     }
     let preview = sysreq_preview_commands(&plan);
     if !preview.is_empty() {
-        if plan.installed_query_error.is_some() {
-            eprintln!("rpx can still try to install them now:");
-        } else {
-            eprintln!("rpx can run:");
-        }
+        eprintln!("rpx will run:");
         for command in &preview {
             eprintln!("- {command}");
         }
