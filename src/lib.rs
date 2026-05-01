@@ -293,7 +293,9 @@ fn cmd_lock() {
 
 fn cmd_sync(install_system: bool, install_only_system: bool) {
     if (install_system || install_only_system) && !host_supports_system_sync() {
-        eprintln!("System dependency installation is currently supported only on Linux.");
+        eprintln!(
+            "System dependency installation is currently supported only on supported Linux distributions/package managers."
+        );
         std::process::exit(1);
     }
 

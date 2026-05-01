@@ -80,11 +80,16 @@ pub enum Commands {
     Sync {
         #[arg(
             long,
+            conflicts_with = "install_only_system",
             help = "Install missing system dependencies before syncing R packages"
         )]
         install_system: bool,
 
-        #[arg(long, help = "Install only missing system dependencies and stop")]
+        #[arg(
+            long,
+            conflicts_with = "install_system",
+            help = "Install only missing system dependencies and stop"
+        )]
         install_only_system: bool,
     },
 
