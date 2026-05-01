@@ -54,7 +54,9 @@ use sysreqs::{
 };
 use ui::{InstallKind, SyncUi};
 
-const SYNC_WORKERS: usize = 4;
+const DOWNLOAD_WORKERS: usize = 8;
+const INSTALL_WORKERS: usize = 8;
+const MAX_SOURCE_BUILDS: usize = 4;
 
 pub fn run() {
     let cli = Cli::parse();
@@ -549,6 +551,14 @@ struct DownloadedInstall {
 }
 
 #[derive(Debug)]
+enum InstallEvent {
+    Finished {
+        package: PendingInstall,
+        result: Result<CompletedBuild, InstallFailure>,
+    },
+}
+
+#[derive(Debug)]
 enum DownloadEvent {
     Started {
         name: String,
@@ -855,64 +865,14 @@ fn sync_from_lockfile(install_system: bool, install_only_system: bool) -> SyncOu
         .count();
     let source_builds = downloaded.len().saturating_sub(binary_installs);
     ui.start_installs(binary_installs, source_builds);
-    while !pending.is_empty() {
-        let ready_names = ready_install_batch(&pending, &satisfied, SYNC_WORKERS);
-        if ready_names.is_empty() {
-            let blocked = pending.keys().cloned().collect::<Vec<_>>();
-            panic!(
-                "no installable packages remain after dependency resolution: {}",
-                blocked.join(", ")
-            );
-        }
-
-        let batch = ready_names
-            .into_iter()
-            .map(|name| {
-                pending
-                    .remove(&name)
-                    .expect("ready package should be pending")
-            })
-            .collect::<Vec<_>>();
-        ui.start_install_batch(batch.iter().map(|package| {
-            let downloaded = downloaded
-                .get(&package.name)
-                .expect("artifact should exist for pending package");
-            (
-                package.name.clone(),
-                package.version.clone(),
-                downloaded.install_kind,
-            )
-        }));
-        let results = build_batch(&batch, &downloaded, &project_library);
-        for result in results {
-            match result {
-                Ok(completed) => {
-                    finalize_built_package(&completed, &project_library).unwrap_or_else(|error| {
-                        panic!(
-                            "failed to cache built package {}@{}: {error}",
-                            completed.package.name, completed.package.version
-                        )
-                    });
-                    satisfied.insert(completed.package.name.clone());
-                    outcome.installed += 1;
-                    let install_kind = downloaded
-                        .get(&completed.package.name)
-                        .expect("artifact should exist for completed package")
-                        .install_kind;
-                    ui.finish_install(
-                        &completed.package.name,
-                        &completed.package.version,
-                        install_kind,
-                    );
-                }
-                Err((package, error)) => {
-                    ui.fail_install(&package.name, &package.version);
-                    report_install_failure(&package.name, &package.version, &error);
-                    std::process::exit(error.exit_code.unwrap_or(1));
-                }
-            }
-        }
-    }
+    install_downloaded_packages_in_parallel(
+        &mut pending,
+        &mut satisfied,
+        &downloaded,
+        &project_library,
+        &ui,
+        &mut outcome,
+    );
     ui.finish_installs();
 
     let locked_names = locked_package_names(&lockfile);
@@ -1604,7 +1564,7 @@ fn download_artifacts_in_parallel(
     let queue = Arc::new(Mutex::new(VecDeque::from(packages.to_vec())));
     let (sender, receiver) = mpsc::channel();
 
-    for _ in 0..SYNC_WORKERS.min(packages.len()) {
+    for _ in 0..DOWNLOAD_WORKERS.min(packages.len()) {
         let queue = Arc::clone(&queue);
         let sender = sender.clone();
         let repositories = repositories.clone();
@@ -1750,10 +1710,9 @@ fn download_artifacts_in_parallel(
     Ok(downloaded)
 }
 
-fn ready_install_batch(
+fn ready_install_names(
     pending: &BTreeMap<String, PendingInstall>,
     satisfied: &BTreeSet<String>,
-    concurrency: usize,
 ) -> Vec<String> {
     pending
         .values()
@@ -1763,55 +1722,140 @@ fn ready_install_batch(
                 .iter()
                 .all(|dependency| satisfied.contains(dependency))
         })
-        .take(concurrency)
         .map(|package| package.name.clone())
         .collect()
 }
 
-fn build_batch(
-    batch: &[PendingInstall],
+fn install_downloaded_packages_in_parallel(
+    pending: &mut BTreeMap<String, PendingInstall>,
+    satisfied: &mut BTreeSet<String>,
+    artifacts: &BTreeMap<String, DownloadedInstall>,
+    project_library: &Path,
+    ui: &SyncUi,
+    outcome: &mut SyncOutcome,
+) {
+    let (sender, receiver) = mpsc::channel();
+    let mut active_installs = 0;
+    let mut active_source_builds = 0;
+
+    while !pending.is_empty() || active_installs > 0 {
+        let ready_names = ready_install_names(pending, satisfied);
+        let mut dispatched = Vec::new();
+
+        for name in ready_names {
+            if active_installs >= INSTALL_WORKERS {
+                break;
+            }
+
+            let install_kind = effective_install_kind(artifacts, &name);
+            if install_kind == InstallKind::Source && active_source_builds >= MAX_SOURCE_BUILDS {
+                continue;
+            }
+
+            let package = pending
+                .remove(&name)
+                .expect("ready package should still be pending");
+            spawn_install_worker(package.clone(), artifacts, project_library, &sender);
+            active_installs += 1;
+            if install_kind == InstallKind::Source {
+                active_source_builds += 1;
+            }
+            dispatched.push((package.name, package.version, install_kind));
+        }
+
+        if !dispatched.is_empty() {
+            ui.start_install_batch(dispatched);
+        }
+
+        if active_installs == 0 {
+            let blocked = pending.keys().cloned().collect::<Vec<_>>();
+            panic!(
+                "no installable packages remain after dependency resolution: {}",
+                blocked.join(", ")
+            );
+        }
+
+        match receiver
+            .recv()
+            .expect("install worker should return a result")
+        {
+            InstallEvent::Finished { package, result } => {
+                active_installs -= 1;
+                let install_kind = effective_install_kind(artifacts, &package.name);
+                if install_kind == InstallKind::Source {
+                    active_source_builds -= 1;
+                }
+
+                match result {
+                    Ok(completed) => {
+                        finalize_built_package(&completed, project_library).unwrap_or_else(
+                            |error| {
+                                panic!(
+                                    "failed to cache built package {}@{}: {error}",
+                                    completed.package.name, completed.package.version
+                                )
+                            },
+                        );
+                        satisfied.insert(completed.package.name.clone());
+                        outcome.installed += 1;
+                        ui.finish_install(
+                            &completed.package.name,
+                            &completed.package.version,
+                            install_kind,
+                        );
+                    }
+                    Err(error) => {
+                        ui.fail_install(&package.name, &package.version);
+                        report_install_failure(&package.name, &package.version, &error);
+                        std::process::exit(error.exit_code.unwrap_or(1));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn spawn_install_worker(
+    package: PendingInstall,
     artifacts: &BTreeMap<String, DownloadedInstall>,
     dependency_library: &Path,
-) -> Vec<Result<CompletedBuild, (PendingInstall, InstallFailure)>> {
-    let (sender, receiver) = mpsc::channel();
+    sender: &mpsc::Sender<InstallEvent>,
+) {
+    let sender = sender.clone();
+    let downloaded = artifacts
+        .get(&package.name)
+        .expect("artifact should exist for pending package");
+    let artifact_path = downloaded.artifact.path().to_path_buf();
+    let install_type = downloaded.install_type.clone();
+    let dependency_library = dependency_library.to_path_buf();
 
-    for package in batch.iter().cloned() {
-        let sender = sender.clone();
-        let downloaded = artifacts
-            .get(&package.name)
-            .expect("artifact should exist for pending package");
-        let artifact_path = downloaded.artifact.path().to_path_buf();
-        let install_type = downloaded.install_type.clone();
-        let dependency_library = dependency_library.to_path_buf();
-        thread::spawn(move || {
-            let temp_library = build_temp_library_path(&package.name, &unique_build_token());
-            let package_for_success = package.clone();
-            let package_for_error = package.clone();
-            let result = install_local_package(
-                &artifact_path,
-                &package.name,
-                &package.version,
-                &install_type,
-                &temp_library,
-                &[dependency_library],
-            )
-            .map(|_| CompletedBuild {
-                package: package_for_success,
-                temp_library,
-            })
-            .map_err(|error| (package_for_error, error));
-            let _ = sender.send(result);
+    thread::spawn(move || {
+        let temp_library = build_temp_library_path(&package.name, &unique_build_token());
+        let package_for_success = package.clone();
+        let result = install_local_package(
+            &artifact_path,
+            &package.name,
+            &package.version,
+            &install_type,
+            &temp_library,
+            &[dependency_library],
+        )
+        .map(|_| CompletedBuild {
+            package: package_for_success,
+            temp_library,
         });
-    }
-    drop(sender);
+        let _ = sender.send(InstallEvent::Finished { package, result });
+    });
+}
 
-    (0..batch.len())
-        .map(|_| {
-            receiver
-                .recv()
-                .expect("build worker should return a result")
-        })
-        .collect()
+fn effective_install_kind(
+    artifacts: &BTreeMap<String, DownloadedInstall>,
+    package_name: &str,
+) -> InstallKind {
+    artifacts
+        .get(package_name)
+        .expect("artifact should exist for pending package")
+        .install_kind
 }
 
 fn finalize_built_package(completed: &CompletedBuild, target_library: &Path) -> Result<(), String> {
