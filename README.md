@@ -20,23 +20,39 @@ The full user guide lives at [rrepo.org](https://rrepo.org/documentation/overvie
 
 `rpx` requires R to be installed and available on `PATH`.
 
+### Prerequisites
+
+`Rscript` should be available in your shell before using `rpx`.
+
+- Install R:
+  - Windows: https://cran.r-project.org/bin/windows/base/
+  - macOS: https://cran.r-project.org/bin/macosx/
+  - CRAN mirrors: https://cran.r-project.org/mirrors.html
+
+Windows currently uses `cargo install --git ...` as the recommended install path, so you also need the Rust toolchain installed:
+
+- Rust: https://rustup.rs/
+- Windows Rust/MSVC prerequisites: https://rust-lang.github.io/rustup/installation/windows-msvc.html
+
+`rpx` prefers binary R package artifacts on Windows and macOS when available, but some packages may still need to be built from source. On Windows, install Rtools if you hit source-build requirements:
+
+- Rtools: https://cran.r-project.org/bin/windows/Rtools/
+
 Install the latest release on macOS or Linux:
 
 ```bash
 curl -LsSf https://github.com/scalerail-solutions/rpx/releases/latest/download/rpx-installer.sh | sh
 ```
 
-Install the latest release on Windows:
+Install on Windows via Cargo for now:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -Command "irm https://github.com/scalerail-solutions/rpx/releases/latest/download/rpx-installer.ps1 | iex"
-```
-
-Rust users can install from source:
-
-```bash
 cargo install --git https://github.com/scalerail-solutions/rpx.git
 ```
+
+Windows is supported, but the native signed Windows installer flow is still in progress. The current PowerShell installer can trigger Windows Defender or SmartScreen warnings while that work is being finalized, so installing from Git is the most reliable Windows path for now. We will update the Windows install guidance as the signing and installer flow improve.
+
+Rust users on other platforms can also install from source with `cargo install --git https://github.com/scalerail-solutions/rpx.git`.
 
 You can also run the Docker image directly:
 
