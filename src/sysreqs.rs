@@ -549,14 +549,7 @@ fn missing_packages_for_host(
 ) -> Result<Vec<String>, String> {
     if matches!(host, HostPlatform::Linux { distribution, .. } if distribution == "ubuntu" || distribution == "debian")
     {
-        return packages
-            .iter()
-            .filter_map(|package| match apt_requirement_satisfied(package) {
-                Ok(true) => None,
-                Ok(false) => Some(Ok(package.clone())),
-                Err(error) => Some(Err(error)),
-            })
-            .collect();
+        return apt_missing_packages(packages);
     }
 
     let installed = installed_packages(host)?;
@@ -567,36 +560,75 @@ fn missing_packages_for_host(
         .collect())
 }
 
-fn apt_requirement_satisfied(requirement: &str) -> Result<bool, String> {
+fn apt_missing_packages(packages: &[String]) -> Result<Vec<String>, String> {
+    let output = apt_simulation_output(packages)?;
+    Ok(apt_simulation_missing_packages(packages, &output))
+}
+
+fn apt_simulation_output(packages: &[String]) -> Result<String, String> {
     let output = Command::new("apt-get")
-        .args([
-            "-s",
-            "install",
-            "-y",
-            "--no-install-recommends",
-            requirement,
-        ])
+        .arg("-s")
+        .arg("install")
+        .arg("-y")
+        .arg("--no-install-recommends")
+        .args(packages)
         .output()
-        .map_err(|error| format!("failed to inspect apt package `{requirement}`: {error}"))?;
+        .map_err(|error| format!("failed to inspect apt packages: {error}"))?;
 
     if !output.status.success() {
         return Err(format!(
-            "failed to inspect apt package `{requirement}` ({})",
+            "failed to inspect apt packages ({})",
             output.status
         ));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{stdout}\n{stderr}");
-
-    Ok(!apt_simulation_requires_changes(&combined))
+    Ok(format!("{stdout}\n{stderr}"))
 }
 
-fn apt_simulation_requires_changes(output: &str) -> bool {
-    output
+fn apt_simulation_missing_packages(packages: &[String], output: &str) -> Vec<String> {
+    let selected_aliases = output
         .lines()
-        .any(|line| line.trim_start().starts_with("Inst "))
+        .filter_map(parse_apt_alias_selection)
+        .collect::<BTreeMap<_, _>>();
+    let packages_to_install = output
+        .lines()
+        .filter_map(parse_apt_installed_package)
+        .collect::<BTreeSet<_>>();
+
+    packages
+        .iter()
+        .filter(|package| {
+            let candidate = selected_aliases
+                .get(package.as_str())
+                .map(String::as_str)
+                .unwrap_or(package.as_str());
+            packages_to_install.contains(candidate)
+        })
+        .cloned()
+        .collect()
+}
+
+fn parse_apt_alias_selection(line: &str) -> Option<(String, String)> {
+    let line = line.trim();
+    let prefix = "Note, selecting '";
+    let middle = "' instead of '";
+    if !line.starts_with(prefix) {
+        return None;
+    }
+
+    let rest = &line[prefix.len()..];
+    let (selected, rest) = rest.split_once(middle)?;
+    let requested = rest.strip_suffix('"').or_else(|| rest.strip_suffix('\''))?;
+    Some((requested.to_string(), selected.to_string()))
+}
+
+fn parse_apt_installed_package(line: &str) -> Option<String> {
+    let line = line.trim_start();
+    let rest = line.strip_prefix("Inst ")?;
+    let package = rest.split_whitespace().next()?;
+    Some(package.to_string())
 }
 
 fn package_manager_for_host(host: &HostPlatform) -> Option<&'static str> {
@@ -817,7 +849,7 @@ fn now_unix() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::apt_simulation_requires_changes;
+    use super::apt_simulation_missing_packages;
 
     #[test]
     fn apt_simulation_recognizes_alias_as_already_satisfied() {
@@ -828,7 +860,9 @@ Note, selecting 'libfreetype-dev' instead of 'libfreetype6-dev'\n\
 libfreetype-dev is already the newest version (2.14.3+dfsg-1).\n\
 0 upgraded, 0 newly installed, 0 to remove and 75 not upgraded.\n";
 
-        assert!(!apt_simulation_requires_changes(output));
+        assert!(
+            apt_simulation_missing_packages(&["libfreetype6-dev".to_string()], output).is_empty()
+        );
     }
 
     #[test]
@@ -841,6 +875,29 @@ The following NEW packages will be installed:\n\
 Inst libfreetype6-dev (2.14.3+dfsg-1 Debian:testing [amd64])\n\
 Conf libfreetype6-dev (2.14.3+dfsg-1 Debian:testing [amd64])\n";
 
-        assert!(apt_simulation_requires_changes(output));
+        assert_eq!(
+            apt_simulation_missing_packages(&["libfreetype6-dev".to_string()], output),
+            vec!["libfreetype6-dev".to_string()]
+        );
+    }
+
+    #[test]
+    fn apt_simulation_batches_missing_and_satisfied_packages() {
+        let output = "Reading package lists... Done\n\
+Building dependency tree... Done\n\
+Reading state information... Done\n\
+Note, selecting 'libfreetype-dev' instead of 'libfreetype6-dev'\n\
+The following NEW packages will be installed:\n\
+  libxml2-dev\n\
+Inst libxml2-dev (2.14.3+dfsg-1 Debian:testing [amd64])\n\
+Conf libxml2-dev (2.14.3+dfsg-1 Debian:testing [amd64])\n";
+
+        assert_eq!(
+            apt_simulation_missing_packages(
+                &["libfreetype6-dev".to_string(), "libxml2-dev".to_string()],
+                output,
+            ),
+            vec!["libxml2-dev".to_string()]
+        );
     }
 }
