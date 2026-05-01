@@ -233,17 +233,11 @@ pub(crate) fn resolve_plan(
     let install_supported = package_manager_for_host(&host).is_some();
     let can_auto_install = install_supported && install_prefix().is_some();
 
-    let (missing_packages, installed_query_error) = match installed_packages(&host) {
-        Ok(installed) => (
-            install_packages
-                .iter()
-                .filter(|package| !installed.contains(*package))
-                .cloned()
-                .collect(),
-            None,
-        ),
-        Err(error) => (install_packages.clone(), Some(error)),
-    };
+    let (missing_packages, installed_query_error) =
+        match missing_packages_for_host(&host, &install_packages) {
+            Ok(missing_packages) => (missing_packages, None),
+            Err(error) => (install_packages.clone(), Some(error)),
+        };
 
     SystemDependencyPlan {
         host,
@@ -472,7 +466,13 @@ fn detect_linux_platform() -> HostPlatform {
         .collect::<BTreeMap<_, _>>();
 
     let id = values.get("ID").cloned().unwrap_or_default();
-    let version = values.get("VERSION_ID").cloned().unwrap_or_default();
+    let version = values
+        .get("VERSION_ID")
+        .cloned()
+        .or_else(|| values.get("VERSION_CODENAME").cloned())
+        .or_else(|| values.get("DEBIAN_CODENAME").cloned())
+        .or_else(|| values.get("VERSION").cloned())
+        .unwrap_or_default();
     let distribution = match id.as_str() {
         "ubuntu" => Some("ubuntu"),
         "debian" => Some("debian"),
@@ -541,6 +541,62 @@ fn installed_packages(host: &HostPlatform) -> Result<BTreeSet<String>, String> {
         .filter(|line| !line.is_empty())
         .map(ToString::to_string)
         .collect())
+}
+
+fn missing_packages_for_host(
+    host: &HostPlatform,
+    packages: &[String],
+) -> Result<Vec<String>, String> {
+    if matches!(host, HostPlatform::Linux { distribution, .. } if distribution == "ubuntu" || distribution == "debian")
+    {
+        return packages
+            .iter()
+            .filter_map(|package| match apt_requirement_satisfied(package) {
+                Ok(true) => None,
+                Ok(false) => Some(Ok(package.clone())),
+                Err(error) => Some(Err(error)),
+            })
+            .collect();
+    }
+
+    let installed = installed_packages(host)?;
+    Ok(packages
+        .iter()
+        .filter(|package| !installed.contains(*package))
+        .cloned()
+        .collect())
+}
+
+fn apt_requirement_satisfied(requirement: &str) -> Result<bool, String> {
+    let output = Command::new("apt-get")
+        .args([
+            "-s",
+            "install",
+            "-y",
+            "--no-install-recommends",
+            requirement,
+        ])
+        .output()
+        .map_err(|error| format!("failed to inspect apt package `{requirement}`: {error}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "failed to inspect apt package `{requirement}` ({})",
+            output.status
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}\n{stderr}");
+
+    Ok(!apt_simulation_requires_changes(&combined))
+}
+
+fn apt_simulation_requires_changes(output: &str) -> bool {
+    output
+        .lines()
+        .any(|line| line.trim_start().starts_with("Inst "))
 }
 
 fn package_manager_for_host(host: &HostPlatform) -> Option<&'static str> {
@@ -757,4 +813,34 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("system time should be after unix epoch")
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apt_simulation_requires_changes;
+
+    #[test]
+    fn apt_simulation_recognizes_alias_as_already_satisfied() {
+        let output = "Reading package lists... Done\n\
+Building dependency tree... Done\n\
+Reading state information... Done\n\
+Note, selecting 'libfreetype-dev' instead of 'libfreetype6-dev'\n\
+libfreetype-dev is already the newest version (2.14.3+dfsg-1).\n\
+0 upgraded, 0 newly installed, 0 to remove and 75 not upgraded.\n";
+
+        assert!(!apt_simulation_requires_changes(output));
+    }
+
+    #[test]
+    fn apt_simulation_recognizes_pending_install() {
+        let output = "Reading package lists... Done\n\
+Building dependency tree... Done\n\
+Reading state information... Done\n\
+The following NEW packages will be installed:\n\
+  libfreetype6-dev\n\
+Inst libfreetype6-dev (2.14.3+dfsg-1 Debian:testing [amd64])\n\
+Conf libfreetype6-dev (2.14.3+dfsg-1 Debian:testing [amd64])\n";
+
+        assert!(apt_simulation_requires_changes(output));
+    }
 }
