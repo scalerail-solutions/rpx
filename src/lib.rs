@@ -2,6 +2,7 @@ use clap::Parser;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     env, fs,
+    io::{IsTerminal, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
     thread,
@@ -16,12 +17,14 @@ mod r;
 mod registry;
 mod repository;
 mod resolver;
+mod sysreqs;
 mod ui;
 
 use cli::{Cli, Commands, RepoCommands};
 use description::{DescriptionExt, init_description, read_description, write_description};
 use lockfile::{
-    LOCKFILE_VERSION, LockedR, Lockfile, read_lockfile, read_lockfile_optional, write_lockfile,
+    LOCKFILE_VERSION, LockedR, LockedSystemRequirements, Lockfile, read_lockfile,
+    read_lockfile_optional, write_lockfile,
 };
 use project::{
     build_temp_library_path, cache_dir_path, compiled_cache_package_path, project_library_path,
@@ -40,9 +43,20 @@ use repository::{
     RepositorySet, RepositorySource, normalize_repository_url, repository_source_from_package_url,
 };
 use resolver::{ResolvedPackage, is_base_package, resolve_from_registry};
-use ui::{InstallKind, SyncUi};
+use sysreqs::{
+    SystemDependencyPlan, cached_latest_snapshot, current_host_platform,
+    empty_snapshot as empty_sysreq_snapshot, install as install_system_dependencies,
+    latest_snapshot as latest_sysreq_snapshot, preview_commands as sysreq_preview_commands,
+    recheck_missing_packages as recheck_system_missing_packages,
+    refresh_metadata as refresh_system_metadata,
+    refresh_preview_command as system_metadata_refresh_preview,
+    resolve_plan as resolve_system_plan,
+};
+use ui::{InstallKind, SyncUi, SystemDepsUi};
 
-const SYNC_WORKERS: usize = 4;
+const DOWNLOAD_WORKERS: usize = 8;
+const INSTALL_WORKERS: usize = 8;
+const MAX_SOURCE_BUILDS: usize = 4;
 
 pub fn run() {
     let cli = Cli::parse();
@@ -54,7 +68,10 @@ pub fn run() {
         Commands::Run { command } => cmd_run(&command),
         Commands::Lock => cmd_lock(),
         Commands::Status => cmd_status(),
-        Commands::Sync => cmd_sync(),
+        Commands::Sync {
+            install_system,
+            install_only_system,
+        } => cmd_sync(install_system, install_only_system),
         Commands::Clean => cmd_clean(),
         Commands::Repo { command } => cmd_repo(command),
     }
@@ -83,6 +100,7 @@ fn cmd_add(packages: &[String]) {
     }
 
     if !new_packages.is_empty() {
+        let sysreq_db = load_sysreq_snapshot_for_lock(lockfile.as_ref());
         let resolved_addition = resolve_additions_from_latest(
             &project.description,
             lockfile.as_ref(),
@@ -105,6 +123,7 @@ fn cmd_add(packages: &[String]) {
             project.description.resolution_roots(),
             &default_registry_base_url(),
             &resolved_addition.resolved,
+            &sysreq_db,
         ));
     }
 
@@ -114,7 +133,7 @@ fn cmd_add(packages: &[String]) {
     } else {
         let _ = lock_from_description();
     }
-    let _ = sync_from_lockfile();
+    let _ = sync_from_lockfile(false, false);
     println!("Added {}", packages.join(", "));
 }
 
@@ -236,7 +255,7 @@ fn cmd_remove(packages: &[String]) {
     }
 
     let _ = lock_from_description();
-    let _ = sync_from_lockfile();
+    let _ = sync_from_lockfile(false, false);
 
     if !removed.is_empty() {
         println!("Removed {}", removed.join(", "));
@@ -272,8 +291,18 @@ fn cmd_lock() {
     }
 }
 
-fn cmd_sync() {
-    let outcome = sync_from_lockfile();
+fn cmd_sync(install_system: bool, install_only_system: bool) {
+    if (install_system || install_only_system) && !host_supports_system_sync() {
+        eprintln!(
+            "System dependency installation is currently supported only on supported Linux distributions/package managers."
+        );
+        std::process::exit(1);
+    }
+
+    let outcome = sync_from_lockfile(install_system, install_only_system);
+    if install_only_system {
+        return;
+    }
     if outcome.installed == 0 && outcome.removed == 0 {
         println!("Project library is already in sync");
     } else {
@@ -329,6 +358,11 @@ fn cmd_status() {
         .collect::<std::collections::BTreeMap<_, _>>();
     let locked_names = locked_package_names(&lockfile);
     let runtime_status = runtime_status(&lockfile);
+    let system_plan = if host_supports_system_sync() {
+        system_plan_from_lockfile(&lockfile).ok()
+    } else {
+        None
+    };
 
     let missing_from_lockfile = manifest_requirements
         .difference(&lock_requirements)
@@ -369,6 +403,10 @@ fn cmd_status() {
         && extra_in_library.is_empty()
         && version_mismatches.is_empty()
         && runtime_status.missing_base_packages.is_empty()
+        && system_plan
+            .as_ref()
+            .map(|plan| plan.missing_packages.is_empty() && plan.unsupported_rules.is_empty())
+            .unwrap_or(true)
     {
         print_runtime_version_warning(&runtime_status);
         println!("Project is in sync");
@@ -380,6 +418,10 @@ fn cmd_status() {
         || !extra_in_library.is_empty()
         || !version_mismatches.is_empty();
     let runtime_out_of_date = !runtime_status.missing_base_packages.is_empty();
+    let system_out_of_date = system_plan
+        .as_ref()
+        .map(|plan| !plan.missing_packages.is_empty() || !plan.unsupported_rules.is_empty())
+        .unwrap_or(false);
 
     if lockfile_out_of_date && library_out_of_date {
         println!("Project is out of sync");
@@ -391,6 +433,8 @@ fn cmd_status() {
         println!("Run: rpx lock");
     } else if runtime_out_of_date {
         println!("R runtime is out of sync");
+    } else if system_out_of_date {
+        println!("System dependencies are out of sync");
     } else {
         println!("Project library is out of sync");
         println!();
@@ -416,6 +460,16 @@ fn cmd_status() {
         "R runtime is missing locked base packages:",
         &runtime_status.missing_base_packages,
     );
+    if let Some(plan) = system_plan {
+        print_status_group(
+            "Missing system packages for this host:",
+            &plan.missing_packages,
+        );
+        print_status_group(
+            "System requirement rules without a host mapping:",
+            &plan.unsupported_rules,
+        );
+    }
 
     std::process::exit(1);
 }
@@ -496,6 +550,14 @@ struct DownloadedInstall {
     artifact: DownloadedArtifact,
     install_kind: InstallKind,
     install_type: String,
+}
+
+#[derive(Debug)]
+enum InstallEvent {
+    Finished {
+        package: PendingInstall,
+        result: Result<CompletedBuild, InstallFailure>,
+    },
 }
 
 #[derive(Debug)]
@@ -671,9 +733,10 @@ fn lock_from_description() -> LockOutcome {
     let registry = default_registry_base_url();
     let repositories = configured_repositories(&project);
     let existing_lockfile = read_lockfile_optional().expect("failed to read lockfile");
+    let sysreq_db = load_sysreq_snapshot_for_lock(existing_lockfile.as_ref());
 
     if roots.is_empty() {
-        let lockfile = lockfile_from_resolution(vec![], &registry, &[]);
+        let lockfile = lockfile_from_resolution(vec![], &registry, &[], &sysreq_db);
         let changed = existing_lockfile.as_ref() != Some(&lockfile);
         write_lockfile(lockfile);
         return LockOutcome { changed };
@@ -682,13 +745,43 @@ fn lock_from_description() -> LockOutcome {
     let resolved = resolve_from_registry(&repositories, &roots, &BTreeMap::new())
         .unwrap_or_else(|error| panic!("failed to resolve package set from registry: {error}"));
 
-    let lockfile = lockfile_from_resolution(roots, &registry, &resolved);
+    let lockfile = lockfile_from_resolution(roots, &registry, &resolved, &sysreq_db);
     let changed = existing_lockfile.as_ref() != Some(&lockfile);
     write_lockfile(lockfile);
     LockOutcome { changed }
 }
 
-fn sync_from_lockfile() -> SyncOutcome {
+fn load_sysreq_snapshot_for_lock(
+    existing_lockfile: Option<&Lockfile>,
+) -> sysreqs::SysreqDbSnapshot {
+    if let Ok(snapshot) = latest_sysreq_snapshot() {
+        return snapshot;
+    }
+
+    if let Ok(Some(snapshot)) = cached_latest_snapshot() {
+        eprintln!("warning: using cached system requirements database snapshot");
+        return snapshot;
+    }
+
+    if let Some(commit) = existing_lockfile
+        .map(|lockfile| lockfile.sysreqs.db_commit.as_str())
+        .filter(|commit| !commit.is_empty())
+    {
+        if let Ok(snapshot) = sysreqs::snapshot_for_commit(commit) {
+            eprintln!(
+                "warning: using system requirements database pinned by the existing lockfile ({commit})"
+            );
+            return snapshot;
+        }
+    }
+
+    eprintln!(
+        "warning: system requirements database unavailable; continuing without updating locked system dependency rules"
+    );
+    empty_sysreq_snapshot()
+}
+
+fn sync_from_lockfile(install_system: bool, install_only_system: bool) -> SyncOutcome {
     let project = read_description().expect("failed to read DESCRIPTION");
     let manifest_requirements = project
         .description
@@ -698,6 +791,17 @@ fn sync_from_lockfile() -> SyncOutcome {
     let lockfile = read_lockfile().expect("failed to read lockfile");
     validate_lockfile_version_for_sync(&lockfile);
     validate_runtime_for_sync(&lockfile);
+    if host_supports_system_sync() {
+        let system_plan = system_plan_from_lockfile(&lockfile).unwrap_or_else(|error| {
+            eprintln!("warning: failed to prepare system dependency plan: {error}");
+            system_plan_without_db(&lockfile)
+        });
+        let proceed_with_r =
+            handle_system_requirements(&system_plan, install_system, install_only_system);
+        if install_only_system || !proceed_with_r {
+            return SyncOutcome::default();
+        }
+    }
     let lock_requirements = lockfile
         .roots
         .iter()
@@ -763,64 +867,14 @@ fn sync_from_lockfile() -> SyncOutcome {
         .count();
     let source_builds = downloaded.len().saturating_sub(binary_installs);
     ui.start_installs(binary_installs, source_builds);
-    while !pending.is_empty() {
-        let ready_names = ready_install_batch(&pending, &satisfied, SYNC_WORKERS);
-        if ready_names.is_empty() {
-            let blocked = pending.keys().cloned().collect::<Vec<_>>();
-            panic!(
-                "no installable packages remain after dependency resolution: {}",
-                blocked.join(", ")
-            );
-        }
-
-        let batch = ready_names
-            .into_iter()
-            .map(|name| {
-                pending
-                    .remove(&name)
-                    .expect("ready package should be pending")
-            })
-            .collect::<Vec<_>>();
-        ui.start_install_batch(batch.iter().map(|package| {
-            let downloaded = downloaded
-                .get(&package.name)
-                .expect("artifact should exist for pending package");
-            (
-                package.name.clone(),
-                package.version.clone(),
-                downloaded.install_kind,
-            )
-        }));
-        let results = build_batch(&batch, &downloaded, &project_library);
-        for result in results {
-            match result {
-                Ok(completed) => {
-                    finalize_built_package(&completed, &project_library).unwrap_or_else(|error| {
-                        panic!(
-                            "failed to cache built package {}@{}: {error}",
-                            completed.package.name, completed.package.version
-                        )
-                    });
-                    satisfied.insert(completed.package.name.clone());
-                    outcome.installed += 1;
-                    let install_kind = downloaded
-                        .get(&completed.package.name)
-                        .expect("artifact should exist for completed package")
-                        .install_kind;
-                    ui.finish_install(
-                        &completed.package.name,
-                        &completed.package.version,
-                        install_kind,
-                    );
-                }
-                Err((package, error)) => {
-                    ui.fail_install(&package.name, &package.version);
-                    report_install_failure(&package.name, &package.version, &error);
-                    std::process::exit(error.exit_code.unwrap_or(1));
-                }
-            }
-        }
-    }
+    install_downloaded_packages_in_parallel(
+        &mut pending,
+        &mut satisfied,
+        &downloaded,
+        &project_library,
+        &ui,
+        &mut outcome,
+    );
     ui.finish_installs();
 
     let locked_names = locked_package_names(&lockfile);
@@ -935,8 +989,10 @@ fn lockfile_from_resolution(
     roots: Vec<ResolutionRoot>,
     registry: &str,
     resolved: &[ResolvedPackage],
+    sysreq_db: &sysreqs::SysreqDbSnapshot,
 ) -> Lockfile {
     let required_base_packages = locked_base_packages(&roots, resolved);
+    let sysreqs = locked_system_requirements(resolved, sysreq_db);
     Lockfile {
         version: LOCKFILE_VERSION,
         registry: registry.to_string(),
@@ -944,6 +1000,7 @@ fn lockfile_from_resolution(
             version: runtime_info().version,
             base_packages: required_base_packages,
         },
+        sysreqs,
         roots: roots
             .into_iter()
             .map(|root| lockfile::LockedRoot {
@@ -1072,6 +1129,238 @@ fn print_runtime_version_warning(status: &RuntimeStatus) {
     println!();
     println!("R runtime differs from lockfile:");
     println!("- {version_mismatch}");
+}
+
+fn system_plan_from_lockfile(lockfile: &Lockfile) -> Result<SystemDependencyPlan, String> {
+    if lockfile.sysreqs.db_commit.is_empty() {
+        return Ok(system_plan_without_db(lockfile));
+    }
+
+    let snapshot = sysreqs::snapshot_for_commit(&lockfile.sysreqs.db_commit)?;
+    Ok(resolve_system_plan(&snapshot, &lockfile.sysreqs.packages))
+}
+
+fn system_plan_without_db(lockfile: &Lockfile) -> SystemDependencyPlan {
+    SystemDependencyPlan {
+        host: current_host_platform(),
+        missing_packages: vec![],
+        install_packages: vec![],
+        pre_install_commands: vec![],
+        post_install_commands: vec![],
+        unsupported_rules: lockfile.sysreqs.rules.clone(),
+        package_rules: lockfile.sysreqs.packages.clone(),
+        install_supported: false,
+        can_auto_install: false,
+        installed_query_error: None,
+        needs_metadata_refresh: false,
+    }
+}
+
+fn host_supports_system_sync() -> bool {
+    matches!(current_host_platform(), sysreqs::HostPlatform::Linux { .. })
+}
+
+fn handle_system_requirements(
+    plan: &SystemDependencyPlan,
+    install_system: bool,
+    install_only_system: bool,
+) -> bool {
+    let explicit_install = install_system || install_only_system;
+    let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    let mut plan = plan.clone();
+
+    if !plan.unsupported_rules.is_empty() {
+        eprintln!(
+            "warning: some system requirement rules do not have an install mapping for {}: {}",
+            plan.host.label(),
+            plan.unsupported_rules.join(", ")
+        );
+    }
+
+    if plan.needs_metadata_refresh && explicit_install {
+        if interactive {
+            prompt_for_metadata_refresh(&plan);
+        }
+
+        eprintln!("Refreshing system package information...");
+        refresh_system_metadata(&plan)
+            .unwrap_or_else(|error| panic!("failed to refresh package metadata: {error}"));
+        match recheck_system_missing_packages(&plan) {
+            Ok(missing_packages) => {
+                plan.missing_packages = missing_packages;
+                plan.installed_query_error = None;
+                plan.needs_metadata_refresh = false;
+            }
+            Err(error) => {
+                plan.installed_query_error = Some(error);
+                plan.needs_metadata_refresh = false;
+            }
+        }
+    }
+
+    if plan.missing_packages.is_empty() {
+        if install_only_system {
+            println!("System dependencies are already installed");
+        }
+        return !install_only_system;
+    }
+
+    if plan.installed_query_error.is_none() {
+        print_system_package_summary(
+            &format!("Missing system packages for {}:", plan.host.label()),
+            &plan.missing_packages,
+        );
+    }
+    let preview = sysreq_preview_commands(&plan);
+    if !preview.is_empty() {
+        eprintln!("rpx will run:");
+        for command in &preview {
+            eprintln!("- {command}");
+        }
+    }
+
+    if explicit_install && interactive && !prompt_for_install_confirmation() {
+        println!("Canceled");
+        std::process::exit(1);
+    }
+
+    if explicit_install {
+        let ui = SystemDepsUi::start();
+        if let Err(error) = install_system_dependencies(&plan) {
+            ui.fail();
+            panic!("failed to install system dependencies: {error}");
+        }
+        ui.finish();
+        if install_only_system {
+            println!("System dependency sync complete.");
+            return false;
+        }
+        return true;
+    }
+
+    if !interactive {
+        eprintln!("warning: continuing with R package sync without installing system dependencies");
+        return !install_only_system;
+    }
+
+    match prompt_for_system_dependency_action() {
+        SyncSystemChoice::InstallAndContinue => {
+            let ui = SystemDepsUi::start();
+            if let Err(error) = install_system_dependencies(&plan) {
+                ui.fail();
+                panic!("failed to install system dependencies: {error}");
+            }
+            ui.finish();
+            true
+        }
+        SyncSystemChoice::TryROnly => true,
+        SyncSystemChoice::Cancel => {
+            println!("Canceled");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn prompt_for_install_confirmation() -> bool {
+    eprintln!("Proceed with system package installation? [y/N]");
+    eprint!("> ");
+    std::io::stderr().flush().expect("failed to flush prompt");
+
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return false;
+    }
+
+    matches!(input.trim(), "y" | "Y" | "yes" | "YES" | "Yes")
+}
+
+fn print_system_package_summary(title: &str, packages: &[String]) {
+    eprintln!("{title}");
+    let shown = packages.iter().take(8).collect::<Vec<_>>();
+    for package in shown {
+        eprintln!("- {package}");
+    }
+    if packages.len() > 8 {
+        eprintln!("- ... and {} more", packages.len() - 8);
+    }
+}
+
+fn prompt_for_metadata_refresh(plan: &SystemDependencyPlan) {
+    eprintln!("rpx could not verify which system packages are missing yet.");
+    eprintln!();
+    eprintln!("rpx can run:");
+    if let Some(command) = system_metadata_refresh_preview(plan) {
+        eprintln!("- {command}");
+    }
+    eprintln!("to refresh apt package information and check what is missing.");
+    eprintln!();
+    eprintln!("Run package metadata refresh now? [y/N]");
+    eprint!("> ");
+    std::io::stderr().flush().expect("failed to flush prompt");
+
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        println!("Canceled");
+        std::process::exit(1);
+    }
+
+    if !matches!(input.trim(), "y" | "Y" | "yes" | "YES" | "Yes") {
+        println!("Canceled");
+        std::process::exit(1);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncSystemChoice {
+    InstallAndContinue,
+    TryROnly,
+    Cancel,
+}
+
+fn prompt_for_system_dependency_action() -> SyncSystemChoice {
+    eprintln!("Choose an action:");
+    eprintln!("1. Install system deps and continue");
+    eprintln!("2. Try to install R packages only");
+    eprintln!("3. Cancel");
+    eprint!("> ");
+    std::io::stderr().flush().expect("failed to flush prompt");
+
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return SyncSystemChoice::TryROnly;
+    }
+
+    match input.trim() {
+        "1" | "y" | "Y" => SyncSystemChoice::InstallAndContinue,
+        "2" | "r" | "R" => SyncSystemChoice::TryROnly,
+        _ => SyncSystemChoice::Cancel,
+    }
+}
+
+fn locked_system_requirements(
+    resolved: &[ResolvedPackage],
+    sysreq_db: &sysreqs::SysreqDbSnapshot,
+) -> LockedSystemRequirements {
+    let packages = resolved
+        .iter()
+        .filter_map(|package| {
+            let rules = sysreqs::match_rules(package.system_requirements.as_deref(), sysreq_db);
+            (!rules.is_empty()).then(|| (package.name.clone(), rules))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let rules = packages
+        .values()
+        .flatten()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    LockedSystemRequirements {
+        db_commit: sysreq_db.commit.clone(),
+        rules,
+        packages,
+    }
 }
 
 fn validate_runtime_for_sync(lockfile: &Lockfile) {
@@ -1263,7 +1552,7 @@ fn download_artifacts_in_parallel(
     let queue = Arc::new(Mutex::new(VecDeque::from(packages.to_vec())));
     let (sender, receiver) = mpsc::channel();
 
-    for _ in 0..SYNC_WORKERS.min(packages.len()) {
+    for _ in 0..DOWNLOAD_WORKERS.min(packages.len()) {
         let queue = Arc::clone(&queue);
         let sender = sender.clone();
         let repositories = repositories.clone();
@@ -1409,10 +1698,9 @@ fn download_artifacts_in_parallel(
     Ok(downloaded)
 }
 
-fn ready_install_batch(
+fn ready_install_names(
     pending: &BTreeMap<String, PendingInstall>,
     satisfied: &BTreeSet<String>,
-    concurrency: usize,
 ) -> Vec<String> {
     pending
         .values()
@@ -1422,55 +1710,140 @@ fn ready_install_batch(
                 .iter()
                 .all(|dependency| satisfied.contains(dependency))
         })
-        .take(concurrency)
         .map(|package| package.name.clone())
         .collect()
 }
 
-fn build_batch(
-    batch: &[PendingInstall],
+fn install_downloaded_packages_in_parallel(
+    pending: &mut BTreeMap<String, PendingInstall>,
+    satisfied: &mut BTreeSet<String>,
+    artifacts: &BTreeMap<String, DownloadedInstall>,
+    project_library: &Path,
+    ui: &SyncUi,
+    outcome: &mut SyncOutcome,
+) {
+    let (sender, receiver) = mpsc::channel();
+    let mut active_installs = 0;
+    let mut active_source_builds = 0;
+
+    while !pending.is_empty() || active_installs > 0 {
+        let ready_names = ready_install_names(pending, satisfied);
+        let mut dispatched = Vec::new();
+
+        for name in ready_names {
+            if active_installs >= INSTALL_WORKERS {
+                break;
+            }
+
+            let install_kind = effective_install_kind(artifacts, &name);
+            if install_kind == InstallKind::Source && active_source_builds >= MAX_SOURCE_BUILDS {
+                continue;
+            }
+
+            let package = pending
+                .remove(&name)
+                .expect("ready package should still be pending");
+            spawn_install_worker(package.clone(), artifacts, project_library, &sender);
+            active_installs += 1;
+            if install_kind == InstallKind::Source {
+                active_source_builds += 1;
+            }
+            dispatched.push((package.name, package.version, install_kind));
+        }
+
+        if !dispatched.is_empty() {
+            ui.start_install_batch(dispatched);
+        }
+
+        if active_installs == 0 {
+            let blocked = pending.keys().cloned().collect::<Vec<_>>();
+            panic!(
+                "no installable packages remain after dependency resolution: {}",
+                blocked.join(", ")
+            );
+        }
+
+        match receiver
+            .recv()
+            .expect("install worker should return a result")
+        {
+            InstallEvent::Finished { package, result } => {
+                active_installs -= 1;
+                let install_kind = effective_install_kind(artifacts, &package.name);
+                if install_kind == InstallKind::Source {
+                    active_source_builds -= 1;
+                }
+
+                match result {
+                    Ok(completed) => {
+                        finalize_built_package(&completed, project_library).unwrap_or_else(
+                            |error| {
+                                panic!(
+                                    "failed to cache built package {}@{}: {error}",
+                                    completed.package.name, completed.package.version
+                                )
+                            },
+                        );
+                        satisfied.insert(completed.package.name.clone());
+                        outcome.installed += 1;
+                        ui.finish_install(
+                            &completed.package.name,
+                            &completed.package.version,
+                            install_kind,
+                        );
+                    }
+                    Err(error) => {
+                        ui.fail_install(&package.name, &package.version);
+                        report_install_failure(&package.name, &package.version, &error);
+                        std::process::exit(error.exit_code.unwrap_or(1));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn spawn_install_worker(
+    package: PendingInstall,
     artifacts: &BTreeMap<String, DownloadedInstall>,
     dependency_library: &Path,
-) -> Vec<Result<CompletedBuild, (PendingInstall, InstallFailure)>> {
-    let (sender, receiver) = mpsc::channel();
+    sender: &mpsc::Sender<InstallEvent>,
+) {
+    let sender = sender.clone();
+    let downloaded = artifacts
+        .get(&package.name)
+        .expect("artifact should exist for pending package");
+    let artifact_path = downloaded.artifact.path().to_path_buf();
+    let install_type = downloaded.install_type.clone();
+    let dependency_library = dependency_library.to_path_buf();
 
-    for package in batch.iter().cloned() {
-        let sender = sender.clone();
-        let downloaded = artifacts
-            .get(&package.name)
-            .expect("artifact should exist for pending package");
-        let artifact_path = downloaded.artifact.path().to_path_buf();
-        let install_type = downloaded.install_type.clone();
-        let dependency_library = dependency_library.to_path_buf();
-        thread::spawn(move || {
-            let temp_library = build_temp_library_path(&package.name, &unique_build_token());
-            let package_for_success = package.clone();
-            let package_for_error = package.clone();
-            let result = install_local_package(
-                &artifact_path,
-                &package.name,
-                &package.version,
-                &install_type,
-                &temp_library,
-                &[dependency_library],
-            )
-            .map(|_| CompletedBuild {
-                package: package_for_success,
-                temp_library,
-            })
-            .map_err(|error| (package_for_error, error));
-            let _ = sender.send(result);
+    thread::spawn(move || {
+        let temp_library = build_temp_library_path(&package.name, &unique_build_token());
+        let package_for_success = package.clone();
+        let result = install_local_package(
+            &artifact_path,
+            &package.name,
+            &package.version,
+            &install_type,
+            &temp_library,
+            &[dependency_library],
+        )
+        .map(|_| CompletedBuild {
+            package: package_for_success,
+            temp_library,
         });
-    }
-    drop(sender);
+        let _ = sender.send(InstallEvent::Finished { package, result });
+    });
+}
 
-    (0..batch.len())
-        .map(|_| {
-            receiver
-                .recv()
-                .expect("build worker should return a result")
-        })
-        .collect()
+fn effective_install_kind(
+    artifacts: &BTreeMap<String, DownloadedInstall>,
+    package_name: &str,
+) -> InstallKind {
+    artifacts
+        .get(package_name)
+        .expect("artifact should exist for pending package")
+        .install_kind
 }
 
 fn finalize_built_package(completed: &CompletedBuild, target_library: &Path) -> Result<(), String> {
@@ -1640,10 +2013,14 @@ mod tests {
     use crate::description::RDescription;
     use crate::{
         description::DescriptionExt,
-        lockfile::{LOCKFILE_VERSION, LockedDependency, LockedPackage, LockedR, Lockfile},
+        lockfile::{
+            LOCKFILE_VERSION, LockedDependency, LockedPackage, LockedR, LockedSystemRequirements,
+            Lockfile,
+        },
         r::RuntimeInfo,
         registry::ResolutionRoot,
         resolver::{ResolvedDependency, ResolvedPackage},
+        sysreqs::SysreqDbSnapshot,
     };
     use std::collections::BTreeMap;
     use std::{
@@ -1718,6 +2095,7 @@ mod tests {
                             max_version_exclusive: None,
                         },
                     ],
+                    system_requirements: None,
                 },
                 ResolvedPackage {
                     name: "digest".to_string(),
@@ -1725,8 +2103,10 @@ mod tests {
                     source_url: "https://api.rrepo.org/packages/digest/versions/0.6.37/source"
                         .to_string(),
                     dependencies: vec![],
+                    system_requirements: None,
                 },
             ],
+            &empty_sysreq_db(),
         );
 
         assert_eq!(lockfile.registry, "https://api.rrepo.org");
@@ -1821,6 +2201,7 @@ mod tests {
                 source_url: "https://api.rrepo.org/packages/digest/versions/0.6.37/source"
                     .to_string(),
                 dependencies: vec![],
+                system_requirements: None,
             }],
         )
         .expect("constraints should derive");
@@ -1851,6 +2232,7 @@ mod tests {
             }],
             "https://api.rrepo.org",
             &[],
+            &empty_sysreq_db(),
         );
 
         assert_eq!(lockfile.r.base_packages, vec!["grid"]);
@@ -1890,6 +2272,7 @@ mod tests {
             version: LOCKFILE_VERSION,
             registry: "https://api.rrepo.org".to_string(),
             r: LockedR::default(),
+            sysreqs: LockedSystemRequirements::default(),
             roots: vec![],
             packages: BTreeMap::from([
                 (
@@ -1960,6 +2343,7 @@ mod tests {
             version: LOCKFILE_VERSION,
             registry: "https://api.rrepo.org".to_string(),
             r: LockedR::default(),
+            sysreqs: LockedSystemRequirements::default(),
             roots: vec![],
             packages: BTreeMap::from([
                 (
@@ -2110,5 +2494,13 @@ mod tests {
             compiled_cache_key("jsonlite", "2.0.0", &source_runtime),
             compiled_cache_key("jsonlite", "2.0.0", &binary_runtime)
         );
+    }
+
+    fn empty_sysreq_db() -> SysreqDbSnapshot {
+        SysreqDbSnapshot {
+            commit: "test-commit".to_string(),
+            rules: vec![],
+            scripts: BTreeMap::new(),
+        }
     }
 }

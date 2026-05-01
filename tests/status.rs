@@ -31,7 +31,7 @@ fn runs_rpx_status_for_lockfile_drift() {
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
     let seed_lockfile = format!(
-        "mkdir -p {project_path} && cd {project_path} && cat > rpx.lock <<'EOF'\n{{\n  \"version\": 2,\n  \"registry\": \"https://api.rrepo.org\",\n  \"roots\": [],\n  \"packages\": {{}}\n}}\nEOF"
+        "mkdir -p {project_path} && cd {project_path} && cat > rpx.lock <<'EOF'\n{{\n  \"version\": 3,\n  \"registry\": \"https://api.rrepo.org\",\n  \"roots\": [],\n  \"packages\": {{}}\n}}\nEOF"
     );
     let (exit_code, stdout, stderr) = run_shell_command(&container, &seed_lockfile);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");

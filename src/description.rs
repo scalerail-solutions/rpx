@@ -106,6 +106,14 @@ impl RDescription {
             .unwrap_or_default()
     }
 
+    pub fn system_requirements(&self) -> Option<String> {
+        self.paragraph
+            .get("SystemRequirements")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    }
+
     pub fn remove_field(&mut self, field_name: &str) {
         self.paragraph.remove(field_name);
     }

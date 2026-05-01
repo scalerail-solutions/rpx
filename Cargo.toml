@@ -1,6 +1,6 @@
 [package]
 name = "rpx"
-version = "1.1.6"
+version = "1.2.0"
 edition = "2024"
 description = "Rust CLI for managing R package project dependencies"
 repository = "https://github.com/scalerail-solutions/rpx"
@@ -12,14 +12,17 @@ categories = ["command-line-utilities", "development-tools"]
 clap = { version = "4.6.0", features = ["derive"] }
 deb822-fast = "0.2.3"
 directories = "6.0.0"
+flate2 = "1.1.5"
 indicatif = "0.18.4"
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "linux-native", "windows-native"] }
 pubgrub = "0.3.0"
+regex = "1.12.2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rpassword = "7.3.1"
 r-description = "0.3.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+tar = "0.4.44"
 tracing = "0.1.41"
 tracing-indicatif = "0.3.13"
 tracing-subscriber = "0.3.19"

@@ -1,6 +1,6 @@
 use crate::registry::{
-    LatestVersionResponse, PackageVersionsResponse, RegistryClient, RepositoryPackagesResponse,
-    is_not_found_error, is_unauthorized_error,
+    PackageVersionsResponse, RegistryClient, RepositoryPackagesResponse, is_not_found_error,
+    is_unauthorized_error,
 };
 use keyring::Entry;
 use std::{
@@ -15,12 +15,6 @@ const KEYRING_SERVICE: &str = "rpx";
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RepositorySource {
     base_url: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct SourcedLatestVersion {
-    pub source: RepositorySource,
-    pub response: LatestVersionResponse,
 }
 
 #[derive(Debug, Clone)]
@@ -117,30 +111,6 @@ impl RepositorySet {
         self.with_authorized_client(source, |client| client.fetch_repository_packages())
     }
 
-    pub fn fetch_latest_version_with_retry(
-        &self,
-        package: &str,
-    ) -> Result<SourcedLatestVersion, String> {
-        for source in &self.sources {
-            match self.with_authorized_client(source, |client| {
-                client.fetch_latest_version_with_retry(package)
-            }) {
-                Ok(response) => {
-                    return Ok(SourcedLatestVersion {
-                        source: source.clone(),
-                        response,
-                    });
-                }
-                Err(error) if is_not_found_error(&error) => continue,
-                Err(error) => return Err(error),
-            }
-        }
-
-        Err(format!(
-            "package {package} not found in configured repositories"
-        ))
-    }
-
     pub fn fetch_package_versions_with_retry(
         &self,
         package: &str,
@@ -176,18 +146,6 @@ impl RepositorySet {
         })
     }
 
-    pub fn download_artifact(
-        &self,
-        source: &RepositorySource,
-        package: &str,
-        version: &str,
-        artifact: &crate::registry::ArtifactRequest,
-    ) -> Result<crate::registry::DownloadedArtifact, String> {
-        self.with_authorized_client(source, |client| {
-            client.download_artifact(package, version, artifact)
-        })
-    }
-
     pub fn download_artifact_with_progress(
         &self,
         source: &RepositorySource,
@@ -203,10 +161,6 @@ impl RepositorySet {
 
     pub fn has_stored_credential(&self, source: &RepositorySource) -> Result<bool, String> {
         Ok(self.credentials.get(source)?.is_some())
-    }
-
-    pub fn store_api_key(&self, source: &RepositorySource, token: &str) -> Result<(), String> {
-        self.credentials.set(source, token)
     }
 
     pub fn remove_api_key(&self, source: &RepositorySource) -> Result<(), String> {

@@ -77,7 +77,21 @@ pub enum Commands {
         about = "Install the locked package set",
         long_about = "Install the exact package set recorded in rpx.lock into the project library."
     )]
-    Sync,
+    Sync {
+        #[arg(
+            long,
+            conflicts_with = "install_only_system",
+            help = "Install missing system dependencies before syncing R packages"
+        )]
+        install_system: bool,
+
+        #[arg(
+            long,
+            conflicts_with = "install_system",
+            help = "Install only missing system dependencies and stop"
+        )]
+        install_only_system: bool,
+    },
 
     #[command(
         about = "Remove project library and caches",
