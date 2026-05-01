@@ -24,14 +24,6 @@ pub struct ResolutionRoot {
 pub struct IngestingResponse {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct LatestVersionResponse {
-    pub package: String,
-    pub version: String,
-    #[serde(rename = "sourceUrl")]
-    pub source_url: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PackageVersionsResponse {
     pub package: String,
     pub versions: Vec<VersionSummary>,
@@ -59,13 +51,6 @@ pub struct VersionSummary {
     pub version: String,
     #[serde(rename = "sourceUrl")]
     pub source_url: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(untagged)]
-enum LatestVersionEnvelope {
-    Complete(LatestVersionResponse),
-    Ingesting(IngestingResponse),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -100,12 +85,7 @@ impl Default for PollConfig {
     }
 }
 
-impl PollConfig {
-    #[cfg(test)]
-    pub fn from_delays(delays: Vec<Duration>) -> Self {
-        Self { delays }
-    }
-}
+impl PollConfig {}
 
 #[derive(Debug)]
 pub struct RegistryClient {
@@ -150,10 +130,6 @@ impl RegistryClient {
         Self::with_token_and_poll_config(base_url, token, PollConfig::default())
     }
 
-    pub fn with_poll_config(base_url: impl AsRef<str>, poll_config: PollConfig) -> Self {
-        Self::with_token_and_poll_config(base_url, None, poll_config)
-    }
-
     pub fn with_token_and_poll_config(
         base_url: impl AsRef<str>,
         token: Option<String>,
@@ -177,15 +153,6 @@ impl RegistryClient {
         }
     }
 
-    #[cfg(test)]
-    fn with_cache_ttl(base_url: impl AsRef<str>, ttl: Duration) -> Self {
-        Self::with_config(base_url, None, PollConfig::default(), ttl)
-    }
-
-    pub fn base_url(&self) -> &str {
-        &self.base_url
-    }
-
     pub fn fetch_repository_packages(&self) -> Result<RepositoryPackagesResponse, String> {
         let response = self
             .request(reqwest::Method::GET, format!("{}/packages", self.base_url))
@@ -193,47 +160,6 @@ impl RegistryClient {
             .map_err(|error| format!("failed to contact registry: {error}"))?;
 
         decode_json_response(response, "failed to decode repository packages response")
-    }
-
-    #[cfg(test)]
-    fn fetch_latest_version(&self, package: &str) -> Result<LatestVersionResponse, String> {
-        match self.fetch_latest_version_once(package)? {
-            LatestVersionEnvelope::Complete(response) => Ok(response),
-            LatestVersionEnvelope::Ingesting(_) => {
-                Err("registry is still hydrating dependencies; wait a bit and retry".to_string())
-            }
-        }
-    }
-
-    pub fn fetch_latest_version_with_retry(
-        &self,
-        package: &str,
-    ) -> Result<LatestVersionResponse, String> {
-        for (attempt, delay) in self.poll_config.delays.iter().enumerate() {
-            match self.fetch_latest_version_once(package)? {
-                LatestVersionEnvelope::Complete(response) => return Ok(response),
-                LatestVersionEnvelope::Ingesting(_) => {
-                    if attempt == self.poll_config.delays.len() - 1 {
-                        break;
-                    }
-                    thread::sleep(*delay);
-                }
-            }
-        }
-
-        Err("registry is still hydrating dependencies; wait a bit and retry".to_string())
-    }
-
-    fn fetch_latest_version_once(&self, package: &str) -> Result<LatestVersionEnvelope, String> {
-        let response = self
-            .request(
-                reqwest::Method::GET,
-                format!("{}/packages/{package}/versions/latest", self.base_url),
-            )
-            .send()
-            .map_err(|error| format!("failed to contact registry: {error}"))?;
-
-        decode_json_response(response, "failed to decode latest version response")
     }
 
     #[cfg(test)]
@@ -389,15 +315,6 @@ impl RegistryClient {
             .join("descriptions")
             .join(package)
             .join(format!("{version}.dcf"))
-    }
-
-    pub fn download_artifact(
-        &self,
-        package: &str,
-        version: &str,
-        artifact: &ArtifactRequest,
-    ) -> Result<DownloadedArtifact, String> {
-        self.download_artifact_with_progress(package, version, artifact, |_| {})
     }
 
     pub fn download_artifact_with_progress(
@@ -635,14 +552,6 @@ mod tests {
 }"#
     }
 
-    fn sample_latest_version_body() -> &'static str {
-        r#"{
-  "package": "dplyr",
-  "version": "1.1.4",
-  "sourceUrl": "https://api.rrepo.org/packages/dplyr/versions/1.1.4/source"
-}"#
-    }
-
     fn sample_package_versions_body() -> &'static str {
         r#"{
   "package": "dplyr",
@@ -670,59 +579,6 @@ mod tests {
         if path.exists() {
             fs::remove_dir_all(path).expect("metadata cache should be removable");
         }
-    }
-
-    #[test]
-    fn fetches_latest_package_version() {
-        let mut server = Server::new();
-        let mock = server
-            .mock("GET", "/packages/dplyr/versions/latest")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(sample_latest_version_body())
-            .create();
-
-        let client = RegistryClient::new(server.url());
-        let response = client
-            .fetch_latest_version("dplyr")
-            .expect("latest version fetch should succeed");
-
-        mock.assert();
-        assert_eq!(response.version, "1.1.4");
-        assert_eq!(
-            response.source_url,
-            "https://api.rrepo.org/packages/dplyr/versions/1.1.4/source"
-        );
-    }
-
-    #[test]
-    fn polls_until_latest_version_is_ready() {
-        let mut server = Server::new();
-        let _first = server
-            .mock("GET", "/packages/dplyr/versions/latest")
-            .with_status(202)
-            .with_header("content-type", "application/json")
-            .with_body(sample_ingesting_body())
-            .expect(1)
-            .create();
-        let second = server
-            .mock("GET", "/packages/dplyr/versions/latest")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(sample_latest_version_body())
-            .expect(1)
-            .create();
-
-        let client = RegistryClient::with_poll_config(
-            server.url(),
-            PollConfig::from_delays(vec![Duration::ZERO, Duration::ZERO, Duration::ZERO]),
-        );
-        let response = client
-            .fetch_latest_version_with_retry("dplyr")
-            .expect("latest version fetch should succeed");
-
-        second.assert();
-        assert_eq!(response.version, "1.1.4");
     }
 
     #[test]
@@ -764,9 +620,13 @@ mod tests {
             .expect(1)
             .create();
 
-        let client = RegistryClient::with_poll_config(
+        let client = RegistryClient::with_config(
             server.url(),
-            PollConfig::from_delays(vec![Duration::ZERO, Duration::ZERO, Duration::ZERO]),
+            None,
+            PollConfig {
+                delays: vec![Duration::ZERO, Duration::ZERO, Duration::ZERO],
+            },
+            VERSION_CACHE_TTL,
         );
         let response = client
             .fetch_package_versions_with_retry("dplyr")
@@ -798,7 +658,7 @@ mod tests {
 
         mock.assert();
         assert_eq!(first, second);
-        clear_registry_metadata_cache(client.base_url());
+        clear_registry_metadata_cache(&client.base_url);
     }
 
     #[test]
@@ -813,7 +673,8 @@ mod tests {
             .expect(2)
             .create();
 
-        let client = RegistryClient::with_cache_ttl(server.url(), Duration::ZERO);
+        let client =
+            RegistryClient::with_config(server.url(), None, PollConfig::default(), Duration::ZERO);
         let first = client
             .fetch_package_versions_with_retry("dplyr")
             .expect("initial package versions fetch should succeed");
@@ -823,7 +684,7 @@ mod tests {
 
         mock.assert();
         assert_eq!(first, second);
-        clear_registry_metadata_cache(client.base_url());
+        clear_registry_metadata_cache(&client.base_url);
     }
 
     #[test]
@@ -851,7 +712,7 @@ mod tests {
         mock.assert();
         assert_eq!(first, second);
         assert!(first.contains("package missingpkg not found"));
-        clear_registry_metadata_cache(client.base_url());
+        clear_registry_metadata_cache(&client.base_url);
     }
 
     #[test]
@@ -896,7 +757,7 @@ mod tests {
 
         mock.assert();
         assert_eq!(first, second);
-        clear_registry_metadata_cache(client.base_url());
+        clear_registry_metadata_cache(&client.base_url);
     }
 
     #[test]
@@ -917,9 +778,13 @@ mod tests {
             .expect(1)
             .create();
 
-        let client = RegistryClient::with_poll_config(
+        let client = RegistryClient::with_config(
             server.url(),
-            PollConfig::from_delays(vec![Duration::ZERO, Duration::ZERO, Duration::ZERO]),
+            None,
+            PollConfig {
+                delays: vec![Duration::ZERO, Duration::ZERO, Duration::ZERO],
+            },
+            VERSION_CACHE_TTL,
         );
         let response = client
             .fetch_description_with_retry("dplyr", "1.1.4")
@@ -927,53 +792,6 @@ mod tests {
 
         second.assert();
         assert!(response.contains("Version: 1.1.4"));
-    }
-
-    #[test]
-    fn returns_friendly_error_when_latest_version_keeps_ingesting() {
-        let mut server = Server::new();
-        let mock = server
-            .mock("GET", "/packages/dplyr/versions/latest")
-            .with_status(202)
-            .with_header("content-type", "application/json")
-            .with_body(sample_ingesting_body())
-            .expect(3)
-            .create();
-
-        let client = RegistryClient::with_poll_config(
-            server.url(),
-            PollConfig::from_delays(vec![Duration::ZERO, Duration::ZERO, Duration::ZERO]),
-        );
-        let error = client
-            .fetch_latest_version_with_retry("dplyr")
-            .expect_err("latest version fetch should time out");
-
-        mock.assert();
-        assert_eq!(
-            error,
-            "registry is still hydrating dependencies; wait a bit and retry"
-        );
-    }
-
-    #[test]
-    fn surfaces_registry_server_errors() {
-        let mut server = Server::new();
-        let mock = server
-            .mock("GET", "/packages/dplyr/versions/latest")
-            .with_status(500)
-            .with_body("registry exploded")
-            .create();
-
-        let client = RegistryClient::with_poll_config(
-            server.url(),
-            PollConfig::from_delays(vec![Duration::ZERO]),
-        );
-        let error = client
-            .fetch_latest_version_with_retry("dplyr")
-            .expect_err("latest version fetch should fail");
-
-        mock.assert();
-        assert!(error.contains("registry error (500 Internal Server Error): registry exploded"));
     }
 
     #[test]
@@ -990,7 +808,7 @@ mod tests {
 
         let client = RegistryClient::new(server.url());
         let artifact = client
-            .download_artifact(
+            .download_artifact_with_progress(
                 "digest",
                 "0.6.37",
                 &ArtifactRequest {
@@ -998,6 +816,7 @@ mod tests {
                     url: format!("{}/packages/digest/versions/0.6.37/source", server.url()),
                     cache_file_name: "digest_0.6.37_download.tar.gz".to_string(),
                 },
+                |_| {},
             )
             .expect("download should succeed");
 
@@ -1020,7 +839,7 @@ mod tests {
 
         let client = RegistryClient::new(server.url());
         let error = client
-            .download_artifact(
+            .download_artifact_with_progress(
                 "digest",
                 "0.6.37",
                 &ArtifactRequest {
@@ -1028,6 +847,7 @@ mod tests {
                     url: format!("{}/packages/digest/versions/0.6.37/source", server.url()),
                     cache_file_name: "digest_0.6.37_error.tar.gz".to_string(),
                 },
+                |_| {},
             )
             .expect_err("download should fail");
 
@@ -1054,7 +874,7 @@ mod tests {
 
         let client = RegistryClient::new(server.url());
         let artifact = client
-            .download_artifact(
+            .download_artifact_with_progress(
                 "digest",
                 "0.6.37",
                 &ArtifactRequest {
@@ -1065,6 +885,7 @@ mod tests {
                     ),
                     cache_file_name: "digest_0.6.37.zip".to_string(),
                 },
+                |_| {},
             )
             .expect("download should succeed");
 
