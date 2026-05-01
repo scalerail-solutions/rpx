@@ -86,6 +86,7 @@ pub(crate) struct SystemDependencyPlan {
     pub install_supported: bool,
     pub can_auto_install: bool,
     pub installed_query_error: Option<String>,
+    pub needs_metadata_refresh: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -233,10 +234,14 @@ pub(crate) fn resolve_plan(
     let install_supported = package_manager_for_host(&host).is_some();
     let can_auto_install = install_supported && install_prefix().is_some();
 
-    let (missing_packages, installed_query_error) =
+    let (missing_packages, installed_query_error, needs_metadata_refresh) =
         match missing_packages_for_host(&host, &install_packages) {
-            Ok(missing_packages) => (missing_packages, None),
-            Err(error) => (install_packages.clone(), Some(error)),
+            Ok(missing_packages) => (missing_packages, None, false),
+            Err(error) => (
+                install_packages.clone(),
+                Some(error.to_string()),
+                error.needs_metadata_refresh(),
+            ),
         };
 
     SystemDependencyPlan {
@@ -250,6 +255,7 @@ pub(crate) fn resolve_plan(
         install_supported,
         can_auto_install,
         installed_query_error,
+        needs_metadata_refresh,
     }
 }
 
@@ -314,6 +320,30 @@ pub(crate) fn install(plan: &SystemDependencyPlan) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+pub(crate) fn refresh_metadata(plan: &SystemDependencyPlan) -> Result<(), String> {
+    let Some(command) = package_update_command(&plan.host) else {
+        return Err(format!(
+            "automatic system dependency installation is not supported on {}",
+            plan.host.label()
+        ));
+    };
+    let Some(prefix) = install_prefix() else {
+        return Err(
+            "need root privileges or passwordless sudo to install system dependencies".to_string(),
+        );
+    };
+
+    run_shell_command(&prefix, &command)
+}
+
+pub(crate) fn refresh_preview_command(plan: &SystemDependencyPlan) -> Option<String> {
+    package_update_command(&plan.host).map(prefix_command)
+}
+
+pub(crate) fn recheck_missing_packages(plan: &SystemDependencyPlan) -> Result<Vec<String>, String> {
+    missing_packages_for_host(&plan.host, &plan.install_packages).map_err(|error| error.to_string())
 }
 
 impl HostPlatform {
@@ -546,13 +576,13 @@ fn installed_packages(host: &HostPlatform) -> Result<BTreeSet<String>, String> {
 fn missing_packages_for_host(
     host: &HostPlatform,
     packages: &[String],
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, AvailabilityCheckError> {
     if matches!(host, HostPlatform::Linux { distribution, .. } if distribution == "ubuntu" || distribution == "debian")
     {
         return apt_missing_packages(packages);
     }
 
-    let installed = installed_packages(host)?;
+    let installed = installed_packages(host).map_err(AvailabilityCheckError::other)?;
     Ok(packages
         .iter()
         .filter(|package| !installed.contains(*package))
@@ -560,12 +590,12 @@ fn missing_packages_for_host(
         .collect())
 }
 
-fn apt_missing_packages(packages: &[String]) -> Result<Vec<String>, String> {
+fn apt_missing_packages(packages: &[String]) -> Result<Vec<String>, AvailabilityCheckError> {
     let output = apt_simulation_output(packages)?;
     Ok(apt_simulation_missing_packages(packages, &output))
 }
 
-fn apt_simulation_output(packages: &[String]) -> Result<String, String> {
+fn apt_simulation_output(packages: &[String]) -> Result<String, AvailabilityCheckError> {
     let output = Command::new("apt-get")
         .arg("-s")
         .arg("install")
@@ -573,17 +603,15 @@ fn apt_simulation_output(packages: &[String]) -> Result<String, String> {
         .arg("--no-install-recommends")
         .args(packages)
         .output()
-        .map_err(|error| format!("failed to inspect apt packages: {error}"))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "failed to inspect apt packages ({})",
-            output.status
-        ));
-    }
+        .map_err(|error| AvailabilityCheckError::other(format!("failed to inspect apt packages: {error}")))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}\n{stderr}");
+
+    if !output.status.success() {
+        return Err(classify_apt_failure(output.status.code(), &combined));
+    }
     Ok(format!("{stdout}\n{stderr}"))
 }
 
@@ -631,6 +659,60 @@ fn parse_apt_installed_package(line: &str) -> Option<String> {
     Some(package.to_string())
 }
 
+#[derive(Debug, Clone)]
+struct AvailabilityCheckError {
+    message: String,
+    needs_metadata_refresh: bool,
+}
+
+impl AvailabilityCheckError {
+    fn other(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            needs_metadata_refresh: false,
+        }
+    }
+
+    fn metadata_refresh(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            needs_metadata_refresh: true,
+        }
+    }
+
+    fn needs_metadata_refresh(&self) -> bool {
+        self.needs_metadata_refresh
+    }
+}
+
+impl std::fmt::Display for AvailabilityCheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+fn classify_apt_failure(exit_code: Option<i32>, output: &str) -> AvailabilityCheckError {
+    let trimmed = output.trim();
+    if apt_failure_likely_needs_metadata_refresh(trimmed) {
+        return AvailabilityCheckError::metadata_refresh(format!(
+            "failed to inspect apt packages (exit status: {})",
+            exit_code.unwrap_or(1)
+        ));
+    }
+
+    AvailabilityCheckError::other(format!(
+        "failed to inspect apt packages (exit status: {}): {trimmed}",
+        exit_code.unwrap_or(1)
+    ))
+}
+
+fn apt_failure_likely_needs_metadata_refresh(output: &str) -> bool {
+    let lowered = output.to_ascii_lowercase();
+    lowered.contains("unable to locate package")
+        || lowered.contains("has no installation candidate")
+        || lowered.contains("package information")
+}
+
 fn package_manager_for_host(host: &HostPlatform) -> Option<&'static str> {
     match host {
         HostPlatform::Linux { distribution, .. }
@@ -654,6 +736,31 @@ fn package_manager_for_host(host: &HostPlatform) -> Option<&'static str> {
             Some("zypper")
         }
         HostPlatform::Linux { distribution, .. } if distribution == "alpine" => Some("apk"),
+        _ => None,
+    }
+}
+
+fn package_update_command(host: &HostPlatform) -> Option<String> {
+    match host {
+        HostPlatform::Linux { distribution, .. }
+            if distribution == "ubuntu" || distribution == "debian" => {
+                Some("apt-get update".to_string())
+            }
+        HostPlatform::Linux { distribution, .. }
+            if distribution == "rockylinux" || distribution == "fedora" => {
+                Some("dnf makecache".to_string())
+            }
+        HostPlatform::Linux { distribution, .. }
+            if distribution == "centos" || distribution == "redhat" => {
+                Some("yum makecache".to_string())
+            }
+        HostPlatform::Linux { distribution, .. }
+            if distribution == "opensuse" || distribution == "sle" => {
+                Some("zypper --non-interactive refresh".to_string())
+            }
+        HostPlatform::Linux { distribution, .. } if distribution == "alpine" => {
+            Some("apk update".to_string())
+        }
         _ => None,
     }
 }
@@ -849,7 +956,7 @@ fn now_unix() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::apt_simulation_missing_packages;
+    use super::{apt_failure_likely_needs_metadata_refresh, apt_simulation_missing_packages};
 
     #[test]
     fn apt_simulation_recognizes_alias_as_already_satisfied() {
@@ -899,5 +1006,15 @@ Conf libxml2-dev (2.14.3+dfsg-1 Debian:testing [amd64])\n";
             ),
             vec!["libxml2-dev".to_string()]
         );
+    }
+
+    #[test]
+    fn detects_metadata_refresh_needed_for_apt_resolution_failure() {
+        let output = "Reading package lists... Done\n\
+Building dependency tree... Done\n\
+Reading state information... Done\n\
+E: Unable to locate package libxml2-dev\n";
+
+        assert!(apt_failure_likely_needs_metadata_refresh(output));
     }
 }

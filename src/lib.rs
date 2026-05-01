@@ -47,6 +47,9 @@ use sysreqs::{
     SystemDependencyPlan, cached_latest_snapshot, current_host_platform,
     empty_snapshot as empty_sysreq_snapshot, install as install_system_dependencies,
     latest_snapshot as latest_sysreq_snapshot, preview_commands as sysreq_preview_commands,
+    refresh_metadata as refresh_system_metadata,
+    refresh_preview_command as system_metadata_refresh_preview,
+    recheck_missing_packages as recheck_system_missing_packages,
     resolve_plan as resolve_system_plan,
 };
 use ui::{InstallKind, SyncUi};
@@ -1176,6 +1179,7 @@ fn system_plan_without_db(lockfile: &Lockfile) -> SystemDependencyPlan {
         install_supported: false,
         can_auto_install: false,
         installed_query_error: None,
+        needs_metadata_refresh: false,
     }
 }
 
@@ -1186,6 +1190,7 @@ fn handle_system_requirements(
 ) -> bool {
     let explicit_install = install_system || install_only_system;
     let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    let mut plan = plan.clone();
 
     if !plan.unsupported_rules.is_empty() {
         eprintln!(
@@ -1195,8 +1200,35 @@ fn handle_system_requirements(
         );
     }
 
+    if plan.needs_metadata_refresh && explicit_install {
+        if interactive {
+            prompt_for_metadata_refresh(&plan);
+        }
+
+        refresh_system_metadata(&plan)
+            .unwrap_or_else(|error| panic!("failed to refresh package metadata: {error}"));
+        match recheck_system_missing_packages(&plan) {
+            Ok(missing_packages) => {
+                plan.missing_packages = missing_packages;
+                plan.installed_query_error = None;
+                plan.needs_metadata_refresh = false;
+            }
+            Err(error) => {
+                plan.installed_query_error = Some(error);
+                plan.needs_metadata_refresh = false;
+            }
+        }
+    }
+
     if let Some(error) = &plan.installed_query_error {
-        eprintln!("warning: {error}");
+        if explicit_install {
+            eprintln!("rpx could not verify system package availability with apt.");
+            eprintln!();
+            eprintln!("Apt reported:");
+            eprintln!("{error}");
+        } else {
+            eprintln!("warning: {error}");
+        }
     }
 
     if plan.missing_packages.is_empty() {
@@ -1206,14 +1238,24 @@ fn handle_system_requirements(
         return !install_only_system;
     }
 
-    eprintln!(
-        "warning: missing system packages for {}: {}",
-        plan.host.label(),
-        plan.missing_packages.join(", ")
-    );
-    let preview = sysreq_preview_commands(plan);
+    if plan.installed_query_error.is_some() {
+        print_system_package_summary(
+            "Requested system packages for this project:",
+            &plan.install_packages,
+        );
+    } else {
+        print_system_package_summary(
+            &format!("Missing system packages for {}:", plan.host.label()),
+            &plan.missing_packages,
+        );
+    }
+    let preview = sysreq_preview_commands(&plan);
     if !preview.is_empty() {
-        eprintln!("System install commands:");
+        if plan.installed_query_error.is_some() {
+            eprintln!("rpx can still try to install them now:");
+        } else {
+            eprintln!("rpx can run:");
+        }
         for command in &preview {
             eprintln!("- {command}");
         }
@@ -1225,7 +1267,7 @@ fn handle_system_requirements(
     }
 
     if explicit_install {
-        install_system_dependencies(plan)
+        install_system_dependencies(&plan)
             .unwrap_or_else(|error| panic!("failed to install system dependencies: {error}"));
         if install_only_system {
             println!("Installed system dependencies");
@@ -1241,7 +1283,7 @@ fn handle_system_requirements(
 
     match prompt_for_system_dependency_action() {
         SyncSystemChoice::InstallAndContinue => {
-            install_system_dependencies(plan)
+            install_system_dependencies(&plan)
                 .unwrap_or_else(|error| panic!("failed to install system dependencies: {error}"));
             true
         }
@@ -1264,6 +1306,42 @@ fn prompt_for_install_confirmation() -> bool {
     }
 
     matches!(input.trim(), "y" | "Y" | "yes" | "YES" | "Yes")
+}
+
+fn print_system_package_summary(title: &str, packages: &[String]) {
+    eprintln!("{title}");
+    let shown = packages.iter().take(8).collect::<Vec<_>>();
+    for package in shown {
+        eprintln!("- {package}");
+    }
+    if packages.len() > 8 {
+        eprintln!("- ... and {} more", packages.len() - 8);
+    }
+}
+
+fn prompt_for_metadata_refresh(plan: &SystemDependencyPlan) {
+    eprintln!("rpx could not verify which system packages are missing yet.");
+    eprintln!();
+    eprintln!("rpx can run:");
+    if let Some(command) = system_metadata_refresh_preview(plan) {
+        eprintln!("- {command}");
+    }
+    eprintln!("to refresh apt package information and check what is missing.");
+    eprintln!();
+    eprintln!("Run package metadata refresh now? [y/N]");
+    eprint!("> ");
+    std::io::stderr().flush().expect("failed to flush prompt");
+
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        println!("Canceled");
+        std::process::exit(1);
+    }
+
+    if !matches!(input.trim(), "y" | "Y" | "yes" | "YES" | "Yes") {
+        println!("Canceled");
+        std::process::exit(1);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
