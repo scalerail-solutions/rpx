@@ -47,9 +47,9 @@ use sysreqs::{
     SystemDependencyPlan, cached_latest_snapshot, current_host_platform,
     empty_snapshot as empty_sysreq_snapshot, install as install_system_dependencies,
     latest_snapshot as latest_sysreq_snapshot, preview_commands as sysreq_preview_commands,
+    recheck_missing_packages as recheck_system_missing_packages,
     refresh_metadata as refresh_system_metadata,
     refresh_preview_command as system_metadata_refresh_preview,
-    recheck_missing_packages as recheck_system_missing_packages,
     resolve_plan as resolve_system_plan,
 };
 use ui::{InstallKind, SyncUi};
@@ -1205,6 +1205,7 @@ fn handle_system_requirements(
             prompt_for_metadata_refresh(&plan);
         }
 
+        eprintln!("Refreshing system package information...");
         refresh_system_metadata(&plan)
             .unwrap_or_else(|error| panic!("failed to refresh package metadata: {error}"));
         match recheck_system_missing_packages(&plan) {
@@ -1267,10 +1268,11 @@ fn handle_system_requirements(
     }
 
     if explicit_install {
+        eprintln!("Installing system dependencies...");
         install_system_dependencies(&plan)
             .unwrap_or_else(|error| panic!("failed to install system dependencies: {error}"));
         if install_only_system {
-            println!("Installed system dependencies");
+            println!("System dependency sync complete.");
             return false;
         }
         return true;
@@ -1283,6 +1285,7 @@ fn handle_system_requirements(
 
     match prompt_for_system_dependency_action() {
         SyncSystemChoice::InstallAndContinue => {
+            eprintln!("Installing system dependencies...");
             install_system_dependencies(&plan)
                 .unwrap_or_else(|error| panic!("failed to install system dependencies: {error}"));
             true

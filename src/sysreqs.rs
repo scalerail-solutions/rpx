@@ -603,7 +603,9 @@ fn apt_simulation_output(packages: &[String]) -> Result<String, AvailabilityChec
         .arg("--no-install-recommends")
         .args(packages)
         .output()
-        .map_err(|error| AvailabilityCheckError::other(format!("failed to inspect apt packages: {error}")))?;
+        .map_err(|error| {
+            AvailabilityCheckError::other(format!("failed to inspect apt packages: {error}"))
+        })?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -743,21 +745,25 @@ fn package_manager_for_host(host: &HostPlatform) -> Option<&'static str> {
 fn package_update_command(host: &HostPlatform) -> Option<String> {
     match host {
         HostPlatform::Linux { distribution, .. }
-            if distribution == "ubuntu" || distribution == "debian" => {
-                Some("apt-get update".to_string())
-            }
+            if distribution == "ubuntu" || distribution == "debian" =>
+        {
+            Some("apt-get update".to_string())
+        }
         HostPlatform::Linux { distribution, .. }
-            if distribution == "rockylinux" || distribution == "fedora" => {
-                Some("dnf makecache".to_string())
-            }
+            if distribution == "rockylinux" || distribution == "fedora" =>
+        {
+            Some("dnf makecache".to_string())
+        }
         HostPlatform::Linux { distribution, .. }
-            if distribution == "centos" || distribution == "redhat" => {
-                Some("yum makecache".to_string())
-            }
+            if distribution == "centos" || distribution == "redhat" =>
+        {
+            Some("yum makecache".to_string())
+        }
         HostPlatform::Linux { distribution, .. }
-            if distribution == "opensuse" || distribution == "sle" => {
-                Some("zypper --non-interactive refresh".to_string())
-            }
+            if distribution == "opensuse" || distribution == "sle" =>
+        {
+            Some("zypper --non-interactive refresh".to_string())
+        }
         HostPlatform::Linux { distribution, .. } if distribution == "alpine" => {
             Some("apk update".to_string())
         }
@@ -847,14 +853,39 @@ fn run_shell_command(prefix: &[String], command: &str) -> Result<(), String> {
         process
     };
 
-    let status = process
-        .status()
+    let output = process
+        .output()
         .map_err(|error| format!("failed to run system command `{command}`: {error}"))?;
-    if status.success() {
+    if output.status.success() {
         return Ok(());
     }
 
-    Err(format!("system command failed ({status}): {command}"))
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = [stdout.as_ref().trim(), stderr.as_ref().trim()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let tail = command_output_tail(&combined, 40);
+
+    if tail.is_empty() {
+        return Err(format!(
+            "system command failed ({}): {command}",
+            output.status
+        ));
+    }
+
+    Err(format!(
+        "system command failed ({}): {command}\n{tail}",
+        output.status
+    ))
+}
+
+fn command_output_tail(output: &str, max_lines: usize) -> String {
+    let lines = output.lines().collect::<Vec<_>>();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join("\n")
 }
 
 fn prefix_command(command: String) -> String {
