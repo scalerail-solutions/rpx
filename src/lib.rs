@@ -2,6 +2,7 @@ use clap::Parser;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     env, fs,
+    io::{IsTerminal, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
     thread,
@@ -16,12 +17,14 @@ mod r;
 mod registry;
 mod repository;
 mod resolver;
+mod sysreqs;
 mod ui;
 
 use cli::{Cli, Commands, RepoCommands};
 use description::{DescriptionExt, init_description, read_description, write_description};
 use lockfile::{
-    LOCKFILE_VERSION, LockedR, Lockfile, read_lockfile, read_lockfile_optional, write_lockfile,
+    LOCKFILE_VERSION, LockedR, LockedSystemRequirements, Lockfile, read_lockfile,
+    read_lockfile_optional, write_lockfile,
 };
 use project::{
     build_temp_library_path, cache_dir_path, compiled_cache_package_path, project_library_path,
@@ -40,6 +43,11 @@ use repository::{
     RepositorySet, RepositorySource, normalize_repository_url, repository_source_from_package_url,
 };
 use resolver::{ResolvedPackage, is_base_package, resolve_from_registry};
+use sysreqs::{
+    SystemDependencyPlan, current_host_platform, install as install_system_dependencies,
+    latest_snapshot as latest_sysreq_snapshot, preview_commands as sysreq_preview_commands,
+    resolve_plan as resolve_system_plan,
+};
 use ui::{InstallKind, SyncUi};
 
 const SYNC_WORKERS: usize = 4;
@@ -54,7 +62,10 @@ pub fn run() {
         Commands::Run { command } => cmd_run(&command),
         Commands::Lock => cmd_lock(),
         Commands::Status => cmd_status(),
-        Commands::Sync => cmd_sync(),
+        Commands::Sync {
+            install_system,
+            install_only_system,
+        } => cmd_sync(install_system, install_only_system),
         Commands::Clean => cmd_clean(),
         Commands::Repo { command } => cmd_repo(command),
     }
@@ -83,6 +94,8 @@ fn cmd_add(packages: &[String]) {
     }
 
     if !new_packages.is_empty() {
+        let sysreq_db =
+            latest_sysreq_snapshot().expect("failed to load system requirements database");
         let resolved_addition = resolve_additions_from_latest(
             &project.description,
             lockfile.as_ref(),
@@ -105,6 +118,7 @@ fn cmd_add(packages: &[String]) {
             project.description.resolution_roots(),
             &default_registry_base_url(),
             &resolved_addition.resolved,
+            &sysreq_db,
         ));
     }
 
@@ -114,7 +128,7 @@ fn cmd_add(packages: &[String]) {
     } else {
         let _ = lock_from_description();
     }
-    let _ = sync_from_lockfile();
+    let _ = sync_from_lockfile(false, false);
     println!("Added {}", packages.join(", "));
 }
 
@@ -236,7 +250,7 @@ fn cmd_remove(packages: &[String]) {
     }
 
     let _ = lock_from_description();
-    let _ = sync_from_lockfile();
+    let _ = sync_from_lockfile(false, false);
 
     if !removed.is_empty() {
         println!("Removed {}", removed.join(", "));
@@ -272,8 +286,11 @@ fn cmd_lock() {
     }
 }
 
-fn cmd_sync() {
-    let outcome = sync_from_lockfile();
+fn cmd_sync(install_system: bool, install_only_system: bool) {
+    let outcome = sync_from_lockfile(install_system, install_only_system);
+    if install_only_system {
+        return;
+    }
     if outcome.installed == 0 && outcome.removed == 0 {
         println!("Project library is already in sync");
     } else {
@@ -329,6 +346,7 @@ fn cmd_status() {
         .collect::<std::collections::BTreeMap<_, _>>();
     let locked_names = locked_package_names(&lockfile);
     let runtime_status = runtime_status(&lockfile);
+    let system_plan = system_plan_from_lockfile(&lockfile).ok();
 
     let missing_from_lockfile = manifest_requirements
         .difference(&lock_requirements)
@@ -369,6 +387,10 @@ fn cmd_status() {
         && extra_in_library.is_empty()
         && version_mismatches.is_empty()
         && runtime_status.missing_base_packages.is_empty()
+        && system_plan
+            .as_ref()
+            .map(|plan| plan.missing_packages.is_empty() && plan.unsupported_rules.is_empty())
+            .unwrap_or(true)
     {
         print_runtime_version_warning(&runtime_status);
         println!("Project is in sync");
@@ -380,6 +402,10 @@ fn cmd_status() {
         || !extra_in_library.is_empty()
         || !version_mismatches.is_empty();
     let runtime_out_of_date = !runtime_status.missing_base_packages.is_empty();
+    let system_out_of_date = system_plan
+        .as_ref()
+        .map(|plan| !plan.missing_packages.is_empty() || !plan.unsupported_rules.is_empty())
+        .unwrap_or(false);
 
     if lockfile_out_of_date && library_out_of_date {
         println!("Project is out of sync");
@@ -391,6 +417,8 @@ fn cmd_status() {
         println!("Run: rpx lock");
     } else if runtime_out_of_date {
         println!("R runtime is out of sync");
+    } else if system_out_of_date {
+        println!("System dependencies are out of sync");
     } else {
         println!("Project library is out of sync");
         println!();
@@ -416,6 +444,16 @@ fn cmd_status() {
         "R runtime is missing locked base packages:",
         &runtime_status.missing_base_packages,
     );
+    if let Some(plan) = system_plan {
+        print_status_group(
+            "Missing system packages for this host:",
+            &plan.missing_packages,
+        );
+        print_status_group(
+            "System requirement rules without a host mapping:",
+            &plan.unsupported_rules,
+        );
+    }
 
     std::process::exit(1);
 }
@@ -671,9 +709,10 @@ fn lock_from_description() -> LockOutcome {
     let registry = default_registry_base_url();
     let repositories = configured_repositories(&project);
     let existing_lockfile = read_lockfile_optional().expect("failed to read lockfile");
+    let sysreq_db = latest_sysreq_snapshot().expect("failed to load system requirements database");
 
     if roots.is_empty() {
-        let lockfile = lockfile_from_resolution(vec![], &registry, &[]);
+        let lockfile = lockfile_from_resolution(vec![], &registry, &[], &sysreq_db);
         let changed = existing_lockfile.as_ref() != Some(&lockfile);
         write_lockfile(lockfile);
         return LockOutcome { changed };
@@ -682,13 +721,13 @@ fn lock_from_description() -> LockOutcome {
     let resolved = resolve_from_registry(&repositories, &roots, &BTreeMap::new())
         .unwrap_or_else(|error| panic!("failed to resolve package set from registry: {error}"));
 
-    let lockfile = lockfile_from_resolution(roots, &registry, &resolved);
+    let lockfile = lockfile_from_resolution(roots, &registry, &resolved, &sysreq_db);
     let changed = existing_lockfile.as_ref() != Some(&lockfile);
     write_lockfile(lockfile);
     LockOutcome { changed }
 }
 
-fn sync_from_lockfile() -> SyncOutcome {
+fn sync_from_lockfile(install_system: bool, install_only_system: bool) -> SyncOutcome {
     let project = read_description().expect("failed to read DESCRIPTION");
     let manifest_requirements = project
         .description
@@ -698,6 +737,15 @@ fn sync_from_lockfile() -> SyncOutcome {
     let lockfile = read_lockfile().expect("failed to read lockfile");
     validate_lockfile_version_for_sync(&lockfile);
     validate_runtime_for_sync(&lockfile);
+    let system_plan = system_plan_from_lockfile(&lockfile).unwrap_or_else(|error| {
+        eprintln!("warning: failed to prepare system dependency plan: {error}");
+        system_plan_without_db(&lockfile)
+    });
+    let proceed_with_r =
+        handle_system_requirements(&system_plan, install_system, install_only_system);
+    if install_only_system || !proceed_with_r {
+        return SyncOutcome::default();
+    }
     let lock_requirements = lockfile
         .roots
         .iter()
@@ -935,8 +983,10 @@ fn lockfile_from_resolution(
     roots: Vec<ResolutionRoot>,
     registry: &str,
     resolved: &[ResolvedPackage],
+    sysreq_db: &sysreqs::SysreqDbSnapshot,
 ) -> Lockfile {
     let required_base_packages = locked_base_packages(&roots, resolved);
+    let sysreqs = locked_system_requirements(resolved, sysreq_db);
     Lockfile {
         version: LOCKFILE_VERSION,
         registry: registry.to_string(),
@@ -944,6 +994,7 @@ fn lockfile_from_resolution(
             version: runtime_info().version,
             base_packages: required_base_packages,
         },
+        sysreqs,
         roots: roots
             .into_iter()
             .map(|root| lockfile::LockedRoot {
@@ -1072,6 +1123,149 @@ fn print_runtime_version_warning(status: &RuntimeStatus) {
     println!();
     println!("R runtime differs from lockfile:");
     println!("- {version_mismatch}");
+}
+
+fn system_plan_from_lockfile(lockfile: &Lockfile) -> Result<SystemDependencyPlan, String> {
+    if lockfile.sysreqs.db_commit.is_empty() {
+        return Ok(system_plan_without_db(lockfile));
+    }
+
+    let snapshot = sysreqs::snapshot_for_commit(&lockfile.sysreqs.db_commit)?;
+    Ok(resolve_system_plan(&snapshot, &lockfile.sysreqs.packages))
+}
+
+fn system_plan_without_db(lockfile: &Lockfile) -> SystemDependencyPlan {
+    SystemDependencyPlan {
+        host: current_host_platform(),
+        missing_packages: vec![],
+        install_packages: vec![],
+        pre_install_commands: vec![],
+        post_install_commands: vec![],
+        unsupported_rules: lockfile.sysreqs.rules.clone(),
+        package_rules: lockfile.sysreqs.packages.clone(),
+        install_supported: false,
+        can_auto_install: false,
+        installed_query_error: None,
+    }
+}
+
+fn handle_system_requirements(
+    plan: &SystemDependencyPlan,
+    install_system: bool,
+    install_only_system: bool,
+) -> bool {
+    if !plan.unsupported_rules.is_empty() {
+        eprintln!(
+            "warning: some system requirement rules do not have an install mapping for {}: {}",
+            plan.host.label(),
+            plan.unsupported_rules.join(", ")
+        );
+    }
+
+    if let Some(error) = &plan.installed_query_error {
+        eprintln!("warning: {error}");
+    }
+
+    if plan.missing_packages.is_empty() {
+        if install_only_system {
+            println!("System dependencies are already installed");
+        }
+        return !install_only_system;
+    }
+
+    eprintln!(
+        "warning: missing system packages for {}: {}",
+        plan.host.label(),
+        plan.missing_packages.join(", ")
+    );
+    let preview = sysreq_preview_commands(plan);
+    if !preview.is_empty() {
+        eprintln!("System install commands:");
+        for command in &preview {
+            eprintln!("- {command}");
+        }
+    }
+
+    if install_system || install_only_system {
+        install_system_dependencies(plan)
+            .unwrap_or_else(|error| panic!("failed to install system dependencies: {error}"));
+        if install_only_system {
+            println!("Installed system dependencies");
+            return false;
+        }
+        return true;
+    }
+
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        eprintln!("warning: continuing with R package sync without installing system dependencies");
+        return !install_only_system;
+    }
+
+    match prompt_for_system_dependency_action() {
+        SyncSystemChoice::InstallAndContinue => {
+            install_system_dependencies(plan)
+                .unwrap_or_else(|error| panic!("failed to install system dependencies: {error}"));
+            true
+        }
+        SyncSystemChoice::TryROnly => true,
+        SyncSystemChoice::Cancel => {
+            println!("Canceled");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncSystemChoice {
+    InstallAndContinue,
+    TryROnly,
+    Cancel,
+}
+
+fn prompt_for_system_dependency_action() -> SyncSystemChoice {
+    eprintln!("Choose an action:");
+    eprintln!("1. Install system deps and continue");
+    eprintln!("2. Try to install R packages only");
+    eprintln!("3. Cancel");
+    eprint!("> ");
+    std::io::stderr().flush().expect("failed to flush prompt");
+
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return SyncSystemChoice::TryROnly;
+    }
+
+    match input.trim() {
+        "1" | "y" | "Y" => SyncSystemChoice::InstallAndContinue,
+        "2" | "r" | "R" => SyncSystemChoice::TryROnly,
+        _ => SyncSystemChoice::Cancel,
+    }
+}
+
+fn locked_system_requirements(
+    resolved: &[ResolvedPackage],
+    sysreq_db: &sysreqs::SysreqDbSnapshot,
+) -> LockedSystemRequirements {
+    let packages = resolved
+        .iter()
+        .filter_map(|package| {
+            let rules = sysreqs::match_rules(package.system_requirements.as_deref(), sysreq_db);
+            (!rules.is_empty()).then(|| (package.name.clone(), rules))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let rules = packages
+        .values()
+        .flatten()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    LockedSystemRequirements {
+        db_commit: sysreq_db.commit.clone(),
+        rules,
+        packages,
+    }
 }
 
 fn validate_runtime_for_sync(lockfile: &Lockfile) {
@@ -1640,10 +1834,14 @@ mod tests {
     use crate::description::RDescription;
     use crate::{
         description::DescriptionExt,
-        lockfile::{LOCKFILE_VERSION, LockedDependency, LockedPackage, LockedR, Lockfile},
+        lockfile::{
+            LOCKFILE_VERSION, LockedDependency, LockedPackage, LockedR, LockedSystemRequirements,
+            Lockfile,
+        },
         r::RuntimeInfo,
         registry::ResolutionRoot,
         resolver::{ResolvedDependency, ResolvedPackage},
+        sysreqs::SysreqDbSnapshot,
     };
     use std::collections::BTreeMap;
     use std::{
@@ -1718,6 +1916,7 @@ mod tests {
                             max_version_exclusive: None,
                         },
                     ],
+                    system_requirements: None,
                 },
                 ResolvedPackage {
                     name: "digest".to_string(),
@@ -1725,8 +1924,10 @@ mod tests {
                     source_url: "https://api.rrepo.org/packages/digest/versions/0.6.37/source"
                         .to_string(),
                     dependencies: vec![],
+                    system_requirements: None,
                 },
             ],
+            &empty_sysreq_db(),
         );
 
         assert_eq!(lockfile.registry, "https://api.rrepo.org");
@@ -1821,6 +2022,7 @@ mod tests {
                 source_url: "https://api.rrepo.org/packages/digest/versions/0.6.37/source"
                     .to_string(),
                 dependencies: vec![],
+                system_requirements: None,
             }],
         )
         .expect("constraints should derive");
@@ -1851,6 +2053,7 @@ mod tests {
             }],
             "https://api.rrepo.org",
             &[],
+            &empty_sysreq_db(),
         );
 
         assert_eq!(lockfile.r.base_packages, vec!["grid"]);
@@ -1890,6 +2093,7 @@ mod tests {
             version: LOCKFILE_VERSION,
             registry: "https://api.rrepo.org".to_string(),
             r: LockedR::default(),
+            sysreqs: LockedSystemRequirements::default(),
             roots: vec![],
             packages: BTreeMap::from([
                 (
@@ -1960,6 +2164,7 @@ mod tests {
             version: LOCKFILE_VERSION,
             registry: "https://api.rrepo.org".to_string(),
             r: LockedR::default(),
+            sysreqs: LockedSystemRequirements::default(),
             roots: vec![],
             packages: BTreeMap::from([
                 (
@@ -2110,5 +2315,13 @@ mod tests {
             compiled_cache_key("jsonlite", "2.0.0", &source_runtime),
             compiled_cache_key("jsonlite", "2.0.0", &binary_runtime)
         );
+    }
+
+    fn empty_sysreq_db() -> SysreqDbSnapshot {
+        SysreqDbSnapshot {
+            commit: "test-commit".to_string(),
+            rules: vec![],
+            scripts: BTreeMap::new(),
+        }
     }
 }

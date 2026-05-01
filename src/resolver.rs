@@ -112,6 +112,7 @@ pub struct ResolvedPackage {
     pub version: String,
     pub source_url: String,
     pub dependencies: Vec<ResolvedDependency>,
+    pub system_requirements: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +134,7 @@ struct PackageMetadata {
     version: String,
     source_url: String,
     dependencies: Vec<PackageDependency>,
+    system_requirements: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -276,6 +278,7 @@ impl<'a> RegistryDependencyProvider<'a> {
             version: version_entry.version.clone(),
             source_url: version_entry.source_url,
             dependencies: description_dependencies(&description)?,
+            system_requirements: description.system_requirements(),
         };
         self.metadata_by_package_version
             .borrow_mut()
@@ -298,6 +301,7 @@ impl<'a> RegistryDependencyProvider<'a> {
                 .into_iter()
                 .map(|dependency| dependency.resolved)
                 .collect(),
+            system_requirements: metadata.system_requirements,
         })
     }
 
