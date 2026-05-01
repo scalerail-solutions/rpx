@@ -290,6 +290,11 @@ fn cmd_lock() {
 }
 
 fn cmd_sync(install_system: bool, install_only_system: bool) {
+    if (install_system || install_only_system) && !host_supports_system_sync() {
+        eprintln!("System dependency installation is currently supported only on Linux.");
+        std::process::exit(1);
+    }
+
     let outcome = sync_from_lockfile(install_system, install_only_system);
     if install_only_system {
         return;
@@ -349,7 +354,11 @@ fn cmd_status() {
         .collect::<std::collections::BTreeMap<_, _>>();
     let locked_names = locked_package_names(&lockfile);
     let runtime_status = runtime_status(&lockfile);
-    let system_plan = system_plan_from_lockfile(&lockfile).ok();
+    let system_plan = if host_supports_system_sync() {
+        system_plan_from_lockfile(&lockfile).ok()
+    } else {
+        None
+    };
 
     let missing_from_lockfile = manifest_requirements
         .difference(&lock_requirements)
@@ -770,14 +779,16 @@ fn sync_from_lockfile(install_system: bool, install_only_system: bool) -> SyncOu
     let lockfile = read_lockfile().expect("failed to read lockfile");
     validate_lockfile_version_for_sync(&lockfile);
     validate_runtime_for_sync(&lockfile);
-    let system_plan = system_plan_from_lockfile(&lockfile).unwrap_or_else(|error| {
-        eprintln!("warning: failed to prepare system dependency plan: {error}");
-        system_plan_without_db(&lockfile)
-    });
-    let proceed_with_r =
-        handle_system_requirements(&system_plan, install_system, install_only_system);
-    if install_only_system || !proceed_with_r {
-        return SyncOutcome::default();
+    if host_supports_system_sync() {
+        let system_plan = system_plan_from_lockfile(&lockfile).unwrap_or_else(|error| {
+            eprintln!("warning: failed to prepare system dependency plan: {error}");
+            system_plan_without_db(&lockfile)
+        });
+        let proceed_with_r =
+            handle_system_requirements(&system_plan, install_system, install_only_system);
+        if install_only_system || !proceed_with_r {
+            return SyncOutcome::default();
+        }
     }
     let lock_requirements = lockfile
         .roots
@@ -1181,6 +1192,10 @@ fn system_plan_without_db(lockfile: &Lockfile) -> SystemDependencyPlan {
         installed_query_error: None,
         needs_metadata_refresh: false,
     }
+}
+
+fn host_supports_system_sync() -> bool {
+    matches!(current_host_platform(), sysreqs::HostPlatform::Linux { .. })
 }
 
 fn handle_system_requirements(
