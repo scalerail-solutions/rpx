@@ -1919,7 +1919,7 @@ dependencies = [
 
 [[package]]
 name = "rpx"
-version = "1.1.6"
+version = "1.2.0"
 dependencies = [
  "clap",
  "deb822-fast",
