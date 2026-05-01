@@ -1184,6 +1184,9 @@ fn handle_system_requirements(
     install_system: bool,
     install_only_system: bool,
 ) -> bool {
+    let explicit_install = install_system || install_only_system;
+    let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+
     if !plan.unsupported_rules.is_empty() {
         eprintln!(
             "warning: some system requirement rules do not have an install mapping for {}: {}",
@@ -1216,7 +1219,12 @@ fn handle_system_requirements(
         }
     }
 
-    if install_system || install_only_system {
+    if explicit_install && interactive && !prompt_for_install_confirmation() {
+        println!("Canceled");
+        std::process::exit(1);
+    }
+
+    if explicit_install {
         install_system_dependencies(plan)
             .unwrap_or_else(|error| panic!("failed to install system dependencies: {error}"));
         if install_only_system {
@@ -1226,7 +1234,7 @@ fn handle_system_requirements(
         return true;
     }
 
-    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+    if !interactive {
         eprintln!("warning: continuing with R package sync without installing system dependencies");
         return !install_only_system;
     }
@@ -1243,6 +1251,19 @@ fn handle_system_requirements(
             std::process::exit(1);
         }
     }
+}
+
+fn prompt_for_install_confirmation() -> bool {
+    eprintln!("Proceed with system package installation? [y/N]");
+    eprint!("> ");
+    std::io::stderr().flush().expect("failed to flush prompt");
+
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return false;
+    }
+
+    matches!(input.trim(), "y" | "Y" | "yes" | "YES" | "Yes")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
