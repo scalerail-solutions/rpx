@@ -52,7 +52,7 @@ use sysreqs::{
     refresh_preview_command as system_metadata_refresh_preview,
     resolve_plan as resolve_system_plan,
 };
-use ui::{InstallKind, SyncUi};
+use ui::{InstallKind, SyncUi, SystemDepsUi};
 
 const DOWNLOAD_WORKERS: usize = 8;
 const INSTALL_WORKERS: usize = 8;
@@ -1223,9 +1223,12 @@ fn handle_system_requirements(
     }
 
     if explicit_install {
-        eprintln!("Installing system dependencies...");
-        install_system_dependencies(&plan)
-            .unwrap_or_else(|error| panic!("failed to install system dependencies: {error}"));
+        let ui = SystemDepsUi::start();
+        if let Err(error) = install_system_dependencies(&plan) {
+            ui.fail();
+            panic!("failed to install system dependencies: {error}");
+        }
+        ui.finish();
         if install_only_system {
             println!("System dependency sync complete.");
             return false;
@@ -1240,9 +1243,12 @@ fn handle_system_requirements(
 
     match prompt_for_system_dependency_action() {
         SyncSystemChoice::InstallAndContinue => {
-            eprintln!("Installing system dependencies...");
-            install_system_dependencies(&plan)
-                .unwrap_or_else(|error| panic!("failed to install system dependencies: {error}"));
+            let ui = SystemDepsUi::start();
+            if let Err(error) = install_system_dependencies(&plan) {
+                ui.fail();
+                panic!("failed to install system dependencies: {error}");
+            }
+            ui.finish();
             true
         }
         SyncSystemChoice::TryROnly => true,

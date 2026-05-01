@@ -35,15 +35,17 @@ impl InstallKind {
 pub(crate) struct SyncUi {
     interactive: bool,
     _multi: Option<MultiProgress>,
-    downloads: ProgressBar,
-    binary_installs: ProgressBar,
-    source_builds: ProgressBar,
-    status: ProgressBar,
+    downloads: RefCell<Option<ProgressBar>>,
+    binary_installs: RefCell<Option<ProgressBar>>,
+    source_builds: RefCell<Option<ProgressBar>>,
     active_downloads: RefCell<BTreeMap<String, ProgressBar>>,
     active_installs: RefCell<BTreeMap<String, ProgressBar>>,
+    restored_packages: Cell<u64>,
     downloaded_packages: Cell<u64>,
     downloaded_bytes: Cell<u64>,
     total_download_bytes: Cell<Option<u64>>,
+    binary_finished: Cell<u64>,
+    source_finished: Cell<u64>,
 }
 
 impl SyncUi {
@@ -52,63 +54,37 @@ impl SyncUi {
 
         if interactive {
             let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr());
-            let downloads = multi.add(ProgressBar::new(0));
-            downloads.set_style(
-                ProgressStyle::with_template(
-                    "downloads          [{bar:30.cyan/blue}] {pos}/{len} {msg}",
-                )
-                .expect("progress template should parse")
-                .progress_chars("##-"),
-            );
-            let binary_installs = multi.add(ProgressBar::new(0));
-            binary_installs.set_style(
-                ProgressStyle::with_template(
-                    "installing binaries [{bar:30.green/blue}] {pos}/{len}",
-                )
-                .expect("progress template should parse")
-                .progress_chars("##-"),
-            );
-            let source_builds = multi.add(ProgressBar::new(0));
-            source_builds.set_style(
-                ProgressStyle::with_template(
-                    "compiling source    [{bar:30.yellow/blue}] {pos}/{len}",
-                )
-                .expect("progress template should parse")
-                .progress_chars("##-"),
-            );
-            let status = multi.add(ProgressBar::new_spinner());
-            status.set_style(
-                ProgressStyle::with_template("{spinner} {msg}")
-                    .expect("progress template should parse"),
-            );
-            status.enable_steady_tick(std::time::Duration::from_millis(100));
 
             Self {
                 interactive,
                 _multi: Some(multi),
-                downloads,
-                binary_installs,
-                source_builds,
-                status,
+                downloads: RefCell::new(None),
+                binary_installs: RefCell::new(None),
+                source_builds: RefCell::new(None),
                 active_downloads: RefCell::new(BTreeMap::new()),
                 active_installs: RefCell::new(BTreeMap::new()),
+                restored_packages: Cell::new(0),
                 downloaded_packages: Cell::new(0),
                 downloaded_bytes: Cell::new(0),
                 total_download_bytes: Cell::new(Some(0)),
+                binary_finished: Cell::new(0),
+                source_finished: Cell::new(0),
             }
         } else {
             Self {
                 interactive,
                 _multi: None,
-                downloads: ProgressBar::hidden(),
-                binary_installs: ProgressBar::hidden(),
-                source_builds: ProgressBar::hidden(),
-                status: ProgressBar::hidden(),
+                downloads: RefCell::new(None),
+                binary_installs: RefCell::new(None),
+                source_builds: RefCell::new(None),
                 active_downloads: RefCell::new(BTreeMap::new()),
                 active_installs: RefCell::new(BTreeMap::new()),
+                restored_packages: Cell::new(0),
                 downloaded_packages: Cell::new(0),
                 downloaded_bytes: Cell::new(0),
                 total_download_bytes: Cell::new(Some(0)),
+                binary_finished: Cell::new(0),
+                source_finished: Cell::new(0),
             }
         }
     }
@@ -118,42 +94,59 @@ impl SyncUi {
             return;
         }
 
+        self.restored_packages.set(0);
+
         if self.interactive {
-            self.downloads.set_length(total as u64);
-            self.downloads.set_position(0);
-            self.downloads.set_message("from cache");
-            self.status.set_message("restoring cached packages");
+            let bar = self
+                .create_aggregate_bar("downloads          [{bar:30.cyan/blue}] {pos}/{len} {msg}");
+            bar.set_length(total as u64);
+            bar.set_position(0);
+            bar.set_message("from cache");
+            self.downloads.replace(Some(bar));
         } else {
             eprintln!("Restoring {total} cached packages");
         }
     }
 
     pub(crate) fn finish_restore(&self, name: &str, version: &str) {
-        self.downloads.inc(1);
-        if self.interactive {
-            self.status
-                .set_message(format!("restored {name}@{version} from cache"));
-        } else {
+        self.restored_packages
+            .set(self.restored_packages.get().saturating_add(1));
+        if let Some(bar) = self.downloads.borrow().as_ref() {
+            bar.inc(1);
+        }
+        if !self.interactive {
             eprintln!("Restored {name}@{version} from cache");
         }
     }
 
     pub(crate) fn finish_restores(&self) {
-        if self.interactive && self.downloads.length().unwrap_or(0) > 0 {
-            self.downloads.finish_and_clear();
+        if self.interactive {
+            if let Some(bar) = self.downloads.borrow_mut().take() {
+                bar.finish_with_message(format!(
+                    "Restored {} {} from cache",
+                    self.restored_packages.get(),
+                    pluralize(self.restored_packages.get(), "package", "packages")
+                ));
+            }
         }
     }
 
     pub(crate) fn start_downloads(&self, total: usize) {
+        if total == 0 {
+            return;
+        }
+
         self.downloaded_packages.set(0);
         self.downloaded_bytes.set(0);
         self.total_download_bytes.set(Some(0));
 
         if self.interactive {
-            self.downloads.set_length(total as u64);
-            self.downloads.set_position(0);
+            let bar = self
+                .create_aggregate_bar("downloads          [{bar:30.cyan/blue}] {pos}/{len} {msg}");
+            bar.set_length(total as u64);
+            bar.set_position(0);
+            self.downloads.replace(Some(bar));
             self.update_download_message();
-            self.status.set_message("downloading package artifacts");
         } else {
             eprintln!("Downloading {total} packages");
         }
@@ -169,7 +162,7 @@ impl SyncUi {
                 ._multi
                 .as_ref()
                 .map_or_else(ProgressBar::hidden, |multi| {
-                    let bar = multi.insert_before(&self.status, ProgressBar::new(0));
+                    let bar = multi.add(ProgressBar::new(0));
                     bar.set_style(
                         ProgressStyle::with_template(
                             "  {msg:28} [{bar:24.cyan/blue}] {bytes}/{total_bytes} {bytes_per_sec}",
@@ -183,8 +176,6 @@ impl SyncUi {
             self.active_downloads
                 .borrow_mut()
                 .insert(name.to_string(), bar);
-            self.status
-                .set_message(format!("downloading {name}@{version}"));
         } else {
             eprintln!("Downloading {name}@{version} {}", artifact_label(kind));
         }
@@ -213,11 +204,7 @@ impl SyncUi {
     }
 
     pub(crate) fn fallback_to_source(&self, name: &str, version: &str) {
-        if self.interactive {
-            self.status.set_message(format!(
-                "{name}@{version} binary unavailable; falling back to source"
-            ));
-        } else {
+        if !self.interactive {
             eprintln!("{name}@{version} binary unavailable; falling back to source");
         }
     }
@@ -225,16 +212,15 @@ impl SyncUi {
     pub(crate) fn finish_download(&self, name: &str, version: &str, kind: InstallKind) {
         self.downloaded_packages
             .set(self.downloaded_packages.get().saturating_add(1));
-        self.downloads.inc(1);
+        if let Some(bar) = self.downloads.borrow().as_ref() {
+            bar.inc(1);
+        }
         if let Some(bar) = self.active_downloads.borrow_mut().remove(name) {
             bar.finish_and_clear();
         }
         self.update_download_message();
 
-        if self.interactive {
-            self.status
-                .set_message(format!("downloaded {name}@{version} {}", kind.label()));
-        } else {
+        if !self.interactive {
             eprintln!("Downloaded {name}@{version} {}", kind.label());
         }
     }
@@ -244,17 +230,36 @@ impl SyncUi {
             for (_, bar) in self.active_downloads.borrow_mut().split_off("") {
                 bar.finish_and_clear();
             }
-            self.downloads.finish_and_clear();
+            if let Some(bar) = self.downloads.borrow_mut().take() {
+                bar.finish_with_message(format!(
+                    "Downloaded {} {} ({})",
+                    self.downloaded_packages.get(),
+                    pluralize(self.downloaded_packages.get(), "package", "packages"),
+                    HumanBytes(self.downloaded_bytes.get())
+                ));
+            }
         }
     }
 
     pub(crate) fn start_installs(&self, binary_total: usize, source_total: usize) {
+        self.binary_finished.set(0);
+        self.source_finished.set(0);
+
         if self.interactive {
-            self.binary_installs.set_length(binary_total as u64);
-            self.binary_installs.set_position(0);
-            self.source_builds.set_length(source_total as u64);
-            self.source_builds.set_position(0);
-            self.status.set_message("installing locked packages");
+            if binary_total > 0 {
+                let bar = self
+                    .create_aggregate_bar("installing binaries[{bar:30.green/blue}] {pos}/{len}");
+                bar.set_length(binary_total as u64);
+                bar.set_position(0);
+                self.binary_installs.replace(Some(bar));
+            }
+            if source_total > 0 {
+                let bar = self
+                    .create_aggregate_bar("compiling source   [{bar:30.yellow/blue}] {pos}/{len}");
+                bar.set_length(source_total as u64);
+                bar.set_position(0);
+                self.source_builds.replace(Some(bar));
+            }
         } else {
             if binary_total > 0 {
                 eprintln!("Installing {binary_total} binary packages");
@@ -275,7 +280,7 @@ impl SyncUi {
                     ._multi
                     .as_ref()
                     .map_or_else(ProgressBar::hidden, |multi| {
-                        let bar = multi.insert_before(&self.status, ProgressBar::new_spinner());
+                        let bar = multi.add(ProgressBar::new_spinner());
                         bar.set_style(
                             ProgressStyle::with_template("  {spinner} {msg}")
                                 .expect("progress template should parse"),
@@ -285,8 +290,6 @@ impl SyncUi {
                         bar
                     });
                 self.active_installs.borrow_mut().insert(name.clone(), bar);
-                self.status
-                    .set_message(format!("{} {name}@{version}", kind.active_label()));
             } else {
                 eprintln!("{} {name}@{version}", sentence_case(kind.active_label()));
             }
@@ -295,27 +298,33 @@ impl SyncUi {
 
     pub(crate) fn finish_install(&self, name: &str, version: &str, kind: InstallKind) {
         match kind {
-            InstallKind::Binary => self.binary_installs.inc(1),
-            InstallKind::Source => self.source_builds.inc(1),
+            InstallKind::Binary => {
+                self.binary_finished
+                    .set(self.binary_finished.get().saturating_add(1));
+                if let Some(bar) = self.binary_installs.borrow().as_ref() {
+                    bar.inc(1);
+                }
+            }
+            InstallKind::Source => {
+                self.source_finished
+                    .set(self.source_finished.get().saturating_add(1));
+                if let Some(bar) = self.source_builds.borrow().as_ref() {
+                    bar.inc(1);
+                }
+            }
         }
         if let Some(bar) = self.active_installs.borrow_mut().remove(name) {
             bar.finish_and_clear();
         }
 
-        if self.interactive {
-            self.status
-                .set_message(format!("finished {name}@{version} {}", kind.label()));
-        } else {
+        if !self.interactive {
             eprintln!("Finished {name}@{version} {}", kind.label());
         }
     }
 
-    pub(crate) fn fail_install(&self, name: &str, version: &str) {
+    pub(crate) fn fail_install(&self, name: &str, _version: &str) {
         if let Some(bar) = self.active_installs.borrow_mut().remove(name) {
             bar.finish_and_clear();
-        }
-        if self.interactive {
-            self.status.set_message(format!("failed {name}@{version}"));
         }
     }
 
@@ -324,8 +333,20 @@ impl SyncUi {
             for (_, bar) in self.active_installs.borrow_mut().split_off("") {
                 bar.finish_and_clear();
             }
-            self.binary_installs.finish_and_clear();
-            self.source_builds.finish_and_clear();
+            if let Some(bar) = self.binary_installs.borrow_mut().take() {
+                bar.finish_with_message(format!(
+                    "Installed {} {}",
+                    self.binary_finished.get(),
+                    pluralize(self.binary_finished.get(), "binary", "binaries")
+                ));
+            }
+            if let Some(bar) = self.source_builds.borrow_mut().take() {
+                bar.finish_with_message(format!(
+                    "Compiled {} {} from source",
+                    self.source_finished.get(),
+                    pluralize(self.source_finished.get(), "package", "packages")
+                ));
+            }
         }
     }
 
@@ -334,24 +355,14 @@ impl SyncUi {
             return;
         }
 
-        if self.interactive {
-            self.status.set_message("removing extra packages");
-        } else {
+        if !self.interactive {
             eprintln!("Removing {total} extra packages");
         }
     }
 
-    pub(crate) fn finish_removals(&self) {
-        if self.interactive {
-            self.status.set_message("removed extra packages");
-        }
-    }
+    pub(crate) fn finish_removals(&self) {}
 
-    pub(crate) fn finish(&self) {
-        if self.interactive {
-            self.status.finish_and_clear();
-        }
-    }
+    pub(crate) fn finish(&self) {}
 
     fn update_download_message(&self) {
         if !self.interactive {
@@ -363,7 +374,65 @@ impl SyncUi {
             Some(0) | None => format!("{downloaded}"),
             Some(total) => format!("{downloaded}/{}", HumanBytes(total)),
         };
-        self.downloads.set_message(message);
+        if let Some(bar) = self.downloads.borrow().as_ref() {
+            bar.set_message(message);
+        }
+    }
+
+    fn create_aggregate_bar(&self, template: &str) -> ProgressBar {
+        self._multi
+            .as_ref()
+            .map_or_else(ProgressBar::hidden, |multi| {
+                let bar = multi.add(ProgressBar::new(0));
+                bar.set_style(
+                    ProgressStyle::with_template(template)
+                        .expect("progress template should parse")
+                        .progress_chars("##-"),
+                );
+                bar
+            })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct SystemDepsUi {
+    interactive: bool,
+    bar: ProgressBar,
+}
+
+impl SystemDepsUi {
+    pub(crate) fn start() -> Self {
+        let interactive = std::io::stderr().is_terminal();
+        let bar = if interactive {
+            let bar = ProgressBar::new_spinner();
+            bar.set_style(
+                ProgressStyle::with_template("{spinner} {msg}")
+                    .expect("progress template should parse"),
+            );
+            bar.enable_steady_tick(std::time::Duration::from_millis(100));
+            bar.set_message("installing system dependencies");
+            bar
+        } else {
+            eprintln!("Installing system dependencies...");
+            ProgressBar::hidden()
+        };
+
+        Self { interactive, bar }
+    }
+
+    pub(crate) fn finish(self) {
+        if self.interactive {
+            self.bar
+                .finish_with_message("Installed system dependencies".to_string());
+        } else {
+            eprintln!("Installed system dependencies");
+        }
+    }
+
+    pub(crate) fn fail(self) {
+        if self.interactive {
+            self.bar.finish_and_clear();
+        }
     }
 }
 
@@ -380,6 +449,10 @@ fn sentence_case(value: &str) -> String {
         return String::new();
     };
     first.to_uppercase().chain(chars).collect()
+}
+
+fn pluralize<'a>(count: u64, singular: &'a str, plural: &'a str) -> &'a str {
+    if count == 1 { singular } else { plural }
 }
 
 #[derive(Debug)]
