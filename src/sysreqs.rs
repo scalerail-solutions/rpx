@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
-    io::Read,
+    io::{IsTerminal, Read},
     path::PathBuf,
     process::Command,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -232,7 +232,8 @@ pub(crate) fn resolve_plan(
     post_install = dedupe_keep_order(post_install);
     let install_packages = install_packages.into_iter().collect::<Vec<_>>();
     let install_supported = package_manager_for_host(&host).is_some();
-    let can_auto_install = install_supported && install_prefix().is_some();
+    let can_auto_install =
+        install_supported && install_prefix(std::io::stderr().is_terminal()).is_some();
 
     let (missing_packages, installed_query_error, needs_metadata_refresh) =
         match missing_packages_for_host(&host, &install_packages) {
@@ -296,10 +297,10 @@ pub(crate) fn install(plan: &SystemDependencyPlan) -> Result<(), String> {
         ));
     }
 
-    let Some(prefix) = install_prefix() else {
-        return Err(
-            "need root privileges or passwordless sudo to install system dependencies".to_string(),
-        );
+    let Some(prefix) = install_prefix(std::io::stderr().is_terminal()) else {
+        return Err(system_install_privilege_error(
+            std::io::stderr().is_terminal(),
+        ));
     };
 
     for command in &plan.pre_install_commands {
@@ -329,10 +330,10 @@ pub(crate) fn refresh_metadata(plan: &SystemDependencyPlan) -> Result<(), String
             plan.host.label()
         ));
     };
-    let Some(prefix) = install_prefix() else {
-        return Err(
-            "need root privileges or passwordless sudo to install system dependencies".to_string(),
-        );
+    let Some(prefix) = install_prefix(std::io::stderr().is_terminal()) else {
+        return Err(system_install_privilege_error(
+            std::io::stderr().is_terminal(),
+        ));
     };
 
     run_shell_command(&prefix, &command)
@@ -819,7 +820,7 @@ fn action_command(action: &SysreqAction, db: &SysreqDbSnapshot) -> Result<String
     Err("invalid sysreq action: missing command or script".to_string())
 }
 
-fn install_prefix() -> Option<Vec<String>> {
+fn install_prefix(interactive: bool) -> Option<Vec<String>> {
     if current_uid().as_deref() == Some("0") {
         return Some(vec![]);
     }
@@ -829,7 +830,23 @@ fn install_prefix() -> Option<Vec<String>> {
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false);
-    sudo_ok.then(|| vec!["sudo".to_string()])
+    if sudo_ok {
+        return Some(vec!["sudo".to_string()]);
+    }
+
+    if interactive && sudo_available() {
+        return Some(vec!["sudo".to_string()]);
+    }
+
+    None
+}
+
+fn sudo_available() -> bool {
+    Command::new("sudo")
+        .arg("-V")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 fn current_uid() -> Option<String> {
@@ -889,10 +906,18 @@ fn command_output_tail(output: &str, max_lines: usize) -> String {
 }
 
 fn prefix_command(command: String) -> String {
-    install_prefix()
+    install_prefix(std::io::stderr().is_terminal())
         .filter(|prefix| !prefix.is_empty())
         .map(|prefix| format!("{} {command}", prefix.join(" ")))
         .unwrap_or(command)
+}
+
+fn system_install_privilege_error(interactive: bool) -> String {
+    if interactive {
+        "need root privileges or sudo to install system dependencies".to_string()
+    } else {
+        "need root privileges or passwordless sudo to install system dependencies".to_string()
+    }
 }
 
 fn github_client() -> Result<reqwest::blocking::Client, String> {
