@@ -72,7 +72,7 @@ fn fails_when_description_already_exists() {
     let command = format!("cd {project_path} && rpx init");
     let (exit_code, stdout, stderr) = run_shell_command(&container, &command);
 
-    assert_eq!(exit_code, 101, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
         stderr.contains("DESCRIPTION already exists"),
         "stdout was: {stdout}\nstderr was: {stderr}"

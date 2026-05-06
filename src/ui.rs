@@ -120,14 +120,14 @@ impl SyncUi {
     }
 
     pub(crate) fn finish_restores(&self) {
-        if self.interactive {
-            if let Some(bar) = self.downloads.borrow_mut().take() {
-                bar.finish_with_message(format!(
-                    "Restored {} {} from cache",
-                    self.restored_packages.get(),
-                    pluralize(self.restored_packages.get(), "package", "packages")
-                ));
-            }
+        if self.interactive
+            && let Some(bar) = self.downloads.borrow_mut().take()
+        {
+            bar.finish_with_message(format!(
+                "Restored {} {} from cache",
+                self.restored_packages.get(),
+                pluralize(self.restored_packages.get(), "package", "packages")
+            ));
         }
     }
 

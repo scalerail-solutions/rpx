@@ -1,4 +1,4 @@
-use crate::project::{LOCKFILE_NAME, lockfile_path};
+use crate::project::{LOCKFILE_NAME, lockfile_path_result};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs};
 
@@ -70,7 +70,7 @@ pub fn read_lockfile() -> Result<Lockfile, String> {
 }
 
 pub fn read_lockfile_optional() -> Result<Option<Lockfile>, String> {
-    let path = lockfile_path();
+    let path = lockfile_path_result()?;
 
     if !path.exists() {
         return Ok(None);
@@ -81,9 +81,9 @@ pub fn read_lockfile_optional() -> Result<Option<Lockfile>, String> {
     Ok(Some(lockfile))
 }
 
-pub fn write_lockfile(lockfile: Lockfile) {
-    let contents = serde_json::to_string_pretty(&lockfile).expect("failed to serialize lockfile");
-    fs::write(lockfile_path(), format!("{contents}\n")).expect("failed to write lockfile");
+pub fn write_lockfile(lockfile: Lockfile) -> Result<(), String> {
+    let contents = serde_json::to_string_pretty(&lockfile).map_err(|error| error.to_string())?;
+    fs::write(lockfile_path_result()?, format!("{contents}\n")).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

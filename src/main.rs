@@ -1,3 +1,3 @@
-fn main() {
-    rpx::run();
+fn main() -> miette::Result<()> {
+    rpx::run()
 }
