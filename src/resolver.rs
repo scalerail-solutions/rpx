@@ -349,10 +349,10 @@ impl DependencyProvider for RegistryDependencyProvider<'_> {
             return Ok(range.contains(&version).then_some(version));
         }
 
-        if let Some(preferred_version) = self.preferred_versions_by_package.get(package) {
-            if range.contains(preferred_version) {
-                return Ok(Some(preferred_version.clone()));
-            }
+        if let Some(preferred_version) = self.preferred_versions_by_package.get(package)
+            && range.contains(preferred_version)
+        {
+            return Ok(Some(preferred_version.clone()));
         }
 
         Ok(self

@@ -72,16 +72,15 @@ fn reports_old_lockfile_needs_update() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
     assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stdout.contains("Lockfile is out of date"),
+        stderr.contains("lockfile is out of date"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert!(
-        stdout
-            .contains("Your lockfile was created by an older rpx version and needs to be updated."),
+        stderr.contains("rpx::lockfile::older"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert!(
-        stdout.contains("Run: rpx lock"),
+        stderr.contains("Run `rpx lock`"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }
@@ -101,15 +100,15 @@ fn reports_newer_lockfile_is_incompatible() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
     assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stdout.contains("Lockfile is incompatible"),
+        stderr.contains("lockfile is incompatible"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert!(
-        stdout.contains("Your lockfile was created by a newer rpx version"),
+        stderr.contains("rpx::lockfile::newer"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert!(
-        stdout.contains("Upgrade rpx or regenerate the lockfile with this version."),
+        stderr.contains("Upgrade rpx or regenerate the lockfile with this version."),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }

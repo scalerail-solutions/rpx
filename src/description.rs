@@ -2,7 +2,7 @@ use deb822_fast::Paragraph;
 use r_description::{Version, VersionConstraint};
 use std::{collections::BTreeSet, fs, str::FromStr};
 
-use crate::project::{current_description_path, description_path};
+use crate::project::{current_description_path, description_path_result};
 use crate::registry::ResolutionRoot;
 
 const DESCRIPTION_FIELD_ORDER: &[&str] = &[
@@ -143,7 +143,7 @@ impl RDescription {
 }
 
 pub fn read_description() -> Result<ProjectDescription, String> {
-    let path = description_path();
+    let path = description_path_result()?;
     let contents = fs::read_to_string(&path).map_err(|error| error.to_string())?;
     let mut description = RDescription::from_str(&contents)?;
     let additional_repositories = description.additional_repositories();
@@ -164,7 +164,7 @@ pub fn read_description() -> Result<ProjectDescription, String> {
     })
 }
 
-pub fn write_description(project: &ProjectDescription) {
+pub fn write_description(project: &ProjectDescription) -> Result<(), String> {
     let mut contents = format_description_for_write(&project.description);
     if !project.additional_repositories.is_empty() {
         contents.push('\n');
@@ -173,7 +173,7 @@ pub fn write_description(project: &ProjectDescription) {
         ));
     }
     contents.push('\n');
-    fs::write(description_path(), contents).expect("failed to write DESCRIPTION");
+    fs::write(description_path_result()?, contents).map_err(|error| error.to_string())
 }
 
 pub fn init_description() -> Result<String, String> {

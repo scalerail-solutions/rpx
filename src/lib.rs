@@ -1,4 +1,5 @@
 use clap::Parser;
+use miette::Diagnostic;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     env, fs,
@@ -8,6 +9,7 @@ use std::{
     thread,
     time::{SystemTime, UNIX_EPOCH},
 };
+use thiserror::Error;
 
 mod cli;
 mod description;
@@ -58,7 +60,271 @@ const DOWNLOAD_WORKERS: usize = 8;
 const INSTALL_WORKERS: usize = 8;
 const MAX_SOURCE_BUILDS: usize = 4;
 
-pub fn run() {
+type RpxResult<T> = Result<T, RpxError>;
+
+#[derive(Debug, Error, Diagnostic)]
+enum RpxError {
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Project(#[from] ProjectError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Init(#[from] InitError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Repo(#[from] RepoError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Run(#[from] RunError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Lock(#[from] LockError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Status(#[from] StatusError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Sync(Box<SyncError>),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Clean(#[from] CleanError),
+}
+
+#[derive(Debug, Error, Diagnostic)]
+enum ProjectError {
+    #[error("failed to read DESCRIPTION: {details}")]
+    #[diagnostic(
+        code(rpx::project::description_read),
+        help("Run `rpx init` to create a DESCRIPTION file in this project.")
+    )]
+    DescriptionRead { details: String },
+
+    #[error("failed to write DESCRIPTION: {details}")]
+    #[diagnostic(code(rpx::project::description_write))]
+    DescriptionWrite { details: String },
+
+    #[error("failed to read rpx.lock: {details}")]
+    #[diagnostic(
+        code(rpx::project::lockfile_read),
+        help("Run `rpx lock` to regenerate rpx.lock.")
+    )]
+    LockfileRead { details: String },
+
+    #[error("failed to write rpx.lock: {details}")]
+    #[diagnostic(code(rpx::project::lockfile_write))]
+    LockfileWrite { details: String },
+}
+
+#[derive(Debug, Error, Diagnostic)]
+enum InitError {
+    #[error("DESCRIPTION already exists")]
+    #[diagnostic(
+        code(rpx::init::description_exists),
+        help(
+            "Run rpx commands from this project, or remove DESCRIPTION before initializing a new project."
+        )
+    )]
+    DescriptionAlreadyExists,
+
+    #[error("failed to initialize project: {details}")]
+    #[diagnostic(code(rpx::init::failed))]
+    Failed { details: String },
+}
+
+#[derive(Debug, Error, Diagnostic)]
+enum RepoError {
+    #[error("failed to add repository {url}: {details}")]
+    #[diagnostic(code(rpx::repo::add_failed))]
+    Add { url: String, details: String },
+
+    #[error("failed to remove repository credential: {details}")]
+    #[diagnostic(code(rpx::repo::credential_remove_failed))]
+    CredentialRemove { details: String },
+
+    #[error("failed to inspect repository credential: {details}")]
+    #[diagnostic(code(rpx::repo::credential_inspect_failed))]
+    CredentialInspect { details: String },
+}
+
+impl From<SyncError> for RpxError {
+    fn from(error: SyncError) -> Self {
+        Self::Sync(Box::new(error))
+    }
+}
+
+#[derive(Debug, Error, Diagnostic)]
+enum RunError {
+    #[error("failed to run {program}")]
+    #[diagnostic(code(rpx::run::command_failed))]
+    CommandFailed {
+        program: String,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+#[derive(Debug, Error, Diagnostic)]
+enum LockError {
+    #[error("lockfile is incompatible")]
+    #[diagnostic(
+        code(rpx::lockfile::newer),
+        help("Upgrade rpx or regenerate the lockfile with this version.")
+    )]
+    LockfileNewer,
+
+    #[error("failed to resolve package set from registry: {details}")]
+    #[diagnostic(
+        code(rpx::lock::resolve_failed),
+        help("Check package names and version constraints in DESCRIPTION.")
+    )]
+    ResolveFailed { details: String },
+}
+
+#[derive(Debug, Error, Diagnostic)]
+enum StatusError {
+    #[error("lockfile is out of date")]
+    #[diagnostic(code(rpx::lockfile::older), help("Run `rpx lock` to update rpx.lock."))]
+    LockfileOlder,
+
+    #[error("lockfile is incompatible")]
+    #[diagnostic(
+        code(rpx::lockfile::newer),
+        help("Upgrade rpx or regenerate the lockfile with this version.")
+    )]
+    LockfileNewer,
+}
+
+#[derive(Debug, Error, Diagnostic)]
+enum SyncError {
+    #[error("lockfile is out of date")]
+    #[diagnostic(code(rpx::lockfile::older), help("Run `rpx lock` to update rpx.lock."))]
+    LockfileOlder,
+
+    #[error("lockfile is incompatible")]
+    #[diagnostic(
+        code(rpx::lockfile::newer),
+        help("Upgrade rpx or regenerate the lockfile with this version.")
+    )]
+    LockfileNewer,
+
+    #[error(
+        "system dependency installation is currently supported only on supported Linux distributions/package managers"
+    )]
+    #[diagnostic(code(rpx::sync::unsupported_system_install))]
+    UnsupportedSystemInstall,
+
+    #[error("R runtime is missing required base packages: {packages}")]
+    #[diagnostic(
+        code(rpx::sync::runtime_missing_base_packages),
+        help(
+            "These packages are part of R itself. Use a complete R installation compatible with this project."
+        )
+    )]
+    RuntimeMissingBasePackages { packages: String },
+
+    #[error("failed to refresh package metadata: {details}")]
+    #[diagnostic(code(rpx::sync::metadata_refresh_failed))]
+    MetadataRefreshFailed { details: String },
+
+    #[error("failed to install system dependencies: {details}")]
+    #[diagnostic(code(rpx::sync::system_dependencies_failed))]
+    SystemDependenciesFailed { details: String },
+
+    #[error("failed to restore cached package {package}@{version}: {details}")]
+    #[diagnostic(code(rpx::sync::restore_cached_package_failed))]
+    RestoreCachedPackageFailed {
+        package: String,
+        version: String,
+        details: String,
+    },
+
+    #[error("failed to prepare source artifacts: {details}")]
+    #[diagnostic(code(rpx::sync::download_failed))]
+    DownloadArtifactsFailed { details: String },
+
+    #[error("no installable packages remain after dependency resolution: {packages}")]
+    #[diagnostic(
+        code(rpx::sync::install_order_blocked),
+        help("This indicates a bug in dependency resolution or lockfile dependency metadata.")
+    )]
+    NoInstallablePackages { packages: String },
+
+    #[error("failed to cache built package {package}@{version}: {details}")]
+    #[diagnostic(code(rpx::sync::cache_built_package_failed))]
+    CacheBuiltPackageFailed {
+        package: String,
+        version: String,
+        details: String,
+    },
+
+    #[error("project library did not match rpx.lock after sync")]
+    #[diagnostic(code(rpx::sync::post_sync_verification_failed))]
+    PostSyncVerificationFailed,
+
+    #[error(
+        "failed to install {package}@{version}\nexit status: {exit_status}\nsummary: {summary}\nlog: {log_path}{recent_output}"
+    )]
+    #[diagnostic(
+        code(rpx::sync::install_failed),
+        help("Review the install log for the full build output.")
+    )]
+    InstallFailed {
+        package: String,
+        version: String,
+        exit_status: String,
+        summary: String,
+        log_path: String,
+        recent_output: String,
+    },
+}
+
+#[derive(Debug, Error, Diagnostic)]
+enum CleanError {
+    #[error("failed to remove {label} at {path}")]
+    #[diagnostic(code(rpx::clean::remove_failed))]
+    RemoveFailed {
+        label: String,
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+fn read_project_description() -> Result<description::ProjectDescription, ProjectError> {
+    read_description().map_err(|details| ProjectError::DescriptionRead { details })
+}
+
+fn write_project_description(
+    project: &description::ProjectDescription,
+) -> Result<(), ProjectError> {
+    write_description(project).map_err(|details| ProjectError::DescriptionWrite { details })
+}
+
+fn read_project_lockfile() -> Result<Lockfile, ProjectError> {
+    read_lockfile().map_err(|details| ProjectError::LockfileRead { details })
+}
+
+fn read_project_lockfile_optional() -> Result<Option<Lockfile>, ProjectError> {
+    read_lockfile_optional().map_err(|details| ProjectError::LockfileRead { details })
+}
+
+fn write_project_lockfile(lockfile: Lockfile) -> Result<(), ProjectError> {
+    write_lockfile(lockfile).map_err(|details| ProjectError::LockfileWrite { details })
+}
+
+pub fn run() -> miette::Result<()> {
+    run_inner()?;
+    Ok(())
+}
+
+fn run_inner() -> RpxResult<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -77,16 +343,22 @@ pub fn run() {
     }
 }
 
-fn cmd_init() {
-    let path =
-        init_description().unwrap_or_else(|error| panic!("failed to initialize project: {error}"));
+fn cmd_init() -> RpxResult<()> {
+    let path = init_description().map_err(|details| {
+        if details == "DESCRIPTION already exists" {
+            InitError::DescriptionAlreadyExists
+        } else {
+            InitError::Failed { details }
+        }
+    })?;
     println!("Initialized project at {path}");
     println!("Next: run `rpx add <package>` or `rpx lock`");
+    Ok(())
 }
 
-fn cmd_add(packages: &[String]) {
-    let mut project = read_description().expect("failed to read DESCRIPTION");
-    let mut lockfile = read_lockfile_optional().expect("failed to read lockfile");
+fn cmd_add(packages: &[String]) -> RpxResult<()> {
+    let mut project = read_project_description()?;
+    let mut lockfile = read_project_lockfile_optional()?;
     let repositories = configured_repositories(&project);
     let mut new_packages = Vec::new();
 
@@ -107,7 +379,7 @@ fn cmd_add(packages: &[String]) {
             &new_packages,
             &repositories,
         )
-        .unwrap_or_else(|error| panic!("failed to add package from registry: {error}"));
+        .map_err(|details| LockError::ResolveFailed { details })?;
 
         for package in &new_packages {
             let constraints = resolved_addition
@@ -127,17 +399,18 @@ fn cmd_add(packages: &[String]) {
         ));
     }
 
-    write_description(&project);
+    write_project_description(&project)?;
     if let Some(lockfile) = lockfile {
-        write_lockfile(lockfile);
+        write_project_lockfile(lockfile)?;
     } else {
-        let _ = lock_from_description();
+        let _ = lock_from_description()?;
     }
-    let _ = sync_from_lockfile(false, false);
+    let _ = sync_from_lockfile(false, false)?;
     println!("Added {}", packages.join(", "));
+    Ok(())
 }
 
-fn cmd_repo(command: RepoCommands) {
+fn cmd_repo(command: RepoCommands) -> RpxResult<()> {
     match command {
         RepoCommands::Add { url } => cmd_repo_add(&url),
         RepoCommands::Remove {
@@ -148,8 +421,8 @@ fn cmd_repo(command: RepoCommands) {
     }
 }
 
-fn cmd_repo_add(url: &str) {
-    let mut project = read_description().expect("failed to read DESCRIPTION");
+fn cmd_repo_add(url: &str) -> RpxResult<()> {
+    let mut project = read_project_description()?;
     let source = RepositorySource::new(url);
 
     if project
@@ -158,23 +431,27 @@ fn cmd_repo_add(url: &str) {
         .any(|existing| normalize_repository_url(existing) == source.base_url())
     {
         println!("Repository already configured: {}", source.base_url());
-        return;
+        return Ok(());
     }
 
     let repositories = RepositorySet::new(vec![source.clone()]);
     repositories
         .fetch_repository_packages(&source)
-        .unwrap_or_else(|error| panic!("failed to add repository {}: {error}", source.base_url()));
+        .map_err(|details| RepoError::Add {
+            url: source.base_url().to_string(),
+            details,
+        })?;
 
     project
         .additional_repositories
         .push(source.base_url().to_string());
-    write_description(&project);
+    write_project_description(&project)?;
     println!("Added repository {}", source.base_url());
+    Ok(())
 }
 
-fn cmd_repo_remove(url: &str, remove_credential: bool) {
-    let mut project = read_description().expect("failed to read DESCRIPTION");
+fn cmd_repo_remove(url: &str, remove_credential: bool) -> RpxResult<()> {
+    let mut project = read_project_description()?;
     let source = RepositorySource::new(url);
     let original_len = project.additional_repositories.len();
     project
@@ -183,26 +460,27 @@ fn cmd_repo_remove(url: &str, remove_credential: bool) {
 
     if project.additional_repositories.len() == original_len {
         println!("Repository not configured: {}", source.base_url());
-        return;
+        return Ok(());
     }
 
-    write_description(&project);
+    write_project_description(&project)?;
 
     if remove_credential {
         RepositorySet::new(vec![source.clone()])
             .remove_api_key(&source)
-            .unwrap_or_else(|error| panic!("failed to remove repository credential: {error}"));
+            .map_err(|details| RepoError::CredentialRemove { details })?;
     }
 
     println!("Removed repository {}", source.base_url());
+    Ok(())
 }
 
-fn cmd_repo_list() {
-    let project = read_description().expect("failed to read DESCRIPTION");
+fn cmd_repo_list() -> RpxResult<()> {
+    let project = read_project_description()?;
 
     if project.additional_repositories.is_empty() {
         println!("No additional repositories configured");
-        return;
+        return Ok(());
     }
 
     let repositories = RepositorySet::new(
@@ -217,7 +495,7 @@ fn cmd_repo_list() {
     for source in repositories.sources() {
         let credential = repositories
             .has_stored_credential(source)
-            .unwrap_or_else(|error| panic!("failed to inspect repository credential: {error}"));
+            .map_err(|details| RepoError::CredentialInspect { details })?;
         println!(
             "{} [{}]",
             source.base_url(),
@@ -228,15 +506,16 @@ fn cmd_repo_list() {
             }
         );
     }
+    Ok(())
 }
 
-fn cmd_remove(packages: &[String]) {
-    let mut project = read_description().expect("failed to read DESCRIPTION");
+fn cmd_remove(packages: &[String]) -> RpxResult<()> {
+    let mut project = read_project_description()?;
     for package in packages {
         project.description.remove_from_field("Imports", package);
         project.description.remove_from_field("Depends", package);
     }
-    write_description(&project);
+    write_project_description(&project)?;
 
     let installed = installed_packages_by_name();
     let mut removed = Vec::new();
@@ -254,8 +533,8 @@ fn cmd_remove(packages: &[String]) {
         remove_installed_packages(&removed);
     }
 
-    let _ = lock_from_description();
-    let _ = sync_from_lockfile(false, false);
+    let _ = lock_from_description()?;
+    let _ = sync_from_lockfile(false, false)?;
 
     if !removed.is_empty() {
         println!("Removed {}", removed.join(", "));
@@ -267,9 +546,10 @@ fn cmd_remove(packages: &[String]) {
             if missing.len() == 1 { "is" } else { "are" }
         );
     }
+    Ok(())
 }
 
-fn cmd_run(command: &[String]) {
+fn cmd_run(command: &[String]) -> RpxResult<()> {
     let (program, args) = command
         .split_first()
         .expect("run command requires at least one argument");
@@ -277,73 +557,50 @@ fn cmd_run(command: &[String]) {
     let status = project_command(program)
         .args(args)
         .status()
-        .unwrap_or_else(|_| panic!("failed to run {program}"));
+        .map_err(|source| RunError::CommandFailed {
+            program: program.clone(),
+            source,
+        })?;
 
     exit_with_status(status.code());
+    Ok(())
 }
 
-fn cmd_lock() {
-    let outcome = lock_from_description();
+fn cmd_lock() -> RpxResult<()> {
+    let outcome = lock_from_description()?;
     if outcome.changed {
         println!("Updated rpx.lock");
     } else {
         println!("rpx.lock is already up to date");
     }
+    Ok(())
 }
 
-fn cmd_sync(install_system: bool, install_only_system: bool) {
+fn cmd_sync(install_system: bool, install_only_system: bool) -> RpxResult<()> {
     if (install_system || install_only_system) && !host_supports_system_sync() {
-        eprintln!(
-            "System dependency installation is currently supported only on supported Linux distributions/package managers."
-        );
-        std::process::exit(1);
+        return Err(SyncError::UnsupportedSystemInstall.into());
     }
 
-    let outcome = sync_from_lockfile(install_system, install_only_system);
+    let outcome = sync_from_lockfile(install_system, install_only_system)?;
     if install_only_system {
-        return;
+        return Ok(());
     }
     if outcome.installed == 0 && outcome.removed == 0 {
         println!("Project library is already in sync");
     } else {
         println!("Synchronized project library");
     }
+    Ok(())
 }
 
-fn cmd_status() {
-    let project = match read_description() {
-        Ok(description) => description,
-        Err(error) => {
-            eprintln!("Could not read DESCRIPTION");
-            eprintln!("{error}");
-            std::process::exit(1);
-        }
-    };
-
-    let lockfile = match read_lockfile() {
-        Ok(lockfile) => lockfile,
-        Err(error) => {
-            eprintln!("Lockfile is missing or unreadable");
-            eprintln!("Run: rpx lock");
-            eprintln!("{error}");
-            std::process::exit(1);
-        }
-    };
+fn cmd_status() -> RpxResult<()> {
+    let project = read_project_description()?;
+    let lockfile = read_project_lockfile()?;
 
     match validate_lockfile_compatibility(&lockfile) {
         Ok(()) => {}
-        Err(LockfileCompatibilityError::Older) => {
-            println!("Lockfile is out of date");
-            println!();
-            print_relock_message();
-            std::process::exit(1);
-        }
-        Err(LockfileCompatibilityError::Newer) => {
-            println!("Lockfile is incompatible");
-            println!();
-            print_newer_lockfile_message();
-            std::process::exit(1);
-        }
+        Err(LockfileCompatibilityError::Older) => return Err(StatusError::LockfileOlder.into()),
+        Err(LockfileCompatibilityError::Newer) => return Err(StatusError::LockfileNewer.into()),
     }
 
     let manifest_requirements = project
@@ -419,7 +676,7 @@ fn cmd_status() {
     {
         print_runtime_version_warning(&runtime_status);
         println!("Project is in sync");
-        return;
+        return Ok(());
     }
 
     let lockfile_out_of_date = !missing_from_lockfile.is_empty() || !extra_in_lockfile.is_empty();
@@ -483,27 +740,31 @@ fn cmd_status() {
     std::process::exit(1);
 }
 
-fn cmd_clean() {
+fn cmd_clean() -> RpxResult<()> {
     let mut removed_any = false;
 
-    removed_any |= remove_dir_if_exists(&project_library_root_path(), "project library");
-    removed_any |= remove_dir_if_exists(&cache_dir_path(), "cache directory");
+    removed_any |= remove_dir_if_exists(&project_library_root_path(), "project library")?;
+    removed_any |= remove_dir_if_exists(&cache_dir_path(), "cache directory")?;
 
     if removed_any {
         println!("Removed project library and cache directories");
     } else {
         println!("Project library and cache directories are already clean");
     }
+    Ok(())
 }
 
-fn remove_dir_if_exists(path: &Path, label: &str) -> bool {
+fn remove_dir_if_exists(path: &Path, label: &str) -> RpxResult<bool> {
     if !path.exists() {
-        return false;
+        return Ok(false);
     }
 
-    fs::remove_dir_all(path)
-        .unwrap_or_else(|error| panic!("failed to remove {label} at {}: {error}", path.display()));
-    true
+    fs::remove_dir_all(path).map_err(|source| CleanError::RemoveFailed {
+        label: label.to_string(),
+        path: path.display().to_string(),
+        source,
+    })?;
+    Ok(true)
 }
 
 fn print_status_group(title: &str, items: &[String]) {
@@ -595,7 +856,7 @@ enum DownloadEvent {
         version: String,
     },
     Finished {
-        package: PendingInstall,
+        package: Box<PendingInstall>,
         result: Result<DownloadedInstall, String>,
     },
 }
@@ -742,34 +1003,37 @@ fn constraints_from_resolved_roots(
         .collect()
 }
 
-fn lock_from_description() -> LockOutcome {
-    let project = read_description().expect("failed to read DESCRIPTION");
+fn lock_from_description() -> RpxResult<LockOutcome> {
+    let project = read_project_description()?;
     let roots = project.description.resolution_roots();
     let registry = default_registry_base_url();
     let repositories = configured_repositories(&project);
-    let existing_lockfile = read_lockfile_optional().expect("failed to read lockfile");
-    if let Some(lockfile) = &existing_lockfile {
-        if lockfile.version > LOCKFILE_VERSION {
-            eprint_newer_lockfile_message();
-            std::process::exit(1);
-        }
+    let existing_lockfile = read_project_lockfile_optional()?;
+    if let Some(lockfile) = &existing_lockfile
+        && lockfile.version > LOCKFILE_VERSION
+    {
+        return Err(LockError::LockfileNewer.into());
     }
     let sysreq_db = load_sysreq_snapshot_for_lock(existing_lockfile.as_ref());
 
     if roots.is_empty() {
         let lockfile = lockfile_from_resolution(vec![], &registry, &[], &sysreq_db);
         let changed = existing_lockfile.as_ref() != Some(&lockfile);
-        write_lockfile(lockfile);
-        return LockOutcome { changed };
+        write_project_lockfile(lockfile)?;
+        return Ok(LockOutcome { changed });
     }
 
-    let resolved = resolve_from_registry(&repositories, &roots, &BTreeMap::new())
-        .unwrap_or_else(|error| panic!("failed to resolve package set from registry: {error}"));
+    let resolved =
+        resolve_from_registry(&repositories, &roots, &BTreeMap::new()).map_err(|details| {
+            LockError::ResolveFailed {
+                details: details.to_string(),
+            }
+        })?;
 
     let lockfile = lockfile_from_resolution(roots, &registry, &resolved, &sysreq_db);
     let changed = existing_lockfile.as_ref() != Some(&lockfile);
-    write_lockfile(lockfile);
-    LockOutcome { changed }
+    write_project_lockfile(lockfile)?;
+    Ok(LockOutcome { changed })
 }
 
 fn load_sysreq_snapshot_for_lock(
@@ -787,13 +1051,12 @@ fn load_sysreq_snapshot_for_lock(
     if let Some(commit) = existing_lockfile
         .map(|lockfile| lockfile.sysreqs.db_commit.as_str())
         .filter(|commit| !commit.is_empty())
+        && let Ok(snapshot) = sysreqs::snapshot_for_commit(commit)
     {
-        if let Ok(snapshot) = sysreqs::snapshot_for_commit(commit) {
-            eprintln!(
-                "warning: using system requirements database pinned by the existing lockfile ({commit})"
-            );
-            return snapshot;
-        }
+        eprintln!(
+            "warning: using system requirements database pinned by the existing lockfile ({commit})"
+        );
+        return snapshot;
     }
 
     eprintln!(
@@ -802,25 +1065,25 @@ fn load_sysreq_snapshot_for_lock(
     empty_sysreq_snapshot()
 }
 
-fn sync_from_lockfile(install_system: bool, install_only_system: bool) -> SyncOutcome {
-    let project = read_description().expect("failed to read DESCRIPTION");
+fn sync_from_lockfile(install_system: bool, install_only_system: bool) -> RpxResult<SyncOutcome> {
+    let project = read_project_description()?;
     let manifest_requirements = project
         .description
         .requirements()
         .into_iter()
         .collect::<BTreeSet<_>>();
-    let lockfile = read_lockfile().expect("failed to read lockfile");
-    validate_lockfile_compatibility_for_sync(&lockfile);
-    validate_runtime_for_sync(&lockfile);
+    let lockfile = read_project_lockfile()?;
+    validate_lockfile_compatibility_for_sync(&lockfile)?;
+    validate_runtime_for_sync(&lockfile)?;
     if host_supports_system_sync() {
         let system_plan = system_plan_from_lockfile(&lockfile).unwrap_or_else(|error| {
             eprintln!("warning: failed to prepare system dependency plan: {error}");
             system_plan_without_db(&lockfile)
         });
         let proceed_with_r =
-            handle_system_requirements(&system_plan, install_system, install_only_system);
+            handle_system_requirements(&system_plan, install_system, install_only_system)?;
         if install_only_system || !proceed_with_r {
-            return SyncOutcome::default();
+            return Ok(SyncOutcome::default());
         }
     }
     let lock_requirements = lockfile
@@ -830,8 +1093,7 @@ fn sync_from_lockfile(install_system: bool, install_only_system: bool) -> SyncOu
         .collect::<BTreeSet<_>>();
 
     if manifest_requirements != lock_requirements {
-        eprintln!("lockfile out of date; run rpx lock");
-        std::process::exit(1);
+        return Err(SyncError::LockfileOlder.into());
     }
 
     let installed = installed_packages_by_name();
@@ -863,12 +1125,13 @@ fn sync_from_lockfile(install_system: bool, install_only_system: bool) -> SyncOu
         let package = pending
             .remove(&name)
             .expect("cached package should still be pending");
-        restore_cached_package(&package, &project_library_path()).unwrap_or_else(|error| {
-            panic!(
-                "failed to restore cached package {}@{}: {error}",
-                package.name, package.version
-            )
-        });
+        restore_cached_package(&package, &project_library_path()).map_err(|details| {
+            SyncError::RestoreCachedPackageFailed {
+                package: package.name.clone(),
+                version: package.version.clone(),
+                details,
+            }
+        })?;
         satisfied.insert(package.name.clone());
         outcome.installed += 1;
         ui.finish_restore(&package.name, &package.version);
@@ -878,7 +1141,7 @@ fn sync_from_lockfile(install_system: bool, install_only_system: bool) -> SyncOu
     let download_order = pending.values().cloned().collect::<Vec<_>>();
     ui.start_downloads(download_order.len());
     let downloaded = download_artifacts_in_parallel(&repositories, &download_order, &ui)
-        .unwrap_or_else(|error| panic!("failed to prepare source artifacts: {error}"));
+        .map_err(|details| SyncError::DownloadArtifactsFailed { details })?;
     ui.finish_downloads();
 
     let project_library = project_library_path();
@@ -895,7 +1158,7 @@ fn sync_from_lockfile(install_system: bool, install_only_system: bool) -> SyncOu
         &project_library,
         &ui,
         &mut outcome,
-    );
+    )?;
     ui.finish_installs();
 
     let locked_names = locked_package_names(&lockfile);
@@ -938,7 +1201,7 @@ fn sync_from_lockfile(install_system: bool, install_only_system: bool) -> SyncOu
 
     if missing.is_empty() && extras.is_empty() && version_mismatches.is_empty() {
         ui.finish();
-        return outcome;
+        return Ok(outcome);
     }
 
     if !missing.is_empty() {
@@ -957,7 +1220,7 @@ fn sync_from_lockfile(install_system: bool, install_only_system: bool) -> SyncOu
     }
 
     ui.finish();
-    std::process::exit(1);
+    Err(SyncError::PostSyncVerificationFailed.into())
 }
 
 pub(crate) fn exit_with_status(code: Option<i32>) {
@@ -1057,26 +1320,6 @@ fn lockfile_from_resolution(
     }
 }
 
-fn print_relock_message() {
-    println!("Your lockfile was created by an older rpx version and needs to be updated.");
-    println!("Run: rpx lock");
-}
-
-fn print_newer_lockfile_message() {
-    println!("Your lockfile was created by a newer rpx version and cannot be read by this rpx.");
-    println!("Upgrade rpx or regenerate the lockfile with this version.");
-}
-
-fn eprint_relock_message() {
-    eprintln!("Your lockfile was created by an older rpx version and needs to be updated.");
-    eprintln!("Run: rpx lock");
-}
-
-fn eprint_newer_lockfile_message() {
-    eprintln!("Your lockfile was created by a newer rpx version and cannot be read by this rpx.");
-    eprintln!("Upgrade rpx or regenerate the lockfile with this version.");
-}
-
 fn validate_lockfile_compatibility(lockfile: &Lockfile) -> Result<(), LockfileCompatibilityError> {
     if lockfile.version < LOCKFILE_VERSION {
         return Err(LockfileCompatibilityError::Older);
@@ -1087,17 +1330,11 @@ fn validate_lockfile_compatibility(lockfile: &Lockfile) -> Result<(), LockfileCo
     Ok(())
 }
 
-fn validate_lockfile_compatibility_for_sync(lockfile: &Lockfile) {
+fn validate_lockfile_compatibility_for_sync(lockfile: &Lockfile) -> RpxResult<()> {
     match validate_lockfile_compatibility(lockfile) {
-        Ok(()) => {}
-        Err(LockfileCompatibilityError::Older) => {
-            eprint_relock_message();
-            std::process::exit(1);
-        }
-        Err(LockfileCompatibilityError::Newer) => {
-            eprint_newer_lockfile_message();
-            std::process::exit(1);
-        }
+        Ok(()) => Ok(()),
+        Err(LockfileCompatibilityError::Older) => Err(SyncError::LockfileOlder.into()),
+        Err(LockfileCompatibilityError::Newer) => Err(SyncError::LockfileNewer.into()),
     }
 }
 
@@ -1215,7 +1452,7 @@ fn handle_system_requirements(
     plan: &SystemDependencyPlan,
     install_system: bool,
     install_only_system: bool,
-) -> bool {
+) -> RpxResult<bool> {
     let explicit_install = install_system || install_only_system;
     let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     let mut plan = plan.clone();
@@ -1235,7 +1472,7 @@ fn handle_system_requirements(
 
         eprintln!("Refreshing system package information...");
         refresh_system_metadata(&plan)
-            .unwrap_or_else(|error| panic!("failed to refresh package metadata: {error}"));
+            .map_err(|details| SyncError::MetadataRefreshFailed { details })?;
         match recheck_system_missing_packages(&plan) {
             Ok(missing_packages) => {
                 plan.missing_packages = missing_packages;
@@ -1253,7 +1490,7 @@ fn handle_system_requirements(
         if install_only_system {
             println!("System dependencies are already installed");
         }
-        return !install_only_system;
+        return Ok(!install_only_system);
     }
 
     if plan.installed_query_error.is_none() {
@@ -1279,19 +1516,19 @@ fn handle_system_requirements(
         let ui = SystemDepsUi::start();
         if let Err(error) = install_system_dependencies(&plan) {
             ui.fail();
-            panic!("failed to install system dependencies: {error}");
+            return Err(SyncError::SystemDependenciesFailed { details: error }.into());
         }
         ui.finish();
         if install_only_system {
             println!("System dependency sync complete.");
-            return false;
+            return Ok(false);
         }
-        return true;
+        return Ok(true);
     }
 
     if !interactive {
         eprintln!("warning: continuing with R package sync without installing system dependencies");
-        return !install_only_system;
+        return Ok(!install_only_system);
     }
 
     match prompt_for_system_dependency_action() {
@@ -1299,12 +1536,12 @@ fn handle_system_requirements(
             let ui = SystemDepsUi::start();
             if let Err(error) = install_system_dependencies(&plan) {
                 ui.fail();
-                panic!("failed to install system dependencies: {error}");
+                return Err(SyncError::SystemDependenciesFailed { details: error }.into());
             }
             ui.finish();
-            true
+            Ok(true)
         }
-        SyncSystemChoice::TryROnly => true,
+        SyncSystemChoice::TryROnly => Ok(true),
         SyncSystemChoice::Cancel => {
             println!("Canceled");
             std::process::exit(1);
@@ -1414,7 +1651,7 @@ fn locked_system_requirements(
     }
 }
 
-fn validate_runtime_for_sync(lockfile: &Lockfile) {
+fn validate_runtime_for_sync(lockfile: &Lockfile) -> RpxResult<()> {
     let status = runtime_status(lockfile);
 
     if let Some(version_mismatch) = status.version_mismatch {
@@ -1422,15 +1659,13 @@ fn validate_runtime_for_sync(lockfile: &Lockfile) {
     }
 
     if status.missing_base_packages.is_empty() {
-        return;
+        return Ok(());
     }
 
-    for package in &status.missing_base_packages {
-        eprintln!("R runtime is missing required base package: {package}");
+    Err(SyncError::RuntimeMissingBasePackages {
+        packages: status.missing_base_packages.join(", "),
     }
-    eprintln!("These packages are part of R itself and cannot be installed by rpx.");
-    eprintln!("Use a complete R installation compatible with this project.");
-    std::process::exit(1);
+    .into())
 }
 
 fn registry_source_url(registry: &str, package: &str, version: &str) -> String {
@@ -1713,7 +1948,10 @@ fn download_artifacts_in_parallel(
                                 install_type: "source".to_string(),
                             })
                     });
-                let _ = sender.send(DownloadEvent::Finished { package, result });
+                let _ = sender.send(DownloadEvent::Finished {
+                    package: Box::new(package),
+                    result,
+                });
             }
         });
     }
@@ -1772,7 +2010,7 @@ fn install_downloaded_packages_in_parallel(
     project_library: &Path,
     ui: &SyncUi,
     outcome: &mut SyncOutcome,
-) {
+) -> RpxResult<()> {
     let (sender, receiver) = mpsc::channel();
     let mut active_installs = 0;
     let mut active_source_builds = 0;
@@ -1808,10 +2046,10 @@ fn install_downloaded_packages_in_parallel(
 
         if active_installs == 0 {
             let blocked = pending.keys().cloned().collect::<Vec<_>>();
-            panic!(
-                "no installable packages remain after dependency resolution: {}",
-                blocked.join(", ")
-            );
+            return Err(SyncError::NoInstallablePackages {
+                packages: blocked.join(", "),
+            }
+            .into());
         }
 
         match receiver
@@ -1827,14 +2065,13 @@ fn install_downloaded_packages_in_parallel(
 
                 match result {
                     Ok(completed) => {
-                        finalize_built_package(&completed, project_library).unwrap_or_else(
-                            |error| {
-                                panic!(
-                                    "failed to cache built package {}@{}: {error}",
-                                    completed.package.name, completed.package.version
-                                )
-                            },
-                        );
+                        finalize_built_package(&completed, project_library).map_err(|details| {
+                            SyncError::CacheBuiltPackageFailed {
+                                package: completed.package.name.clone(),
+                                version: completed.package.version.clone(),
+                                details,
+                            }
+                        })?;
                         satisfied.insert(completed.package.name.clone());
                         outcome.installed += 1;
                         ui.finish_install(
@@ -1845,13 +2082,18 @@ fn install_downloaded_packages_in_parallel(
                     }
                     Err(error) => {
                         ui.fail_install(&package.name, &package.version);
-                        report_install_failure(&package.name, &package.version, &error);
-                        std::process::exit(error.exit_code.unwrap_or(1));
+                        return Err(install_failure_diagnostic(
+                            &package.name,
+                            &package.version,
+                            &error,
+                        )
+                        .into());
                     }
                 }
             }
         }
     }
+    Ok(())
 }
 
 fn spawn_install_worker(
@@ -2031,15 +2273,24 @@ fn locked_install_order(lockfile: &Lockfile) -> Result<Vec<String>, String> {
     Ok(ordered)
 }
 
-fn report_install_failure(name: &str, version: &str, failure: &InstallFailure) {
-    eprintln!("failed to install {name}@{version}");
-    eprintln!("summary: {}", failure.summary);
-    eprintln!("log: {}", failure.log_path.display());
-
+fn install_failure_diagnostic(name: &str, version: &str, failure: &InstallFailure) -> SyncError {
     let log_tail = read_log_tail(&failure.log_path, 80);
-    if !log_tail.is_empty() {
-        eprintln!("recent build output:");
-        eprintln!("{log_tail}");
+    let recent_output = if log_tail.is_empty() {
+        String::new()
+    } else {
+        format!("\nrecent build output:\n{log_tail}")
+    };
+
+    SyncError::InstallFailed {
+        package: name.to_string(),
+        version: version.to_string(),
+        exit_status: failure
+            .exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "terminated by signal".to_string()),
+        summary: failure.summary.clone(),
+        log_path: failure.log_path.display().to_string(),
+        recent_output,
     }
 }
 

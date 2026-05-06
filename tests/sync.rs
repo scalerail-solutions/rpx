@@ -204,12 +204,11 @@ fn refuses_to_sync_old_lockfile() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &sync_command);
     assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stderr
-            .contains("Your lockfile was created by an older rpx version and needs to be updated."),
+        stderr.contains("lockfile is out of date"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert!(
-        stderr.contains("Run: rpx lock"),
+        stderr.contains("Run `rpx lock`"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }
@@ -229,7 +228,7 @@ fn refuses_to_sync_newer_lockfile() {
     let (exit_code, stdout, stderr) = run_shell_command(&container, &sync_command);
     assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
     assert!(
-        stderr.contains("Your lockfile was created by a newer rpx version"),
+        stderr.contains("lockfile is incompatible"),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
     assert!(

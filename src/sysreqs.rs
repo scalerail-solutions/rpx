@@ -5,7 +5,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
     io::{IsTerminal, Read},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -268,10 +268,10 @@ pub(crate) fn preview_commands(plan: &SystemDependencyPlan) -> Vec<String> {
             .cloned()
             .map(prefix_command),
     );
-    if !plan.missing_packages.is_empty() {
-        if let Some(command) = package_install_command(&plan.host, &plan.missing_packages) {
-            commands.push(prefix_command(command));
-        }
+    if !plan.missing_packages.is_empty()
+        && let Some(command) = package_install_command(&plan.host, &plan.missing_packages)
+    {
+        commands.push(prefix_command(command));
     }
     commands.extend(
         plan.post_install_commands
@@ -942,7 +942,7 @@ fn db_snapshot_cache_path(commit: &str) -> PathBuf {
     path
 }
 
-fn ensure_parent_dir(path: &PathBuf) {
+fn ensure_parent_dir(path: &Path) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).expect("failed to create sysreq cache directory");
     }

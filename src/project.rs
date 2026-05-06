@@ -13,12 +13,12 @@ pub fn current_description_path() -> PathBuf {
     current_dir().join(DESCRIPTION_NAME)
 }
 
-pub fn description_path() -> PathBuf {
-    project_root().join(DESCRIPTION_NAME)
+pub fn description_path_result() -> Result<PathBuf, String> {
+    Ok(project_root_result()?.join(DESCRIPTION_NAME))
 }
 
-pub fn lockfile_path() -> PathBuf {
-    project_root().join(LOCKFILE_NAME)
+pub fn lockfile_path_result() -> Result<PathBuf, String> {
+    Ok(project_root_result()?.join(LOCKFILE_NAME))
 }
 
 pub fn project_library_path() -> PathBuf {
@@ -73,6 +73,10 @@ pub fn build_temp_library_path(package: &str, unique: &str) -> PathBuf {
 }
 
 pub fn project_root() -> PathBuf {
+    project_root_result().unwrap_or_else(|error| panic!("{error}"))
+}
+
+pub fn project_root_result() -> Result<PathBuf, String> {
     let current_dir = current_dir();
     let current_dir = current_dir
         .canonicalize()
@@ -80,11 +84,13 @@ pub fn project_root() -> PathBuf {
 
     for candidate in current_dir.ancestors() {
         if candidate.join(DESCRIPTION_NAME).exists() {
-            return candidate.to_path_buf();
+            return Ok(candidate.to_path_buf());
         }
     }
 
-    panic!("{DESCRIPTION_NAME} not found in current directory or any parent directory");
+    Err(format!(
+        "{DESCRIPTION_NAME} not found in current directory or any parent directory"
+    ))
 }
 
 fn current_dir() -> PathBuf {
