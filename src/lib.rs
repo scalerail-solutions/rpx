@@ -23,8 +23,8 @@ mod ui;
 use cli::{Cli, Commands, RepoCommands};
 use description::{DescriptionExt, init_description, read_description, write_description};
 use lockfile::{
-    LOCKFILE_VERSION, LockedR, LockedSystemRequirements, Lockfile, read_lockfile,
-    read_lockfile_optional, write_lockfile,
+    LOCKFILE_REVISION, LOCKFILE_VERSION, LockedR, LockedSystemRequirements, Lockfile,
+    read_lockfile, read_lockfile_optional, write_lockfile,
 };
 use project::{
     build_temp_library_path, cache_dir_path, compiled_cache_package_path, project_library_path,
@@ -330,11 +330,20 @@ fn cmd_status() {
         }
     };
 
-    if lockfile.version < LOCKFILE_VERSION {
-        println!("Lockfile is out of date");
-        println!();
-        print_relock_message();
-        std::process::exit(1);
+    match validate_lockfile_compatibility(&lockfile) {
+        Ok(()) => {}
+        Err(LockfileCompatibilityError::Older) => {
+            println!("Lockfile is out of date");
+            println!();
+            print_relock_message();
+            std::process::exit(1);
+        }
+        Err(LockfileCompatibilityError::Newer) => {
+            println!("Lockfile is incompatible");
+            println!();
+            print_newer_lockfile_message();
+            std::process::exit(1);
+        }
     }
 
     let manifest_requirements = project
@@ -524,6 +533,12 @@ struct LockOutcome {
 struct SyncOutcome {
     installed: usize,
     removed: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LockfileCompatibilityError {
+    Older,
+    Newer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -733,6 +748,12 @@ fn lock_from_description() -> LockOutcome {
     let registry = default_registry_base_url();
     let repositories = configured_repositories(&project);
     let existing_lockfile = read_lockfile_optional().expect("failed to read lockfile");
+    if let Some(lockfile) = &existing_lockfile {
+        if lockfile.version > LOCKFILE_VERSION {
+            eprint_newer_lockfile_message();
+            std::process::exit(1);
+        }
+    }
     let sysreq_db = load_sysreq_snapshot_for_lock(existing_lockfile.as_ref());
 
     if roots.is_empty() {
@@ -789,7 +810,7 @@ fn sync_from_lockfile(install_system: bool, install_only_system: bool) -> SyncOu
         .into_iter()
         .collect::<BTreeSet<_>>();
     let lockfile = read_lockfile().expect("failed to read lockfile");
-    validate_lockfile_version_for_sync(&lockfile);
+    validate_lockfile_compatibility_for_sync(&lockfile);
     validate_runtime_for_sync(&lockfile);
     if host_supports_system_sync() {
         let system_plan = system_plan_from_lockfile(&lockfile).unwrap_or_else(|error| {
@@ -995,6 +1016,7 @@ fn lockfile_from_resolution(
     let sysreqs = locked_system_requirements(resolved, sysreq_db);
     Lockfile {
         version: LOCKFILE_VERSION,
+        revision: LOCKFILE_REVISION,
         registry: registry.to_string(),
         r: LockedR {
             version: runtime_info().version,
@@ -1040,14 +1062,43 @@ fn print_relock_message() {
     println!("Run: rpx lock");
 }
 
-fn validate_lockfile_version_for_sync(lockfile: &Lockfile) {
-    if lockfile.version >= LOCKFILE_VERSION {
-        return;
-    }
+fn print_newer_lockfile_message() {
+    println!("Your lockfile was created by a newer rpx version and cannot be read by this rpx.");
+    println!("Upgrade rpx or regenerate the lockfile with this version.");
+}
 
+fn eprint_relock_message() {
     eprintln!("Your lockfile was created by an older rpx version and needs to be updated.");
     eprintln!("Run: rpx lock");
-    std::process::exit(1);
+}
+
+fn eprint_newer_lockfile_message() {
+    eprintln!("Your lockfile was created by a newer rpx version and cannot be read by this rpx.");
+    eprintln!("Upgrade rpx or regenerate the lockfile with this version.");
+}
+
+fn validate_lockfile_compatibility(lockfile: &Lockfile) -> Result<(), LockfileCompatibilityError> {
+    if lockfile.version < LOCKFILE_VERSION {
+        return Err(LockfileCompatibilityError::Older);
+    }
+    if lockfile.version > LOCKFILE_VERSION {
+        return Err(LockfileCompatibilityError::Newer);
+    }
+    Ok(())
+}
+
+fn validate_lockfile_compatibility_for_sync(lockfile: &Lockfile) {
+    match validate_lockfile_compatibility(lockfile) {
+        Ok(()) => {}
+        Err(LockfileCompatibilityError::Older) => {
+            eprint_relock_message();
+            std::process::exit(1);
+        }
+        Err(LockfileCompatibilityError::Newer) => {
+            eprint_newer_lockfile_message();
+            std::process::exit(1);
+        }
+    }
 }
 
 fn locked_base_packages(roots: &[ResolutionRoot], resolved: &[ResolvedPackage]) -> Vec<String> {
@@ -2005,17 +2056,17 @@ fn read_log_tail(path: &Path, max_lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        add_resolution_roots, binary_artifact_request, compiled_cache_key,
-        constraints_from_resolved_roots, default_registry_base_url, locked_install_order,
-        lockfile_from_resolution, persisted_constraints, r_minor_version, semver_add_constraint,
-        should_fallback_to_source,
+        LockfileCompatibilityError, add_resolution_roots, binary_artifact_request,
+        compiled_cache_key, constraints_from_resolved_roots, default_registry_base_url,
+        locked_install_order, lockfile_from_resolution, persisted_constraints, r_minor_version,
+        semver_add_constraint, should_fallback_to_source, validate_lockfile_compatibility,
     };
     use crate::description::RDescription;
     use crate::{
         description::DescriptionExt,
         lockfile::{
-            LOCKFILE_VERSION, LockedDependency, LockedPackage, LockedR, LockedSystemRequirements,
-            Lockfile,
+            LOCKFILE_REVISION, LOCKFILE_VERSION, LockedDependency, LockedPackage, LockedR,
+            LockedSystemRequirements, Lockfile,
         },
         r::RuntimeInfo,
         registry::ResolutionRoot,
@@ -2267,9 +2318,32 @@ mod tests {
     }
 
     #[test]
+    fn accepts_newer_revision_but_rejects_newer_lockfile_version() {
+        let mut lockfile = Lockfile {
+            version: LOCKFILE_VERSION,
+            revision: LOCKFILE_REVISION + 1,
+            registry: "https://api.rrepo.org".to_string(),
+            r: LockedR::default(),
+            sysreqs: LockedSystemRequirements::default(),
+            roots: vec![],
+            packages: BTreeMap::new(),
+        };
+
+        assert_eq!(validate_lockfile_compatibility(&lockfile), Ok(()));
+
+        lockfile.version = LOCKFILE_VERSION + 1;
+
+        assert_eq!(
+            validate_lockfile_compatibility(&lockfile),
+            Err(LockfileCompatibilityError::Newer)
+        );
+    }
+
+    #[test]
     fn installs_locked_packages_in_dependency_order() {
         let lockfile = Lockfile {
             version: LOCKFILE_VERSION,
+            revision: LOCKFILE_REVISION,
             registry: "https://api.rrepo.org".to_string(),
             r: LockedR::default(),
             sysreqs: LockedSystemRequirements::default(),
@@ -2341,6 +2415,7 @@ mod tests {
     fn rejects_cyclic_locked_dependencies() {
         let lockfile = Lockfile {
             version: LOCKFILE_VERSION,
+            revision: LOCKFILE_REVISION,
             registry: "https://api.rrepo.org".to_string(),
             r: LockedR::default(),
             sysreqs: LockedSystemRequirements::default(),

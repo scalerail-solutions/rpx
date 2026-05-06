@@ -87,6 +87,34 @@ fn reports_old_lockfile_needs_update() {
 }
 
 #[test]
+fn reports_newer_lockfile_is_incompatible() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-status-newer-lockfile";
+    create_package_project(&container, project_path);
+    let seed_lockfile = format!(
+        "mkdir -p {project_path} && cd {project_path} && cat > rpx.lock <<'EOF'\n{{\n  \"version\": 999,\n  \"registry\": \"https://api.rrepo.org\",\n  \"roots\": [],\n  \"packages\": {{}}\n}}\nEOF"
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &seed_lockfile);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let status_command = format!("cd {project_path} && rpx status");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &status_command);
+    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stdout.contains("Lockfile is incompatible"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert!(
+        stdout.contains("Your lockfile was created by a newer rpx version"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert!(
+        stdout.contains("Upgrade rpx or regenerate the lockfile with this version."),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+}
+
+#[test]
 fn runs_rpx_status_ignores_additional_repositories() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-status-repo-drift";
