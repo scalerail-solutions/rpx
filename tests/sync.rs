@@ -82,6 +82,10 @@ fn runs_rpx_lock_from_current_library() {
 
     let lockfile = read_project_file(&container, project_path, "rpx.lock");
     assert!(
+        lockfile.contains("\"revision\": 0"),
+        "lockfile was: {lockfile}"
+    );
+    assert!(
         lockfile.contains("\"roots\": []"),
         "lockfile was: {lockfile}"
     );
@@ -206,6 +210,30 @@ fn refuses_to_sync_old_lockfile() {
     );
     assert!(
         stderr.contains("Run: rpx lock"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+}
+
+#[test]
+fn refuses_to_sync_newer_lockfile() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-sync-newer-lockfile";
+    create_package_project(&container, project_path);
+    let seed_lockfile = format!(
+        "mkdir -p {project_path} && cd {project_path} && cat > rpx.lock <<'EOF'\n{{\n  \"version\": 999,\n  \"registry\": \"https://api.rrepo.org\",\n  \"roots\": [],\n  \"packages\": {{}}\n}}\nEOF"
+    );
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &seed_lockfile);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let sync_command = format!("cd {project_path} && rpx sync");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &sync_command);
+    assert_eq!(exit_code, 1, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stderr.contains("Your lockfile was created by a newer rpx version"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("Upgrade rpx or regenerate the lockfile with this version."),
         "stdout was: {stdout}\nstderr was: {stderr}"
     );
 }

@@ -3,10 +3,13 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs};
 
 pub const LOCKFILE_VERSION: u32 = 3;
+pub const LOCKFILE_REVISION: u32 = 0;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Lockfile {
     pub version: u32,
+    #[serde(default)]
+    pub revision: u32,
     pub registry: String,
     #[serde(default)]
     pub r: LockedR,
@@ -88,7 +91,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        LOCKFILE_VERSION, LockedDependency, LockedPackage, LockedR, LockedRoot,
+        LOCKFILE_REVISION, LOCKFILE_VERSION, LockedDependency, LockedPackage, LockedR, LockedRoot,
         LockedSystemRequirements, Lockfile,
     };
 
@@ -96,6 +99,7 @@ mod tests {
     fn serializes_new_registry_lockfile_shape() {
         let lockfile = Lockfile {
             version: LOCKFILE_VERSION,
+            revision: LOCKFILE_REVISION,
             registry: "https://api.rrepo.org".to_string(),
             r: LockedR {
                 version: "4.4.1".to_string(),
@@ -132,6 +136,7 @@ mod tests {
         let json = serde_json::to_string_pretty(&lockfile).expect("lockfile should serialize");
 
         assert!(json.contains("\"version\": 3"));
+        assert!(json.contains("\"revision\": 0"));
         assert!(json.contains("\"registry\": \"https://api.rrepo.org\""));
         assert!(json.contains("\"r\""));
         assert!(json.contains("\"sysreqs\""));
@@ -173,5 +178,19 @@ mod tests {
 
         assert_eq!(lockfile.r, LockedR::default());
         assert_eq!(lockfile.sysreqs, LockedSystemRequirements::default());
+    }
+
+    #[test]
+    fn reads_lockfile_without_revision_as_revision_zero() {
+        let json = r#"{
+  "version": 3,
+  "registry": "https://api.rrepo.org",
+  "roots": [],
+  "packages": {}
+}"#;
+
+        let lockfile: Lockfile = serde_json::from_str(json).expect("lockfile should parse");
+
+        assert_eq!(lockfile.revision, 0);
     }
 }
