@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs};
 
 pub const LOCKFILE_VERSION: u32 = 3;
-pub const LOCKFILE_REVISION: u32 = 0;
+pub const LOCKFILE_REVISION: u32 = 1;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Lockfile {
@@ -11,12 +11,22 @@ pub struct Lockfile {
     #[serde(default)]
     pub revision: u32,
     pub registry: String,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub use_default_repository: bool,
     #[serde(default)]
     pub r: LockedR,
     #[serde(default)]
     pub sysreqs: LockedSystemRequirements,
     pub roots: Vec<LockedRoot>,
     pub packages: BTreeMap<String, LockedPackage>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -101,6 +111,7 @@ mod tests {
             version: LOCKFILE_VERSION,
             revision: LOCKFILE_REVISION,
             registry: "https://api.rrepo.org".to_string(),
+            use_default_repository: true,
             r: LockedR {
                 version: "4.4.1".to_string(),
                 base_packages: vec!["utils".to_string()],
@@ -136,7 +147,7 @@ mod tests {
         let json = serde_json::to_string_pretty(&lockfile).expect("lockfile should serialize");
 
         assert!(json.contains("\"version\": 3"));
-        assert!(json.contains("\"revision\": 0"));
+        assert!(json.contains("\"revision\": 1"));
         assert!(json.contains("\"registry\": \"https://api.rrepo.org\""));
         assert!(json.contains("\"r\""));
         assert!(json.contains("\"sysreqs\""));
@@ -145,8 +156,27 @@ mod tests {
         assert!(json.contains("\"roots\""));
         assert!(json.contains("\"source_url\""));
         assert!(json.contains("\"dependencies\""));
+        assert!(!json.contains("\"use_default_repository\""));
         assert!(!json.contains("\"repositories\""));
         assert!(!json.contains("\"repository\""));
+    }
+
+    #[test]
+    fn serializes_disabled_default_repository_setting() {
+        let lockfile = Lockfile {
+            version: LOCKFILE_VERSION,
+            revision: LOCKFILE_REVISION,
+            registry: "https://api.rrepo.org".to_string(),
+            use_default_repository: false,
+            r: LockedR::default(),
+            sysreqs: LockedSystemRequirements::default(),
+            roots: vec![],
+            packages: BTreeMap::new(),
+        };
+
+        let json = serde_json::to_string_pretty(&lockfile).expect("lockfile should serialize");
+
+        assert!(json.contains("\"use_default_repository\": false"));
     }
 
     #[test]
@@ -178,6 +208,7 @@ mod tests {
 
         assert_eq!(lockfile.r, LockedR::default());
         assert_eq!(lockfile.sysreqs, LockedSystemRequirements::default());
+        assert!(lockfile.use_default_repository);
     }
 
     #[test]
