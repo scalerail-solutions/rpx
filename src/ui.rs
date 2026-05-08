@@ -7,7 +7,7 @@ use std::{
 
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
-use crate::registry::ArtifactKind;
+use crate::{output::note, registry::ArtifactKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InstallKind {
@@ -104,7 +104,7 @@ impl SyncUi {
             bar.set_message("from cache");
             self.downloads.replace(Some(bar));
         } else {
-            eprintln!("Restoring {total} cached packages");
+            note(format_args!("Restoring {total} cached packages"));
         }
     }
 
@@ -115,7 +115,7 @@ impl SyncUi {
             bar.inc(1);
         }
         if !self.interactive {
-            eprintln!("Restored {name}@{version} from cache");
+            note(format_args!("Restored {name}@{version} from cache"));
         }
     }
 
@@ -148,7 +148,7 @@ impl SyncUi {
             self.downloads.replace(Some(bar));
             self.update_download_message();
         } else {
-            eprintln!("Downloading {total} packages");
+            note(format_args!("Downloading {total} packages"));
         }
     }
 
@@ -177,7 +177,10 @@ impl SyncUi {
                 .borrow_mut()
                 .insert(name.to_string(), bar);
         } else {
-            eprintln!("Downloading {name}@{version} {}", artifact_label(kind));
+            note(format_args!(
+                "Downloading {name}@{version} {}",
+                artifact_label(kind)
+            ));
         }
     }
 
@@ -205,7 +208,9 @@ impl SyncUi {
 
     pub(crate) fn fallback_to_source(&self, name: &str, version: &str) {
         if !self.interactive {
-            eprintln!("{name}@{version} binary unavailable; falling back to source");
+            note(format_args!(
+                "{name}@{version} binary unavailable; falling back to source"
+            ));
         }
     }
 
@@ -221,7 +226,7 @@ impl SyncUi {
         self.update_download_message();
 
         if !self.interactive {
-            eprintln!("Downloaded {name}@{version} {}", kind.label());
+            note(format_args!("Downloaded {name}@{version} {}", kind.label()));
         }
     }
 
@@ -262,10 +267,12 @@ impl SyncUi {
             }
         } else {
             if binary_total > 0 {
-                eprintln!("Installing {binary_total} binary packages");
+                note(format_args!("Installing {binary_total} binary packages"));
             }
             if source_total > 0 {
-                eprintln!("Compiling {source_total} packages from source");
+                note(format_args!(
+                    "Compiling {source_total} packages from source"
+                ));
             }
         }
     }
@@ -291,7 +298,10 @@ impl SyncUi {
                     });
                 self.active_installs.borrow_mut().insert(name.clone(), bar);
             } else {
-                eprintln!("{} {name}@{version}", sentence_case(kind.active_label()));
+                note(format_args!(
+                    "{} {name}@{version}",
+                    sentence_case(kind.active_label())
+                ));
             }
         }
     }
@@ -318,7 +328,7 @@ impl SyncUi {
         }
 
         if !self.interactive {
-            eprintln!("Finished {name}@{version} {}", kind.label());
+            note(format_args!("Finished {name}@{version} {}", kind.label()));
         }
     }
 
@@ -356,7 +366,7 @@ impl SyncUi {
         }
 
         if !self.interactive {
-            eprintln!("Removing {total} extra packages");
+            note(format_args!("Removing {total} extra packages"));
         }
     }
 
@@ -413,7 +423,7 @@ impl SystemDepsUi {
             bar.set_message("installing system dependencies");
             bar
         } else {
-            eprintln!("Installing system dependencies...");
+            note("Installing system dependencies...");
             ProgressBar::hidden()
         };
 
@@ -425,7 +435,7 @@ impl SystemDepsUi {
             self.bar
                 .finish_with_message("Installed system dependencies".to_string());
         } else {
-            eprintln!("Installed system dependencies");
+            note("Installed system dependencies");
         }
     }
 

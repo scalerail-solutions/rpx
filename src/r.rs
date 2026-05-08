@@ -7,7 +7,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::project::project_library_path;
+use crate::{output::note, project::project_library_path};
 
 #[derive(Debug)]
 pub struct InstalledPackage {
@@ -172,10 +172,10 @@ pub fn remove_installed_packages(packages: &[String]) {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !stdout.trim().is_empty() {
-            eprintln!("{stdout}");
+            note(stdout);
         }
         if !stderr.trim().is_empty() {
-            eprintln!("{stderr}");
+            note(stderr);
         }
         crate::exit_with_status(output.status.code());
     }
