@@ -3,7 +3,7 @@ use miette::Diagnostic;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     env, fs,
-    io::{IsTerminal, Write},
+    io::IsTerminal,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
     thread,
@@ -14,6 +14,7 @@ use thiserror::Error;
 mod cli;
 mod description;
 mod lockfile;
+mod output;
 mod project;
 mod r;
 mod registry;
@@ -28,6 +29,7 @@ use lockfile::{
     LOCKFILE_REVISION, LOCKFILE_VERSION, LockedR, LockedSystemRequirements, Lockfile,
     read_lockfile, read_lockfile_optional, write_lockfile,
 };
+use output::{blank_note_line, blank_status_line, note, prompt, status, warning};
 use project::{
     build_temp_library_path, cache_dir_path, compiled_cache_package_path, project_library_path,
     project_library_root_path,
@@ -297,6 +299,63 @@ enum CleanError {
     },
 }
 
+#[derive(Debug, Error, Diagnostic)]
+enum RpxWarning {
+    #[error("using cached system requirements database snapshot")]
+    #[diagnostic(
+        severity(Warning),
+        code(rpx::sysreqs::cached_snapshot),
+        help("Run `rpx lock` later to refresh locked system dependency metadata.")
+    )]
+    CachedSysreqSnapshot,
+
+    #[error("using system requirements database pinned by the existing lockfile ({commit})")]
+    #[diagnostic(
+        severity(Warning),
+        code(rpx::sysreqs::pinned_snapshot),
+        help("Run `rpx lock` later to refresh locked system dependency metadata.")
+    )]
+    PinnedSysreqSnapshot { commit: String },
+
+    #[error(
+        "system requirements database unavailable; continuing without updating locked system dependency rules"
+    )]
+    #[diagnostic(
+        severity(Warning),
+        code(rpx::sysreqs::unavailable),
+        help("Check network access and run `rpx lock` again when the database is reachable.")
+    )]
+    SysreqUnavailable,
+
+    #[error("failed to prepare system dependency plan: {details}")]
+    #[diagnostic(
+        severity(Warning),
+        code(rpx::sysreqs::plan_failed),
+        help("rpx will continue with the system requirement rules recorded in rpx.lock.")
+    )]
+    SystemPlanFailed { details: String },
+
+    #[error("some system requirement rules do not have an install mapping for {host}: {rules}")]
+    #[diagnostic(severity(Warning), code(rpx::sysreqs::unsupported_rules))]
+    UnsupportedSystemRequirementRules { host: String, rules: String },
+
+    #[error("{details}")]
+    #[diagnostic(
+        severity(Warning),
+        code(rpx::runtime::version_mismatch),
+        help("Use the R version recorded in rpx.lock for the most reproducible install.")
+    )]
+    RuntimeVersionMismatch { details: String },
+
+    #[error("continuing with R package sync without installing system dependencies")]
+    #[diagnostic(
+        severity(Warning),
+        code(rpx::sync::system_dependencies_skipped),
+        help("Run `rpx sync --install-system` to install missing system dependencies first.")
+    )]
+    ContinuingWithoutSystemDependencies,
+}
+
 fn read_project_description() -> Result<description::ProjectDescription, ProjectError> {
     read_description().map_err(|details| ProjectError::DescriptionRead { details })
 }
@@ -351,8 +410,8 @@ fn cmd_init() -> RpxResult<()> {
             InitError::Failed { details }
         }
     })?;
-    println!("Initialized project at {path}");
-    println!("Next: run `rpx add <package>` or `rpx lock`");
+    status(format_args!("Initialized project at {path}"));
+    status("Next: run `rpx add <package>` or `rpx lock`");
     Ok(())
 }
 
@@ -406,7 +465,7 @@ fn cmd_add(packages: &[String]) -> RpxResult<()> {
         let _ = lock_from_description()?;
     }
     let _ = sync_from_lockfile(false, false)?;
-    println!("Added {}", packages.join(", "));
+    status(format_args!("Added {}", packages.join(", ")));
     Ok(())
 }
 
@@ -430,7 +489,10 @@ fn cmd_repo_add(url: &str) -> RpxResult<()> {
         .iter()
         .any(|existing| normalize_repository_url(existing) == source.base_url())
     {
-        println!("Repository already configured: {}", source.base_url());
+        status(format_args!(
+            "Repository already configured: {}",
+            source.base_url()
+        ));
         return Ok(());
     }
 
@@ -446,7 +508,7 @@ fn cmd_repo_add(url: &str) -> RpxResult<()> {
         .additional_repositories
         .push(source.base_url().to_string());
     write_project_description(&project)?;
-    println!("Added repository {}", source.base_url());
+    status(format_args!("Added repository {}", source.base_url()));
     Ok(())
 }
 
@@ -459,7 +521,10 @@ fn cmd_repo_remove(url: &str, remove_credential: bool) -> RpxResult<()> {
         .retain(|repository| normalize_repository_url(repository) != source.base_url());
 
     if project.additional_repositories.len() == original_len {
-        println!("Repository not configured: {}", source.base_url());
+        status(format_args!(
+            "Repository not configured: {}",
+            source.base_url()
+        ));
         return Ok(());
     }
 
@@ -471,7 +536,7 @@ fn cmd_repo_remove(url: &str, remove_credential: bool) -> RpxResult<()> {
             .map_err(|details| RepoError::CredentialRemove { details })?;
     }
 
-    println!("Removed repository {}", source.base_url());
+    status(format_args!("Removed repository {}", source.base_url()));
     Ok(())
 }
 
@@ -479,7 +544,7 @@ fn cmd_repo_list() -> RpxResult<()> {
     let project = read_project_description()?;
 
     if project.additional_repositories.is_empty() {
-        println!("No additional repositories configured");
+        status("No additional repositories configured");
         return Ok(());
     }
 
@@ -496,7 +561,7 @@ fn cmd_repo_list() -> RpxResult<()> {
         let credential = repositories
             .has_stored_credential(source)
             .map_err(|details| RepoError::CredentialInspect { details })?;
-        println!(
+        status(format_args!(
             "{} [{}]",
             source.base_url(),
             if credential {
@@ -504,7 +569,7 @@ fn cmd_repo_list() -> RpxResult<()> {
             } else {
                 "no credential"
             }
-        );
+        ));
     }
     Ok(())
 }
@@ -537,14 +602,14 @@ fn cmd_remove(packages: &[String]) -> RpxResult<()> {
     let _ = sync_from_lockfile(false, false)?;
 
     if !removed.is_empty() {
-        println!("Removed {}", removed.join(", "));
+        status(format_args!("Removed {}", removed.join(", ")));
     }
     if !missing.is_empty() {
-        println!(
+        status(format_args!(
             "{} {} already missing from the project library",
             missing.join(", "),
             if missing.len() == 1 { "is" } else { "are" }
-        );
+        ));
     }
     Ok(())
 }
@@ -569,9 +634,9 @@ fn cmd_run(command: &[String]) -> RpxResult<()> {
 fn cmd_lock() -> RpxResult<()> {
     let outcome = lock_from_description()?;
     if outcome.changed {
-        println!("Updated rpx.lock");
+        status("Updated rpx.lock");
     } else {
-        println!("rpx.lock is already up to date");
+        status("rpx.lock is already up to date");
     }
     Ok(())
 }
@@ -586,9 +651,9 @@ fn cmd_sync(install_system: bool, install_only_system: bool) -> RpxResult<()> {
         return Ok(());
     }
     if outcome.installed == 0 && outcome.removed == 0 {
-        println!("Project library is already in sync");
+        status("Project library is already in sync");
     } else {
-        println!("Synchronized project library");
+        status("Synchronized project library");
     }
     Ok(())
 }
@@ -675,7 +740,7 @@ fn cmd_status() -> RpxResult<()> {
             .unwrap_or(true)
     {
         print_runtime_version_warning(&runtime_status);
-        println!("Project is in sync");
+        status("Project is in sync");
         return Ok(());
     }
 
@@ -690,21 +755,21 @@ fn cmd_status() -> RpxResult<()> {
         .unwrap_or(false);
 
     if lockfile_out_of_date && library_out_of_date {
-        println!("Project is out of sync");
-        println!();
-        println!("Run: rpx lock && rpx sync");
+        status("Project is out of sync");
+        blank_status_line();
+        status("Run: rpx lock && rpx sync");
     } else if lockfile_out_of_date {
-        println!("Lockfile is out of date");
-        println!();
-        println!("Run: rpx lock");
+        status("Lockfile is out of date");
+        blank_status_line();
+        status("Run: rpx lock");
     } else if runtime_out_of_date {
-        println!("R runtime is out of sync");
+        status("R runtime is out of sync");
     } else if system_out_of_date {
-        println!("System dependencies are out of sync");
+        status("System dependencies are out of sync");
     } else {
-        println!("Project library is out of sync");
-        println!();
-        println!("Run: rpx sync");
+        status("Project library is out of sync");
+        blank_status_line();
+        status("Run: rpx sync");
     }
 
     print_status_group(
@@ -747,9 +812,9 @@ fn cmd_clean() -> RpxResult<()> {
     removed_any |= remove_dir_if_exists(&cache_dir_path(), "cache directory")?;
 
     if removed_any {
-        println!("Removed project library and cache directories");
+        status("Removed project library and cache directories");
     } else {
-        println!("Project library and cache directories are already clean");
+        status("Project library and cache directories are already clean");
     }
     Ok(())
 }
@@ -772,10 +837,10 @@ fn print_status_group(title: &str, items: &[String]) {
         return;
     }
 
-    println!();
-    println!("{title}");
+    blank_status_line();
+    status(title);
     for item in items {
-        println!("- {item}");
+        status(format_args!("- {item}"));
     }
 }
 
@@ -1044,7 +1109,7 @@ fn load_sysreq_snapshot_for_lock(
     }
 
     if let Ok(Some(snapshot)) = cached_latest_snapshot() {
-        eprintln!("warning: using cached system requirements database snapshot");
+        warning(RpxWarning::CachedSysreqSnapshot);
         return snapshot;
     }
 
@@ -1053,15 +1118,13 @@ fn load_sysreq_snapshot_for_lock(
         .filter(|commit| !commit.is_empty())
         && let Ok(snapshot) = sysreqs::snapshot_for_commit(commit)
     {
-        eprintln!(
-            "warning: using system requirements database pinned by the existing lockfile ({commit})"
-        );
+        warning(RpxWarning::PinnedSysreqSnapshot {
+            commit: commit.to_string(),
+        });
         return snapshot;
     }
 
-    eprintln!(
-        "warning: system requirements database unavailable; continuing without updating locked system dependency rules"
-    );
+    warning(RpxWarning::SysreqUnavailable);
     empty_sysreq_snapshot()
 }
 
@@ -1077,7 +1140,7 @@ fn sync_from_lockfile(install_system: bool, install_only_system: bool) -> RpxRes
     validate_runtime_for_sync(&lockfile)?;
     if host_supports_system_sync() {
         let system_plan = system_plan_from_lockfile(&lockfile).unwrap_or_else(|error| {
-            eprintln!("warning: failed to prepare system dependency plan: {error}");
+            warning(RpxWarning::SystemPlanFailed { details: error });
             system_plan_without_db(&lockfile)
         });
         let proceed_with_r =
@@ -1205,18 +1268,24 @@ fn sync_from_lockfile(install_system: bool, install_only_system: bool) -> RpxRes
     }
 
     if !missing.is_empty() {
-        eprintln!("missing from library after sync: {}", missing.join(", "));
+        note(format_args!(
+            "missing from library after sync: {}",
+            missing.join(", ")
+        ));
     }
 
     if !extras.is_empty() {
-        eprintln!("extra in library after sync: {}", extras.join(", "));
+        note(format_args!(
+            "extra in library after sync: {}",
+            extras.join(", ")
+        ));
     }
 
     if !version_mismatches.is_empty() {
-        eprintln!(
+        note(format_args!(
             "version mismatch after sync: {}",
             version_mismatches.join(", ")
-        );
+        ));
     }
 
     ui.finish();
@@ -1409,14 +1478,14 @@ fn runtime_status(lockfile: &Lockfile) -> RuntimeStatus {
     }
 }
 
-fn print_runtime_version_warning(status: &RuntimeStatus) {
-    let Some(version_mismatch) = &status.version_mismatch else {
+fn print_runtime_version_warning(runtime_status: &RuntimeStatus) {
+    let Some(version_mismatch) = &runtime_status.version_mismatch else {
         return;
     };
 
-    println!();
-    println!("R runtime differs from lockfile:");
-    println!("- {version_mismatch}");
+    blank_status_line();
+    status("R runtime differs from lockfile:");
+    status(format_args!("- {version_mismatch}"));
 }
 
 fn system_plan_from_lockfile(lockfile: &Lockfile) -> Result<SystemDependencyPlan, String> {
@@ -1458,11 +1527,10 @@ fn handle_system_requirements(
     let mut plan = plan.clone();
 
     if !plan.unsupported_rules.is_empty() {
-        eprintln!(
-            "warning: some system requirement rules do not have an install mapping for {}: {}",
-            plan.host.label(),
-            plan.unsupported_rules.join(", ")
-        );
+        warning(RpxWarning::UnsupportedSystemRequirementRules {
+            host: plan.host.label(),
+            rules: plan.unsupported_rules.join(", "),
+        });
     }
 
     if plan.needs_metadata_refresh && explicit_install {
@@ -1470,7 +1538,7 @@ fn handle_system_requirements(
             prompt_for_metadata_refresh(&plan);
         }
 
-        eprintln!("Refreshing system package information...");
+        note("Refreshing system package information...");
         refresh_system_metadata(&plan)
             .map_err(|details| SyncError::MetadataRefreshFailed { details })?;
         match recheck_system_missing_packages(&plan) {
@@ -1488,7 +1556,7 @@ fn handle_system_requirements(
 
     if plan.missing_packages.is_empty() {
         if install_only_system {
-            println!("System dependencies are already installed");
+            status("System dependencies are already installed");
         }
         return Ok(!install_only_system);
     }
@@ -1501,14 +1569,14 @@ fn handle_system_requirements(
     }
     let preview = sysreq_preview_commands(&plan);
     if !preview.is_empty() {
-        eprintln!("rpx will run:");
+        note("rpx will run:");
         for command in &preview {
-            eprintln!("- {command}");
+            note(format_args!("- {command}"));
         }
     }
 
     if explicit_install && interactive && !prompt_for_install_confirmation() {
-        println!("Canceled");
+        status("Canceled");
         std::process::exit(1);
     }
 
@@ -1520,14 +1588,14 @@ fn handle_system_requirements(
         }
         ui.finish();
         if install_only_system {
-            println!("System dependency sync complete.");
+            status("System dependency sync complete.");
             return Ok(false);
         }
         return Ok(true);
     }
 
     if !interactive {
-        eprintln!("warning: continuing with R package sync without installing system dependencies");
+        warning(RpxWarning::ContinuingWithoutSystemDependencies);
         return Ok(!install_only_system);
     }
 
@@ -1543,16 +1611,15 @@ fn handle_system_requirements(
         }
         SyncSystemChoice::TryROnly => Ok(true),
         SyncSystemChoice::Cancel => {
-            println!("Canceled");
+            status("Canceled");
             std::process::exit(1);
         }
     }
 }
 
 fn prompt_for_install_confirmation() -> bool {
-    eprintln!("Proceed with system package installation? [y/N]");
-    eprint!("> ");
-    std::io::stderr().flush().expect("failed to flush prompt");
+    note("Proceed with system package installation? [y/N]");
+    prompt("> ");
 
     let mut input = String::new();
     if std::io::stdin().read_line(&mut input).is_err() {
@@ -1563,37 +1630,36 @@ fn prompt_for_install_confirmation() -> bool {
 }
 
 fn print_system_package_summary(title: &str, packages: &[String]) {
-    eprintln!("{title}");
+    note(title);
     let shown = packages.iter().take(8).collect::<Vec<_>>();
     for package in shown {
-        eprintln!("- {package}");
+        note(format_args!("- {package}"));
     }
     if packages.len() > 8 {
-        eprintln!("- ... and {} more", packages.len() - 8);
+        note(format_args!("- ... and {} more", packages.len() - 8));
     }
 }
 
 fn prompt_for_metadata_refresh(plan: &SystemDependencyPlan) {
-    eprintln!("rpx could not verify which system packages are missing yet.");
-    eprintln!();
-    eprintln!("rpx can run:");
+    note("rpx could not verify which system packages are missing yet.");
+    blank_note_line();
+    note("rpx can run:");
     if let Some(command) = system_metadata_refresh_preview(plan) {
-        eprintln!("- {command}");
+        note(format_args!("- {command}"));
     }
-    eprintln!("to refresh apt package information and check what is missing.");
-    eprintln!();
-    eprintln!("Run package metadata refresh now? [y/N]");
-    eprint!("> ");
-    std::io::stderr().flush().expect("failed to flush prompt");
+    note("to refresh apt package information and check what is missing.");
+    blank_note_line();
+    note("Run package metadata refresh now? [y/N]");
+    prompt("> ");
 
     let mut input = String::new();
     if std::io::stdin().read_line(&mut input).is_err() {
-        println!("Canceled");
+        status("Canceled");
         std::process::exit(1);
     }
 
     if !matches!(input.trim(), "y" | "Y" | "yes" | "YES" | "Yes") {
-        println!("Canceled");
+        status("Canceled");
         std::process::exit(1);
     }
 }
@@ -1606,12 +1672,11 @@ enum SyncSystemChoice {
 }
 
 fn prompt_for_system_dependency_action() -> SyncSystemChoice {
-    eprintln!("Choose an action:");
-    eprintln!("1. Install system deps and continue");
-    eprintln!("2. Try to install R packages only");
-    eprintln!("3. Cancel");
-    eprint!("> ");
-    std::io::stderr().flush().expect("failed to flush prompt");
+    note("Choose an action:");
+    note("1. Install system deps and continue");
+    note("2. Try to install R packages only");
+    note("3. Cancel");
+    prompt("> ");
 
     let mut input = String::new();
     if std::io::stdin().read_line(&mut input).is_err() {
@@ -1655,7 +1720,9 @@ fn validate_runtime_for_sync(lockfile: &Lockfile) -> RpxResult<()> {
     let status = runtime_status(lockfile);
 
     if let Some(version_mismatch) = status.version_mismatch {
-        eprintln!("warning: {version_mismatch}");
+        warning(RpxWarning::RuntimeVersionMismatch {
+            details: version_mismatch,
+        });
     }
 
     if status.missing_base_packages.is_empty() {

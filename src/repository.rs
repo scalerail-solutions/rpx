@@ -1,3 +1,4 @@
+use crate::output::try_prompt;
 use crate::registry::{
     PackageVersionsResponse, RegistryClient, RepositoryPackagesResponse, is_not_found_error,
     is_unauthorized_error,
@@ -6,7 +7,7 @@ use keyring::Entry;
 use std::{
     collections::{BTreeSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
-    io::{self, IsTerminal, Write},
+    io::{self, IsTerminal},
     sync::Arc,
 };
 
@@ -253,12 +254,7 @@ impl ApiKeyPrompter for TerminalApiKeyPrompter {
             format!("API key required for {}: ", source.base_url())
         };
 
-        io::stderr()
-            .write_all(prompt.as_bytes())
-            .map_err(|error| format!("failed to prompt for API key: {error}"))?;
-        io::stderr()
-            .flush()
-            .map_err(|error| format!("failed to prompt for API key: {error}"))?;
+        try_prompt(prompt).map_err(|error| format!("failed to prompt for API key: {error}"))?;
 
         let token = rpassword::read_password()
             .map_err(|error| format!("failed to read API key: {error}"))?;
