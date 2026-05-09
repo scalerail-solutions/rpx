@@ -165,6 +165,7 @@ impl RepositorySet {
         }
     }
 
+    #[cfg(test)]
     pub fn fetch_package_versions_with_retry(
         &self,
         package: &str,
@@ -192,6 +193,39 @@ impl RepositorySet {
         Err(format!(
             "unexpected registry response (404 Not Found): package {package} not found"
         ))
+    }
+
+    pub fn fetch_all_package_versions_with_retry(
+        &self,
+        package: &str,
+    ) -> Result<Vec<SourcedPackageVersions>, String> {
+        let mut responses = Vec::new();
+
+        for source in &self.sources {
+            let result = match source.kind() {
+                RepositoryKind::Rrepo => self.with_authorized_client(source, |client| {
+                    client.fetch_package_versions_with_retry(package)
+                }),
+                RepositoryKind::CranLike => self.fetch_cran_like_package_versions(source, package),
+            };
+
+            match result {
+                Ok(response) => responses.push(SourcedPackageVersions {
+                    source: source.clone(),
+                    response,
+                }),
+                Err(error) if is_not_found_error(&error) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+
+        if responses.is_empty() {
+            return Err(format!(
+                "unexpected registry response (404 Not Found): package {package} not found"
+            ));
+        }
+
+        Ok(responses)
     }
 
     pub fn fetch_description_with_retry(
