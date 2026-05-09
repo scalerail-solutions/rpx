@@ -442,7 +442,8 @@ fn cmd_add(packages: &[String], default_repo: bool, no_default_repo: bool) -> Rp
     let mut lockfile = read_project_lockfile_optional()?;
     let use_default_repository =
         resolve_use_default_repository(lockfile.as_ref(), default_repo, no_default_repo);
-    let repositories = configured_repositories(&project, use_default_repository);
+    let repositories = configured_repositories(&project, use_default_repository)
+        .map_err(|details| LockError::ResolveFailed { details })?;
     let mut new_packages = Vec::new();
 
     for package in packages {
@@ -533,6 +534,10 @@ fn cmd_repo_add(url: &str) -> RpxResult<()> {
 }
 
 fn detect_repository_source(url: &str) -> Result<RepositorySource, String> {
+    classify_repository_source(url)
+}
+
+fn classify_repository_source(url: &str) -> Result<RepositorySource, String> {
     let rrepo = RepositorySource::new(url);
     let rrepo_set = RepositorySet::new(vec![rrepo.clone()]);
     match rrepo_set.fetch_repository_packages(&rrepo) {
@@ -543,7 +548,7 @@ fn detect_repository_source(url: &str) -> Result<RepositorySource, String> {
             match cran_like_set.fetch_repository_packages(&cran_like) {
                 Ok(_) => Ok(cran_like),
                 Err(cran_error) => Err(format!(
-                    "not an rrepo API ({rrepo_error}) or CRAN-like directory listing ({cran_error})"
+                    "not an rrepo API ({rrepo_error}) or CRAN-like repository ({cran_error})"
                 )),
             }
         }
@@ -586,22 +591,22 @@ fn cmd_repo_list() -> RpxResult<()> {
         return Ok(());
     }
 
-    let repositories = RepositorySet::new(
-        project
-            .additional_repositories
-            .iter()
-            .cloned()
-            .map(RepositorySource::new)
-            .collect(),
-    );
-
-    for source in repositories.sources() {
+    for url in &project.additional_repositories {
+        let source = classify_repository_source(url).map_err(|details| RepoError::Add {
+            url: normalize_repository_url(url),
+            details,
+        })?;
+        let repositories = RepositorySet::new(vec![source.clone()]);
         let credential = repositories
-            .has_stored_credential(source)
+            .has_stored_credential(&source)
             .map_err(|details| RepoError::CredentialInspect { details })?;
         status(format_args!(
-            "{} [{}]",
+            "{} [{}; {}]",
             source.base_url(),
+            match source.kind() {
+                RepositoryKind::Rrepo => "rrepo",
+                RepositoryKind::CranLike => "CRAN-like",
+            },
             if credential {
                 "credential stored"
             } else {
@@ -1115,7 +1120,8 @@ fn lock_from_description(default_repo: bool, no_default_repo: bool) -> RpxResult
     let existing_lockfile = read_project_lockfile_optional()?;
     let use_default_repository =
         resolve_use_default_repository(existing_lockfile.as_ref(), default_repo, no_default_repo);
-    let repositories = configured_repositories(&project, use_default_repository);
+    let repositories = configured_repositories(&project, use_default_repository)
+        .map_err(|details| LockError::ResolveFailed { details })?;
     if let Some(lockfile) = &existing_lockfile
         && lockfile.version > LOCKFILE_VERSION
     {
@@ -1217,7 +1223,8 @@ fn sync_from_lockfile(install_system: bool, install_only_system: bool) -> RpxRes
 
     let installed = installed_packages_by_name();
     let runtime = runtime_info();
-    let repositories = repositories_for_sync(&project, &lockfile);
+    let repositories = repositories_for_sync(&project, &lockfile)
+        .map_err(|details| SyncError::DownloadArtifactsFailed { details })?;
     let mut outcome = SyncOutcome::default();
     let ui = SyncUi::new();
     let mut satisfied = installed
@@ -1364,35 +1371,37 @@ fn default_registry_base_url() -> String {
 fn configured_repositories(
     project: &description::ProjectDescription,
     use_default_repository: bool,
-) -> RepositorySet {
-    RepositorySet::new(repository_sources_from_project(
+) -> Result<RepositorySet, String> {
+    Ok(RepositorySet::new(repository_sources_from_project(
         project,
         use_default_repository,
-    ))
+    )?))
 }
 
 fn repository_sources_from_project(
     project: &description::ProjectDescription,
     use_default_repository: bool,
-) -> Vec<RepositorySource> {
+) -> Result<Vec<RepositorySource>, String> {
     let mut sources = Vec::new();
     if use_default_repository {
         sources.push(RepositorySource::new(default_registry_base_url()));
     }
-    sources.extend(
-        project
-            .additional_repositories
-            .iter()
-            .flat_map(|url| [RepositorySource::new(url), RepositorySource::cran_like(url)]),
-    );
-    sources
+    for url in &project.additional_repositories {
+        sources.push(classify_repository_source(url).map_err(|details| {
+            format!(
+                "failed to classify configured repository {}: {details}",
+                normalize_repository_url(url)
+            )
+        })?);
+    }
+    Ok(sources)
 }
 
 fn repositories_for_sync(
     project: &description::ProjectDescription,
     lockfile: &Lockfile,
-) -> RepositorySet {
-    let mut sources = repository_sources_from_project(project, lockfile.use_default_repository);
+) -> Result<RepositorySet, String> {
+    let mut sources = repository_sources_from_project(project, lockfile.use_default_repository)?;
     sources.extend(lockfile.packages.values().filter_map(|package| {
         let source_url = package.source_url.as_deref()?;
         repository_source_from_package_url(source_url)
@@ -1401,7 +1410,7 @@ fn repositories_for_sync(
                 cran_like_source_from_package_url(source_url).map(RepositorySource::cran_like)
             })
     }));
-    RepositorySet::new(sources)
+    Ok(RepositorySet::new(sources))
 }
 
 fn resolve_use_default_repository(
@@ -2562,9 +2571,9 @@ fn read_log_tail(path: &Path, max_lines: usize) -> String {
 mod tests {
     use super::{
         LockfileCompatibilityError, add_resolution_roots, binary_artifact_request,
-        compiled_cache_key, constraints_from_resolved_roots, cran_like_binary_artifact_request,
-        default_registry_base_url, locked_install_order, lockfile_from_resolution,
-        persisted_constraints, preferred_artifact, r_minor_version,
+        classify_repository_source, compiled_cache_key, constraints_from_resolved_roots,
+        cran_like_binary_artifact_request, default_registry_base_url, locked_install_order,
+        lockfile_from_resolution, persisted_constraints, preferred_artifact, r_minor_version,
         repository_sources_from_project, resolve_use_default_repository, semver_add_constraint,
         should_fallback_to_source, validate_lockfile_compatibility,
     };
@@ -2577,10 +2586,11 @@ mod tests {
         },
         r::RuntimeInfo,
         registry::ResolutionRoot,
-        repository::{RepositorySet, RepositorySource},
+        repository::{RepositoryKind, RepositorySet, RepositorySource},
         resolver::{ResolvedDependency, ResolvedPackage},
         sysreqs::SysreqDbSnapshot,
     };
+    use mockito::Server;
     use std::collections::BTreeMap;
     use std::{
         env,
@@ -2758,17 +2768,92 @@ mod tests {
         let project = ProjectDescription {
             description: RDescription::from_str("Package: test\nVersion: 0.1.0\n")
                 .expect("description should parse"),
-            additional_repositories: vec!["https://cran.example".to_string()],
+            additional_repositories: vec![],
         };
 
-        let sources = repository_sources_from_project(&project, false);
+        let sources =
+            repository_sources_from_project(&project, false).expect("sources should build");
 
-        assert_eq!(sources.len(), 2);
-        assert!(
-            sources
-                .iter()
-                .all(|source| source.base_url() == "https://cran.example")
-        );
+        assert!(sources.is_empty());
+    }
+
+    #[test]
+    fn classifies_rrepo_repository_sources_up_front() {
+        let mut server = Server::new();
+        let packages_mock = server
+            .mock("GET", "/packages")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"repositorySlug":"test","packages":[]}"#)
+            .expect(1)
+            .create();
+
+        let source = classify_repository_source(&server.url()).expect("rrepo should classify");
+
+        assert_eq!(source.kind(), RepositoryKind::Rrepo);
+        packages_mock.assert();
+    }
+
+    #[test]
+    fn classifies_cran_like_repository_sources_up_front() {
+        let mut server = Server::new();
+        let rrepo_mock = server
+            .mock("GET", "/packages")
+            .with_status(404)
+            .expect(1)
+            .create();
+        let gz_mock = server
+            .mock("GET", "/src/contrib/PACKAGES.gz")
+            .with_status(404)
+            .expect(1)
+            .create();
+        let packages_mock = server
+            .mock("GET", "/src/contrib/PACKAGES")
+            .with_status(200)
+            .with_header("content-type", "text/plain")
+            .with_body("Package: digest\nVersion: 0.6.38\n")
+            .expect(1)
+            .create();
+
+        let source = classify_repository_source(&server.url()).expect("CRAN-like should classify");
+
+        assert_eq!(source.kind(), RepositoryKind::CranLike);
+        rrepo_mock.assert();
+        gz_mock.assert();
+        packages_mock.assert();
+    }
+
+    #[test]
+    fn project_sources_include_classified_additional_repositories_once() {
+        let mut server = Server::new();
+        server
+            .mock("GET", "/packages")
+            .with_status(404)
+            .expect(1)
+            .create();
+        server
+            .mock("GET", "/src/contrib/PACKAGES.gz")
+            .with_status(404)
+            .expect(1)
+            .create();
+        server
+            .mock("GET", "/src/contrib/PACKAGES")
+            .with_status(200)
+            .with_header("content-type", "text/plain")
+            .with_body("Package: digest\nVersion: 0.6.38\n")
+            .expect(1)
+            .create();
+        let project = ProjectDescription {
+            description: RDescription::from_str("Package: test\nVersion: 0.1.0\n")
+                .expect("description should parse"),
+            additional_repositories: vec![server.url()],
+        };
+
+        let sources =
+            repository_sources_from_project(&project, false).expect("sources should build");
+
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].kind(), RepositoryKind::CranLike);
     }
 
     #[test]

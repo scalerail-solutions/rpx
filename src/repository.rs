@@ -62,7 +62,6 @@ pub struct RepositorySet {
         Arc<std::sync::Mutex<BTreeMap<String, BTreeMap<String, Vec<VersionSummary>>>>>,
     cran_archive_unavailable: Arc<std::sync::Mutex<BTreeSet<String>>>,
     cran_archive_listing_support: Arc<std::sync::Mutex<BTreeMap<String, CranArchiveSupport>>>,
-    unavailable_rrepo_sources: Arc<std::sync::Mutex<BTreeSet<String>>>,
 }
 
 impl std::fmt::Debug for RepositorySet {
@@ -147,7 +146,6 @@ impl RepositorySet {
             cran_current_indexes: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             cran_archive_unavailable: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
             cran_archive_listing_support: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
-            unavailable_rrepo_sources: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -172,16 +170,6 @@ impl RepositorySet {
         package: &str,
     ) -> Result<SourcedPackageVersions, String> {
         for source in &self.sources {
-            if source.kind() == RepositoryKind::Rrepo
-                && self
-                    .unavailable_rrepo_sources
-                    .lock()
-                    .expect("unavailable rrepo cache should lock")
-                    .contains(source.base_url())
-            {
-                continue;
-            }
-
             let result = match source.kind() {
                 RepositoryKind::Rrepo => self.with_authorized_client(source, |client| {
                     client.fetch_package_versions_with_retry(package)
@@ -195,15 +183,6 @@ impl RepositorySet {
                         source: source.clone(),
                         response,
                     });
-                }
-                Err(error)
-                    if source.kind() == RepositoryKind::Rrepo && is_not_found_error(&error) =>
-                {
-                    self.unavailable_rrepo_sources
-                        .lock()
-                        .expect("unavailable rrepo cache should lock")
-                        .insert(source.base_url().to_string());
-                    continue;
                 }
                 Err(error) if is_not_found_error(&error) => continue,
                 Err(error) => return Err(error),
@@ -1323,7 +1302,7 @@ Version: 1.1.6
     }
 
     #[test]
-    fn skips_rrepo_candidate_after_not_found_for_same_repository_base() {
+    fn keeps_querying_rrepo_after_package_not_found() {
         let mut server = Server::new();
         let digest_rrepo_mock = server
             .mock("GET", "/packages/digest/versions")
@@ -1332,43 +1311,40 @@ Version: 1.1.6
             .create();
         let rlang_rrepo_mock = server
             .mock("GET", "/packages/rlang/versions")
-            .with_status(404)
-            .expect(0)
-            .create();
-        let current_mock = server
-            .mock("GET", "/src/contrib/PACKAGES")
             .with_status(200)
-            .with_header("content-type", "text/plain")
-            .with_body("Package: digest\nVersion: 0.6.38\n\nPackage: rlang\nVersion: 1.1.6\n")
-            .expect(1)
-            .create();
-        let archive_mock = server
-            .mock("GET", "/src/contrib/Archive/")
-            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+  "package": "rlang",
+  "versions": [
+    {
+      "version": "1.1.6",
+      "sourceUrl": "https://example.test/packages/rlang/versions/1.1.6/source"
+    }
+  ]
+}"#,
+            )
             .expect(1)
             .create();
         let repositories = RepositorySet::with_support(
-            vec![
-                RepositorySource::new(server.url()),
-                RepositorySource::cran_like(server.url()),
-            ],
+            vec![RepositorySource::new(server.url())],
             Arc::new(MemoryCredentialStore::default()),
             Arc::new(StaticPrompter {
                 token: "secret".to_string(),
             }),
         );
 
-        repositories
+        let result = repositories
             .fetch_package_versions_with_retry("digest")
-            .expect("digest should resolve from CRAN-like source");
-        repositories
+            .expect_err("digest should remain missing");
+        assert!(is_not_found_error(&result));
+        let result = repositories
             .fetch_package_versions_with_retry("rlang")
-            .expect("rlang should resolve from CRAN-like source");
+            .expect("rlang should resolve from rrepo source");
+        assert_eq!(result.response.versions[0].version, "1.1.6");
 
         digest_rrepo_mock.assert();
         rlang_rrepo_mock.assert();
-        current_mock.assert();
-        archive_mock.assert();
     }
 
     #[test]
