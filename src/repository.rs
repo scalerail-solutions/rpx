@@ -23,6 +23,7 @@ const KEYRING_SERVICE: &str = "rpx";
 pub struct RepositorySource {
     base_url: String,
     kind: RepositoryKind,
+    cran_archive_support: Option<CranArchiveSupport>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -85,6 +86,18 @@ impl RepositorySource {
         Self {
             base_url: normalize_repository_url(base_url.as_ref()),
             kind,
+            cran_archive_support: None,
+        }
+    }
+
+    pub(crate) fn cran_like_with_archive_support(
+        base_url: impl AsRef<str>,
+        support: CranArchiveSupport,
+    ) -> Self {
+        Self {
+            base_url: normalize_repository_url(base_url.as_ref()),
+            kind: RepositoryKind::CranLike,
+            cran_archive_support: Some(support),
         }
     }
 
@@ -94,6 +107,10 @@ impl RepositorySource {
 
     pub fn kind(&self) -> RepositoryKind {
         self.kind
+    }
+
+    pub(crate) fn cran_archive_support(&self) -> Option<CranArchiveSupport> {
+        self.cran_archive_support
     }
 
     pub fn matches_source_url(&self, url: &str) -> bool {
@@ -138,14 +155,30 @@ impl RepositorySet {
                 deduped.push(source);
             }
         }
+        let cran_archive_listing_support = deduped
+            .iter()
+            .filter_map(|source| {
+                source
+                    .cran_archive_support()
+                    .map(|support| (source.base_url().to_string(), support))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let cran_archive_unavailable = cran_archive_listing_support
+            .iter()
+            .filter_map(|(url, support)| {
+                (*support == CranArchiveSupport::Unavailable).then_some(url.clone())
+            })
+            .collect::<BTreeSet<_>>();
 
         Self {
             sources: deduped,
             credentials,
             prompter,
             cran_current_indexes: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
-            cran_archive_unavailable: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
-            cran_archive_listing_support: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            cran_archive_unavailable: Arc::new(std::sync::Mutex::new(cran_archive_unavailable)),
+            cran_archive_listing_support: Arc::new(std::sync::Mutex::new(
+                cran_archive_listing_support,
+            )),
         }
     }
 
@@ -654,8 +687,8 @@ enum CranLikeArchiveError {
     Failed(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CranArchiveSupport {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum CranArchiveSupport {
     Available,
     Unavailable,
 }
@@ -683,6 +716,16 @@ fn fetch_cran_like_archive_listing_available(
     }
 
     Ok(true)
+}
+
+pub(crate) fn detect_cran_like_archive_support(
+    source: &RepositorySource,
+) -> Result<CranArchiveSupport, String> {
+    match fetch_cran_like_archive_listing_available(source) {
+        Ok(true) => Ok(CranArchiveSupport::Available),
+        Ok(false) | Err(CranLikeArchiveError::Unavailable) => Ok(CranArchiveSupport::Unavailable),
+        Err(CranLikeArchiveError::Failed(error)) => Err(error),
+    }
 }
 
 fn fetch_cran_like_archive_versions(
@@ -1333,6 +1376,49 @@ Version: 1.1.6
             result.response.versions[1].source_url,
             format!("{}/src/contrib/digest_0.6.38.tar.gz", server.url())
         );
+    }
+
+    #[test]
+    fn uses_preclassified_cran_archive_support_for_package_versions() {
+        let mut server = Server::new();
+        let current_mock = server
+            .mock("GET", "/src/contrib/PACKAGES")
+            .with_status(200)
+            .with_header("content-type", "text/plain")
+            .with_body("Package: digest\nVersion: 0.6.38\n")
+            .expect(1)
+            .create();
+        let root_archive_mock = server
+            .mock("GET", "/src/contrib/Archive/")
+            .with_status(200)
+            .expect(0)
+            .create();
+        let package_archive_mock = server
+            .mock("GET", "/src/contrib/Archive/digest/")
+            .with_status(200)
+            .with_body(r#"<a href="digest_0.6.37.tar.gz">digest_0.6.37.tar.gz</a>"#)
+            .expect(1)
+            .create();
+        let source = RepositorySource::cran_like_with_archive_support(
+            server.url(),
+            CranArchiveSupport::Available,
+        );
+        let repositories = RepositorySet::with_support(
+            vec![source],
+            Arc::new(MemoryCredentialStore::default()),
+            Arc::new(StaticPrompter {
+                token: "secret".to_string(),
+            }),
+        );
+
+        let result = repositories
+            .fetch_package_versions_with_retry("digest")
+            .expect("digest should resolve");
+
+        assert_eq!(result.response.versions.len(), 2);
+        current_mock.assert();
+        root_archive_mock.assert();
+        package_archive_mock.assert();
     }
 
     #[test]

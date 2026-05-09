@@ -45,7 +45,7 @@ use registry::{
 };
 use repository::{
     RepositoryKind, RepositorySet, RepositorySource, cran_like_source_from_package_url,
-    normalize_repository_url, repository_source_from_package_url,
+    detect_cran_like_archive_support, normalize_repository_url, repository_source_from_package_url,
 };
 use resolver::{ResolvedPackage, is_base_package, resolve_from_registry};
 use sysreqs::{
@@ -546,7 +546,13 @@ fn classify_repository_source(url: &str) -> Result<RepositorySource, String> {
             let cran_like = RepositorySource::cran_like(url);
             let cran_like_set = RepositorySet::new(vec![cran_like.clone()]);
             match cran_like_set.fetch_repository_packages(&cran_like) {
-                Ok(_) => Ok(cran_like),
+                Ok(_) => {
+                    let archive_support = detect_cran_like_archive_support(&cran_like)?;
+                    Ok(RepositorySource::cran_like_with_archive_support(
+                        url,
+                        archive_support,
+                    ))
+                }
                 Err(cran_error) => Err(format!(
                     "not an rrepo API ({rrepo_error}) or CRAN-like repository ({cran_error})"
                 )),
@@ -2580,7 +2586,7 @@ mod tests {
         },
         r::RuntimeInfo,
         registry::ResolutionRoot,
-        repository::{RepositoryKind, RepositorySet, RepositorySource},
+        repository::{CranArchiveSupport, RepositoryKind, RepositorySet, RepositorySource},
         resolver::{ResolvedDependency, ResolvedPackage},
         sysreqs::SysreqDbSnapshot,
     };
@@ -2808,13 +2814,23 @@ mod tests {
             .with_body("Package: digest\nVersion: 0.6.38\n")
             .expect(1)
             .create();
+        let archive_mock = server
+            .mock("GET", "/src/contrib/Archive/")
+            .with_status(404)
+            .expect(1)
+            .create();
 
         let source = classify_repository_source(&server.url()).expect("CRAN-like should classify");
 
         assert_eq!(source.kind(), RepositoryKind::CranLike);
+        assert_eq!(
+            source.cran_archive_support(),
+            Some(CranArchiveSupport::Unavailable)
+        );
         rrepo_mock.assert();
         gz_mock.assert();
         packages_mock.assert();
+        archive_mock.assert();
     }
 
     #[test]
@@ -2837,6 +2853,11 @@ mod tests {
             .with_body("Package: digest\nVersion: 0.6.38\n")
             .expect(1)
             .create();
+        server
+            .mock("GET", "/src/contrib/Archive/")
+            .with_status(200)
+            .expect(1)
+            .create();
         let project = ProjectDescription {
             description: RDescription::from_str("Package: test\nVersion: 0.1.0\n")
                 .expect("description should parse"),
@@ -2848,6 +2869,10 @@ mod tests {
 
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].kind(), RepositoryKind::CranLike);
+        assert_eq!(
+            sources[0].cran_archive_support(),
+            Some(CranArchiveSupport::Available)
+        );
     }
 
     #[test]
