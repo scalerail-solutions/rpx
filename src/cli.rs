@@ -26,6 +26,20 @@ pub enum Commands {
     )]
     Add {
         #[arg(
+            long,
+            conflicts_with = "no_default_repo",
+            help = "Use the built-in default repository during resolution"
+        )]
+        default_repo: bool,
+
+        #[arg(
+            long,
+            conflicts_with = "default_repo",
+            help = "Do not use the built-in default repository during resolution"
+        )]
+        no_default_repo: bool,
+
+        #[arg(
             help = "Package names to add to the project's dependencies",
             value_name = "PACKAGE",
             required = true
@@ -38,6 +52,20 @@ pub enum Commands {
         long_about = "Remove one or more packages from this project. The packages are removed from DESCRIPTION, the project library is synced, and rpx regenerates rpx.lock."
     )]
     Remove {
+        #[arg(
+            long,
+            conflicts_with = "no_default_repo",
+            help = "Use the built-in default repository during resolution"
+        )]
+        default_repo: bool,
+
+        #[arg(
+            long,
+            conflicts_with = "default_repo",
+            help = "Do not use the built-in default repository during resolution"
+        )]
+        no_default_repo: bool,
+
         #[arg(
             help = "Package names to remove from the project's dependencies",
             value_name = "PACKAGE",
@@ -65,7 +93,21 @@ pub enum Commands {
         about = "Resolve project dependencies",
         long_about = "Resolve project dependencies from DESCRIPTION and write the resolved package set to rpx.lock without installing packages."
     )]
-    Lock,
+    Lock {
+        #[arg(
+            long,
+            conflicts_with = "no_default_repo",
+            help = "Use the built-in default repository during resolution"
+        )]
+        default_repo: bool,
+
+        #[arg(
+            long,
+            conflicts_with = "default_repo",
+            help = "Do not use the built-in default repository during resolution"
+        )]
+        no_default_repo: bool,
+    },
 
     #[command(
         about = "Check project dependency state",

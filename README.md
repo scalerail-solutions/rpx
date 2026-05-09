@@ -119,17 +119,26 @@ If local package state becomes confusing, remove the project library and caches:
 rpx clean
 ```
 
-## Additional Repositories
+## Repository Management
 
-The public rrepo registry is configured by default. Projects can add private or internal rrepo-compatible repositories:
+The public rrepo registry is enabled by default. It is the preferred primary source because it exposes package metadata through a low-latency API, which keeps dependency resolution fast.
+
+Projects can add additional repositories. `rpx repo add` detects whether a repository exposes the rrepo API or a CRAN-like `src/contrib/PACKAGES` index:
 
 ```bash
 rpx repo add https://<org-slug>.rrepo.dev/<repo-slug>
+rpx repo add https://packagemanager.posit.co/cran/latest
 rpx repo list
-rpx repo remove https://<org-slug>.rrepo.dev/<repo-slug>
+rpx repo remove https://packagemanager.posit.co/cran/latest
 ```
 
-Additional repositories must expose the rrepo package metadata API. `rpx repo add` does not support CRAN-like repositories, `PACKAGES` indexes, or CRAN-style Posit Package Manager URLs.
+A useful setup is to keep the default rrepo registry enabled and add Posit Package Manager's latest CRAN repository as a fallback for binary artifacts:
+
+```bash
+rpx repo add https://packagemanager.posit.co/cran/latest
+```
+
+During locking, `rpx` merges versions across enabled repositories. Existing locked versions are preferred when they are still available from enabled repositories. If the same version is available from multiple repositories, the earlier repository wins for the locked source URL.
 
 When a repository requires authentication, `rpx` prompts for an API key and stores it in the operating system keyring for that repository URL.
 
@@ -139,13 +148,16 @@ You can override the default public registry root with `RPX_REGISTRY_BASE_URL`:
 RPX_REGISTRY_BASE_URL=https://example.rrepo.dev/cran rpx lock
 ```
 
+To lock without the default public registry, use `rpx lock --no-default-repo`. The default-repo choice is recorded in `rpx.lock`; use `--default-repo` to enable it again when regenerating the lockfile.
+
 ## How It Works
 
 - `DESCRIPTION` is the dependency manifest.
 - `rpx.lock` records the resolved package set, package sources, and R runtime metadata.
-- `rpx lock` resolves dependencies and writes `rpx.lock`; it does not install packages.
+- `rpx lock` resolves dependencies from enabled repositories and writes `rpx.lock`; it does not install packages.
+- `rpx` prefers existing locked versions when they are still available from enabled repositories.
 - `rpx sync` installs exactly what `rpx.lock` records into the project library.
-- `rpx sync` uses Windows and macOS binary artifacts when available, then falls back to source artifacts.
+- `rpx sync` tries Windows and macOS binary artifacts from enabled repositories when available, then falls back to the locked source artifact.
 - `rpx run` sets the R library path for the command it runs.
 
 ## Local Development

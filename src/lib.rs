@@ -17,6 +17,7 @@ mod lockfile;
 mod output;
 mod project;
 mod r;
+mod r_version;
 mod registry;
 mod repository;
 mod resolver;
@@ -26,8 +27,9 @@ mod ui;
 use cli::{Cli, Commands, RepoCommands};
 use description::{DescriptionExt, init_description, read_description, write_description};
 use lockfile::{
-    LOCKFILE_REVISION, LOCKFILE_VERSION, LockedR, LockedSystemRequirements, Lockfile,
-    read_lockfile, read_lockfile_optional, write_lockfile,
+    LOCKFILE_REVISION, LOCKFILE_VERSION, LockedCranArchiveSupport, LockedR, LockedRepository,
+    LockedRepositoryKind, LockedSystemRequirements, Lockfile, read_lockfile,
+    read_lockfile_optional, write_lockfile,
 };
 use output::{blank_note_line, blank_status_line, note, prompt, status, warning};
 use project::{
@@ -44,7 +46,9 @@ use registry::{
     ResolutionRoot,
 };
 use repository::{
-    RepositorySet, RepositorySource, normalize_repository_url, repository_source_from_package_url,
+    CranArchiveSupport, RepositoryKind, RepositorySet, RepositorySource,
+    cran_like_source_from_package_url, detect_cran_like_archive_support, normalize_repository_url,
+    repository_source_from_package_url,
 };
 use resolver::{ResolvedPackage, is_base_package, resolve_from_registry};
 use sysreqs::{
@@ -354,6 +358,16 @@ enum RpxWarning {
         help("Run `rpx sync --install-system` to install missing system dependencies first.")
     )]
     ContinuingWithoutSystemDependencies,
+
+    #[error("archive listing unavailable for CRAN-like repository {url}")]
+    #[diagnostic(
+        severity(Warning),
+        code(rpx::repository::cran_archive_unavailable),
+        help(
+            "rpx can restore locked archived package URLs, but new resolution for this repository is limited to versions listed in PACKAGES."
+        )
+    )]
+    CranArchiveUnavailable { url: String },
 }
 
 fn read_project_description() -> Result<description::ProjectDescription, ProjectError> {
@@ -388,10 +402,21 @@ fn run_inner() -> RpxResult<()> {
 
     match cli.command {
         Commands::Init => cmd_init(),
-        Commands::Add { packages } => cmd_add(&packages),
-        Commands::Remove { packages } => cmd_remove(&packages),
+        Commands::Add {
+            default_repo,
+            no_default_repo,
+            packages,
+        } => cmd_add(&packages, default_repo, no_default_repo),
+        Commands::Remove {
+            default_repo,
+            no_default_repo,
+            packages,
+        } => cmd_remove(&packages, default_repo, no_default_repo),
         Commands::Run { command } => cmd_run(&command),
-        Commands::Lock => cmd_lock(),
+        Commands::Lock {
+            default_repo,
+            no_default_repo,
+        } => cmd_lock(default_repo, no_default_repo),
         Commands::Status => cmd_status(),
         Commands::Sync {
             install_system,
@@ -415,10 +440,13 @@ fn cmd_init() -> RpxResult<()> {
     Ok(())
 }
 
-fn cmd_add(packages: &[String]) -> RpxResult<()> {
+fn cmd_add(packages: &[String], default_repo: bool, no_default_repo: bool) -> RpxResult<()> {
     let mut project = read_project_description()?;
     let mut lockfile = read_project_lockfile_optional()?;
-    let repositories = configured_repositories(&project);
+    let use_default_repository =
+        resolve_use_default_repository(lockfile.as_ref(), default_repo, no_default_repo);
+    let repositories = configured_repositories(&project, use_default_repository, lockfile.as_ref())
+        .map_err(|details| LockError::ResolveFailed { details })?;
     let mut new_packages = Vec::new();
 
     for package in packages {
@@ -453,8 +481,11 @@ fn cmd_add(packages: &[String]) -> RpxResult<()> {
         lockfile = Some(lockfile_from_resolution(
             project.description.resolution_roots(),
             &default_registry_base_url(),
+            use_default_repository,
             &resolved_addition.resolved,
             &sysreq_db,
+            repositories.sources(),
+            None,
         ));
     }
 
@@ -462,7 +493,7 @@ fn cmd_add(packages: &[String]) -> RpxResult<()> {
     if let Some(lockfile) = lockfile {
         write_project_lockfile(lockfile)?;
     } else {
-        let _ = lock_from_description()?;
+        let _ = lock_from_description(default_repo, no_default_repo)?;
     }
     let _ = sync_from_lockfile(false, false)?;
     status(format_args!("Added {}", packages.join(", ")));
@@ -482,7 +513,10 @@ fn cmd_repo(command: RepoCommands) -> RpxResult<()> {
 
 fn cmd_repo_add(url: &str) -> RpxResult<()> {
     let mut project = read_project_description()?;
-    let source = RepositorySource::new(url);
+    let source = detect_repository_source(url).map_err(|details| RepoError::Add {
+        url: normalize_repository_url(url),
+        details,
+    })?;
 
     if project
         .additional_repositories
@@ -496,20 +530,74 @@ fn cmd_repo_add(url: &str) -> RpxResult<()> {
         return Ok(());
     }
 
-    let repositories = RepositorySet::new(vec![source.clone()]);
-    repositories
-        .fetch_repository_packages(&source)
-        .map_err(|details| RepoError::Add {
-            url: source.base_url().to_string(),
-            details,
-        })?;
-
     project
         .additional_repositories
         .push(source.base_url().to_string());
     write_project_description(&project)?;
     status(format_args!("Added repository {}", source.base_url()));
     Ok(())
+}
+
+fn detect_repository_source(url: &str) -> Result<RepositorySource, String> {
+    classify_repository_source(url)
+}
+
+fn classify_repository_source(url: &str) -> Result<RepositorySource, String> {
+    let rrepo = RepositorySource::new(url);
+    let rrepo_set = RepositorySet::new(vec![rrepo.clone()]);
+    match rrepo_set.fetch_repository_packages(&rrepo) {
+        Ok(_) => return Ok(rrepo),
+        Err(rrepo_error) => {
+            let cran_like = RepositorySource::cran_like(url);
+            let cran_like_set = RepositorySet::new(vec![cran_like.clone()]);
+            match cran_like_set.fetch_repository_packages(&cran_like) {
+                Ok(_) => {
+                    let archive_support = detect_cran_like_archive_support(&cran_like)?;
+                    Ok(match archive_support {
+                        Some(archive_support) => {
+                            RepositorySource::cran_like_with_archive_support(url, archive_support)
+                        }
+                        None => RepositorySource::cran_like(url),
+                    })
+                }
+                Err(cran_error) => Err(format!(
+                    "not an rrepo API ({rrepo_error}) or CRAN-like repository ({cran_error})"
+                )),
+            }
+        }
+    }
+}
+
+fn repository_source_from_lockfile(lockfile: &Lockfile, url: &str) -> Option<RepositorySource> {
+    let normalized = normalize_repository_url(url);
+    lockfile
+        .repositories
+        .iter()
+        .find(|repository| repository.url == normalized)
+        .map(repository_source_from_locked)
+}
+
+fn repository_source_from_locked(repository: &LockedRepository) -> RepositorySource {
+    match repository.kind {
+        LockedRepositoryKind::Rrepo => RepositorySource::new(&repository.url),
+        LockedRepositoryKind::CranLike => match repository.cran_archive_support {
+            Some(support) => RepositorySource::cran_like_with_archive_support(
+                &repository.url,
+                cran_archive_support_from_locked(support),
+            ),
+            None => RepositorySource::cran_like(&repository.url),
+        },
+    }
+}
+
+fn repository_kind_label(lockfile: Option<&Lockfile>, url: &str) -> &'static str {
+    match lockfile.and_then(|lockfile| repository_source_from_lockfile(lockfile, url)) {
+        Some(source) => match source.kind() {
+            RepositoryKind::Rrepo => "rrepo",
+            RepositoryKind::CranLike => "CRAN-like",
+        },
+        None => "unknown",
+    }
 }
 
 fn cmd_repo_remove(url: &str, remove_credential: bool) -> RpxResult<()> {
@@ -542,28 +630,26 @@ fn cmd_repo_remove(url: &str, remove_credential: bool) -> RpxResult<()> {
 
 fn cmd_repo_list() -> RpxResult<()> {
     let project = read_project_description()?;
+    let lockfile = read_project_lockfile_optional()?;
 
     if project.additional_repositories.is_empty() {
         status("No additional repositories configured");
         return Ok(());
     }
 
-    let repositories = RepositorySet::new(
-        project
-            .additional_repositories
-            .iter()
-            .cloned()
-            .map(RepositorySource::new)
-            .collect(),
-    );
-
-    for source in repositories.sources() {
+    for url in &project.additional_repositories {
+        let source = lockfile
+            .as_ref()
+            .and_then(|lockfile| repository_source_from_lockfile(lockfile, url))
+            .unwrap_or_else(|| RepositorySource::new(url));
+        let repositories = RepositorySet::new(vec![source.clone()]);
         let credential = repositories
-            .has_stored_credential(source)
+            .has_stored_credential(&source)
             .map_err(|details| RepoError::CredentialInspect { details })?;
         status(format_args!(
-            "{} [{}]",
-            source.base_url(),
+            "{} [{}; {}]",
+            normalize_repository_url(url),
+            repository_kind_label(lockfile.as_ref(), url),
             if credential {
                 "credential stored"
             } else {
@@ -574,7 +660,7 @@ fn cmd_repo_list() -> RpxResult<()> {
     Ok(())
 }
 
-fn cmd_remove(packages: &[String]) -> RpxResult<()> {
+fn cmd_remove(packages: &[String], default_repo: bool, no_default_repo: bool) -> RpxResult<()> {
     let mut project = read_project_description()?;
     for package in packages {
         project.description.remove_from_field("Imports", package);
@@ -598,7 +684,7 @@ fn cmd_remove(packages: &[String]) -> RpxResult<()> {
         remove_installed_packages(&removed);
     }
 
-    let _ = lock_from_description()?;
+    let _ = lock_from_description(default_repo, no_default_repo)?;
     let _ = sync_from_lockfile(false, false)?;
 
     if !removed.is_empty() {
@@ -631,8 +717,8 @@ fn cmd_run(command: &[String]) -> RpxResult<()> {
     Ok(())
 }
 
-fn cmd_lock() -> RpxResult<()> {
-    let outcome = lock_from_description()?;
+fn cmd_lock(default_repo: bool, no_default_repo: bool) -> RpxResult<()> {
+    let outcome = lock_from_description(default_repo, no_default_repo)?;
     if outcome.changed {
         status("Updated rpx.lock");
     } else {
@@ -872,6 +958,7 @@ struct PendingInstall {
     name: String,
     version: String,
     artifact: ArtifactRequest,
+    binary_fallback_artifacts: Vec<ArtifactRequest>,
     fallback_artifact: Option<ArtifactRequest>,
     install_kind: InstallKind,
     install_type: String,
@@ -946,6 +1033,7 @@ fn resolve_additions_from_latest(
                 packages.join(", ")
             )
         })?;
+    warn_cran_archive_unavailable(repositories);
 
     Ok(AddResolution {
         constraints: constraints_from_resolved_roots(packages, &resolved)?,
@@ -978,7 +1066,7 @@ fn add_resolution_roots(
 }
 
 fn preferred_locked_versions(
-    description: &description::RDescription,
+    _description: &description::RDescription,
     lockfile: Option<&Lockfile>,
     excluded_packages: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>, String> {
@@ -986,25 +1074,12 @@ fn preferred_locked_versions(
         return Ok(BTreeMap::new());
     };
 
-    let mut preferred_versions: BTreeMap<String, String> = description
-        .requirements()
-        .into_iter()
-        .filter(|name| !excluded_packages.contains_key(name))
-        .filter_map(|name| {
-            lockfile
-                .packages
-                .get(&name)
-                .map(|package| (name, package.version.clone()))
-        })
-        .collect();
-
-    for package in excluded_packages.keys() {
-        if let Some(locked_package) = lockfile.packages.get(package) {
-            preferred_versions.insert(package.clone(), locked_package.version.clone());
-        }
-    }
-
-    Ok(preferred_versions)
+    Ok(lockfile
+        .packages
+        .iter()
+        .filter(|(name, _)| !excluded_packages.contains_key(name.as_str()))
+        .map(|(name, package)| (name.clone(), package.version.clone()))
+        .collect())
 }
 
 fn semver_add_constraint(version: &str) -> Result<String, String> {
@@ -1068,12 +1143,16 @@ fn constraints_from_resolved_roots(
         .collect()
 }
 
-fn lock_from_description() -> RpxResult<LockOutcome> {
+fn lock_from_description(default_repo: bool, no_default_repo: bool) -> RpxResult<LockOutcome> {
     let project = read_project_description()?;
     let roots = project.description.resolution_roots();
     let registry = default_registry_base_url();
-    let repositories = configured_repositories(&project);
     let existing_lockfile = read_project_lockfile_optional()?;
+    let use_default_repository =
+        resolve_use_default_repository(existing_lockfile.as_ref(), default_repo, no_default_repo);
+    let repositories =
+        configured_repositories(&project, use_default_repository, existing_lockfile.as_ref())
+            .map_err(|details| LockError::ResolveFailed { details })?;
     if let Some(lockfile) = &existing_lockfile
         && lockfile.version > LOCKFILE_VERSION
     {
@@ -1082,20 +1161,43 @@ fn lock_from_description() -> RpxResult<LockOutcome> {
     let sysreq_db = load_sysreq_snapshot_for_lock(existing_lockfile.as_ref());
 
     if roots.is_empty() {
-        let lockfile = lockfile_from_resolution(vec![], &registry, &[], &sysreq_db);
+        let lockfile = lockfile_from_resolution(
+            vec![],
+            &registry,
+            use_default_repository,
+            &[],
+            &sysreq_db,
+            repositories.sources(),
+            None,
+        );
         let changed = existing_lockfile.as_ref() != Some(&lockfile);
         write_project_lockfile(lockfile)?;
         return Ok(LockOutcome { changed });
     }
 
+    let preferred_versions = preferred_locked_versions(
+        &project.description,
+        existing_lockfile.as_ref(),
+        &BTreeMap::new(),
+    )
+    .map_err(|details| LockError::ResolveFailed { details })?;
     let resolved =
-        resolve_from_registry(&repositories, &roots, &BTreeMap::new()).map_err(|details| {
+        resolve_from_registry(&repositories, &roots, &preferred_versions).map_err(|details| {
             LockError::ResolveFailed {
                 details: details.to_string(),
             }
         })?;
+    warn_cran_archive_unavailable(&repositories);
 
-    let lockfile = lockfile_from_resolution(roots, &registry, &resolved, &sysreq_db);
+    let lockfile = lockfile_from_resolution(
+        roots,
+        &registry,
+        use_default_repository,
+        &resolved,
+        &sysreq_db,
+        repositories.sources(),
+        None,
+    );
     let changed = existing_lockfile.as_ref() != Some(&lockfile);
     write_project_lockfile(lockfile)?;
     Ok(LockOutcome { changed })
@@ -1126,6 +1228,12 @@ fn load_sysreq_snapshot_for_lock(
 
     warning(RpxWarning::SysreqUnavailable);
     empty_sysreq_snapshot()
+}
+
+fn warn_cran_archive_unavailable(repositories: &RepositorySet) {
+    for url in repositories.cran_archive_unavailable_repositories() {
+        warning(RpxWarning::CranArchiveUnavailable { url });
+    }
 }
 
 fn sync_from_lockfile(install_system: bool, install_only_system: bool) -> RpxResult<SyncOutcome> {
@@ -1161,7 +1269,8 @@ fn sync_from_lockfile(install_system: bool, install_only_system: bool) -> RpxRes
 
     let installed = installed_packages_by_name();
     let runtime = runtime_info();
-    let repositories = repositories_for_sync(&project, &lockfile);
+    let repositories = repositories_for_sync(&project, &lockfile)
+        .map_err(|details| SyncError::DownloadArtifactsFailed { details })?;
     let mut outcome = SyncOutcome::default();
     let ui = SyncUi::new();
     let mut satisfied = installed
@@ -1305,44 +1414,86 @@ fn default_registry_base_url() -> String {
         .to_string()
 }
 
-fn configured_repositories(project: &description::ProjectDescription) -> RepositorySet {
-    RepositorySet::new(repository_sources_from_project(project))
+fn configured_repositories(
+    project: &description::ProjectDescription,
+    use_default_repository: bool,
+    lockfile: Option<&Lockfile>,
+) -> Result<RepositorySet, String> {
+    Ok(RepositorySet::new(repository_sources_from_project(
+        project,
+        use_default_repository,
+        lockfile,
+    )?))
 }
 
 fn repository_sources_from_project(
     project: &description::ProjectDescription,
-) -> Vec<RepositorySource> {
-    let mut sources = vec![RepositorySource::new(default_registry_base_url())];
-    sources.extend(
-        project
-            .additional_repositories
-            .iter()
-            .cloned()
-            .map(RepositorySource::new),
-    );
-    sources
+    use_default_repository: bool,
+    lockfile: Option<&Lockfile>,
+) -> Result<Vec<RepositorySource>, String> {
+    let mut sources = Vec::new();
+    if use_default_repository {
+        sources.push(RepositorySource::new(default_registry_base_url()));
+    }
+    for url in &project.additional_repositories {
+        if let Some(source) =
+            lockfile.and_then(|lockfile| repository_source_from_lockfile(lockfile, url))
+        {
+            sources.push(source);
+            continue;
+        }
+
+        sources.push(classify_repository_source(url).map_err(|details| {
+            format!(
+                "failed to classify configured repository {}: {details}",
+                normalize_repository_url(url)
+            )
+        })?);
+    }
+    Ok(sources)
 }
 
 fn repositories_for_sync(
     project: &description::ProjectDescription,
     lockfile: &Lockfile,
-) -> RepositorySet {
-    let mut sources = repository_sources_from_project(project);
+) -> Result<RepositorySet, String> {
+    let mut sources =
+        repository_sources_from_project(project, lockfile.use_default_repository, Some(lockfile))?;
     sources.extend(lockfile.packages.values().filter_map(|package| {
-        package
-            .source_url
-            .as_deref()
-            .and_then(repository_source_from_package_url)
+        let source_url = package.source_url.as_deref()?;
+        repository_source_from_package_url(source_url)
             .map(RepositorySource::new)
+            .or_else(|| {
+                cran_like_source_from_package_url(source_url).map(RepositorySource::cran_like)
+            })
     }));
-    RepositorySet::new(sources)
+    Ok(RepositorySet::new(sources))
+}
+
+fn resolve_use_default_repository(
+    lockfile: Option<&Lockfile>,
+    default_repo: bool,
+    no_default_repo: bool,
+) -> bool {
+    if default_repo {
+        return true;
+    }
+    if no_default_repo {
+        return false;
+    }
+    lockfile
+        .map(|lockfile| lockfile.use_default_repository)
+        .unwrap_or(true)
 }
 
 fn lockfile_from_resolution(
     roots: Vec<ResolutionRoot>,
     registry: &str,
+    use_default_repository: bool,
     resolved: &[ResolvedPackage],
     sysreq_db: &sysreqs::SysreqDbSnapshot,
+    repositories: &[RepositorySource],
+    r_version: Option<&str>,
 ) -> Lockfile {
     let required_base_packages = locked_base_packages(&roots, resolved);
     let sysreqs = locked_system_requirements(resolved, sysreq_db);
@@ -1350,8 +1501,12 @@ fn lockfile_from_resolution(
         version: LOCKFILE_VERSION,
         revision: LOCKFILE_REVISION,
         registry: registry.to_string(),
+        use_default_repository,
+        repositories: locked_repositories(repositories),
         r: LockedR {
-            version: runtime_info().version,
+            version: r_version
+                .map(ToString::to_string)
+                .unwrap_or_else(|| runtime_info().version),
             base_packages: required_base_packages,
         },
         sysreqs,
@@ -1386,6 +1541,40 @@ fn lockfile_from_resolution(
                 )
             })
             .collect(),
+    }
+}
+
+fn locked_repositories(repositories: &[RepositorySource]) -> Vec<LockedRepository> {
+    repositories
+        .iter()
+        .map(|source| LockedRepository {
+            url: source.base_url().to_string(),
+            kind: locked_repository_kind(source.kind()),
+            cran_archive_support: source
+                .cran_archive_support()
+                .map(locked_cran_archive_support),
+        })
+        .collect()
+}
+
+fn locked_repository_kind(kind: RepositoryKind) -> LockedRepositoryKind {
+    match kind {
+        RepositoryKind::Rrepo => LockedRepositoryKind::Rrepo,
+        RepositoryKind::CranLike => LockedRepositoryKind::CranLike,
+    }
+}
+
+fn locked_cran_archive_support(support: CranArchiveSupport) -> LockedCranArchiveSupport {
+    match support {
+        CranArchiveSupport::Available => LockedCranArchiveSupport::Available,
+        CranArchiveSupport::Unavailable => LockedCranArchiveSupport::Unavailable,
+    }
+}
+
+fn cran_archive_support_from_locked(support: LockedCranArchiveSupport) -> CranArchiveSupport {
+    match support {
+        LockedCranArchiveSupport::Available => CranArchiveSupport::Available,
+        LockedCranArchiveSupport::Unavailable => CranArchiveSupport::Unavailable,
     }
 }
 
@@ -1743,6 +1932,7 @@ fn registry_source_url(registry: &str, package: &str, version: &str) -> String {
 }
 
 fn preferred_artifact(
+    repositories: &RepositorySet,
     source: &RepositorySource,
     package: &str,
     version: &str,
@@ -1750,6 +1940,7 @@ fn preferred_artifact(
     runtime: &RuntimeInfo,
 ) -> (
     ArtifactRequest,
+    Vec<ArtifactRequest>,
     Option<ArtifactRequest>,
     InstallKind,
     String,
@@ -1760,21 +1951,73 @@ fn preferred_artifact(
         cache_file_name: source_cache_file_name(package, version),
     };
 
-    let Some(binary) = binary_artifact_request(source.base_url(), package, version, runtime) else {
+    let mut binary_candidates =
+        binary_artifact_candidates(repositories, source, package, version, runtime);
+    let Some(binary) = binary_candidates.first().cloned() else {
         return (
             source_artifact,
+            vec![],
             None,
             InstallKind::Source,
             "source".to_string(),
         );
     };
+    binary_candidates.remove(0);
 
     (
         binary,
+        binary_candidates,
         Some(source_artifact),
         InstallKind::Binary,
         runtime.pkg_type.clone(),
     )
+}
+
+fn binary_artifact_candidates(
+    repositories: &RepositorySet,
+    locked_source: &RepositorySource,
+    package: &str,
+    version: &str,
+    runtime: &RuntimeInfo,
+) -> Vec<ArtifactRequest> {
+    let sources = std::iter::once(locked_source)
+        .chain(
+            repositories
+                .sources()
+                .iter()
+                .filter(|source| *source != locked_source),
+        )
+        .collect::<Vec<_>>();
+    let mut seen = BTreeSet::new();
+    let mut artifacts = Vec::new();
+
+    for source in sources {
+        let Some(artifact) = binary_artifact_request_for_source(source, package, version, runtime)
+        else {
+            continue;
+        };
+        if seen.insert(artifact.url.clone()) {
+            artifacts.push(artifact);
+        }
+    }
+
+    artifacts
+}
+
+fn binary_artifact_request_for_source(
+    source: &RepositorySource,
+    package: &str,
+    version: &str,
+    runtime: &RuntimeInfo,
+) -> Option<ArtifactRequest> {
+    match source.kind() {
+        RepositoryKind::Rrepo => {
+            binary_artifact_request(source.base_url(), package, version, runtime)
+        }
+        RepositoryKind::CranLike => {
+            cran_like_binary_artifact_request(source.base_url(), package, version, runtime)
+        }
+    }
 }
 
 fn binary_artifact_request(
@@ -1800,6 +2043,36 @@ fn binary_artifact_request(
         kind: ArtifactKind::Binary,
         url: format!(
             "{}/packages/{package}/versions/{version}/binaries/macos/{target}/{}",
+            registry.trim_end_matches('/'),
+            r_minor_version(&runtime.version)?
+        ),
+        cache_file_name: macos_binary_cache_file_name(package, version),
+    })
+}
+
+fn cran_like_binary_artifact_request(
+    registry: &str,
+    package: &str,
+    version: &str,
+    runtime: &RuntimeInfo,
+) -> Option<ArtifactRequest> {
+    if runtime.pkg_type == "win.binary" {
+        return Some(ArtifactRequest {
+            kind: ArtifactKind::Binary,
+            url: format!(
+                "{}/bin/windows/contrib/{}/{package}_{version}.zip",
+                registry.trim_end_matches('/'),
+                r_minor_version(&runtime.version)?
+            ),
+            cache_file_name: windows_binary_cache_file_name(package, version),
+        });
+    }
+
+    let target = runtime.pkg_type.strip_prefix("mac.binary.")?;
+    Some(ArtifactRequest {
+        kind: ArtifactKind::Binary,
+        url: format!(
+            "{}/bin/macosx/{target}/contrib/{}/{package}_{version}.tgz",
             registry.trim_end_matches('/'),
             r_minor_version(&runtime.version)?
         ),
@@ -1848,8 +2121,20 @@ fn collect_pending_installs(
                 let source = repositories
                     .source_for_url(&source_url)
                     .unwrap_or_else(|| RepositorySource::new(lockfile.registry.clone()));
-                let (artifact, fallback_artifact, install_kind, install_type) =
-                    preferred_artifact(&source, name, &package.version, &source_url, runtime);
+                let (
+                    artifact,
+                    binary_fallback_artifacts,
+                    fallback_artifact,
+                    install_kind,
+                    install_type,
+                ) = preferred_artifact(
+                    repositories,
+                    &source,
+                    name,
+                    &package.version,
+                    &source_url,
+                    runtime,
+                );
                 let dependencies = package
                     .dependencies
                     .iter()
@@ -1865,6 +2150,7 @@ fn collect_pending_installs(
                         name: name.clone(),
                         version: package.version.clone(),
                         artifact,
+                        binary_fallback_artifacts,
                         fallback_artifact,
                         install_kind,
                         install_type,
@@ -1919,102 +2205,66 @@ fn download_artifacts_in_parallel(
                     break;
                 };
 
-                let _ = sender.send(DownloadEvent::Started {
-                    name: package.name.clone(),
-                    version: package.version.clone(),
-                    kind: package.artifact.kind,
-                });
+                let mut result = download_artifact_candidate(
+                    &repositories,
+                    &sender,
+                    &package,
+                    &package.artifact,
+                    package.install_kind,
+                    package.install_type.clone(),
+                );
+                let mut source_fallback_allowed = result
+                    .as_ref()
+                    .err()
+                    .is_none_or(|error| should_fallback_to_source(error));
+                let mut first_non_fallback_error = result
+                    .as_ref()
+                    .err()
+                    .filter(|error| !should_fallback_to_source(error))
+                    .cloned();
 
-                let progress_sender = sender.clone();
-                let progress_name = package.name.clone();
-                let result = repositories
-                    .source_for_url(&package.artifact.url)
-                    .ok_or_else(|| {
-                        format!(
-                            "could not determine repository source for {}@{}",
-                            package.name, package.version
-                        )
-                    })
-                    .and_then(|source| {
-                        repositories.download_artifact_with_progress(
-                            &source,
-                            &package.name,
-                            &package.version,
-                            &package.artifact,
-                            move |progress| match progress {
-                                DownloadProgress::ContentLength(length) => {
-                                    let _ = progress_sender.send(DownloadEvent::ContentLength {
-                                        name: progress_name.clone(),
-                                        length,
-                                    });
-                                }
-                                DownloadProgress::Advanced(bytes) => {
-                                    let _ = progress_sender.send(DownloadEvent::Advanced {
-                                        name: progress_name.clone(),
-                                        bytes,
-                                    });
-                                }
-                            },
-                        )
-                    })
-                    .map(|artifact| DownloadedInstall {
+                for artifact in &package.binary_fallback_artifacts {
+                    if result.is_ok() {
+                        break;
+                    }
+                    result = download_artifact_candidate(
+                        &repositories,
+                        &sender,
+                        &package,
                         artifact,
-                        install_kind: package.install_kind,
-                        install_type: package.install_type.clone(),
-                    })
-                    .or_else(|error| {
-                        let Some(fallback) = &package.fallback_artifact else {
-                            return Err(error);
-                        };
-                        if !should_fallback_to_source(&error) {
-                            return Err(error);
+                        InstallKind::Binary,
+                        package.install_type.clone(),
+                    );
+                    if let Err(error) = &result
+                        && !should_fallback_to_source(error)
+                    {
+                        source_fallback_allowed = false;
+                        if first_non_fallback_error.is_none() {
+                            first_non_fallback_error = Some(error.clone());
                         }
-                        let _ = sender.send(DownloadEvent::FallbackToSource {
-                            name: package.name.clone(),
-                            version: package.version.clone(),
-                        });
-                        let _ = sender.send(DownloadEvent::Started {
-                            name: package.name.clone(),
-                            version: package.version.clone(),
-                            kind: fallback.kind,
-                        });
-                        let source =
-                            repositories.source_for_url(&fallback.url).ok_or_else(|| {
-                                format!(
-                                    "could not determine repository source for {}@{}",
-                                    package.name, package.version
-                                )
-                            })?;
-                        let progress_sender = sender.clone();
-                        let progress_name = package.name.clone();
-                        repositories
-                            .download_artifact_with_progress(
-                                &source,
-                                &package.name,
-                                &package.version,
-                                fallback,
-                                move |progress| match progress {
-                                    DownloadProgress::ContentLength(length) => {
-                                        let _ =
-                                            progress_sender.send(DownloadEvent::ContentLength {
-                                                name: progress_name.clone(),
-                                                length,
-                                            });
-                                    }
-                                    DownloadProgress::Advanced(bytes) => {
-                                        let _ = progress_sender.send(DownloadEvent::Advanced {
-                                            name: progress_name.clone(),
-                                            bytes,
-                                        });
-                                    }
-                                },
-                            )
-                            .map(|artifact| DownloadedInstall {
-                                artifact,
-                                install_kind: InstallKind::Source,
-                                install_type: "source".to_string(),
-                            })
+                    }
+                }
+
+                let result = result.or_else(|error| {
+                    if !source_fallback_allowed {
+                        return Err(first_non_fallback_error.unwrap_or(error));
+                    }
+                    let Some(fallback) = &package.fallback_artifact else {
+                        return Err(error);
+                    };
+                    let _ = sender.send(DownloadEvent::FallbackToSource {
+                        name: package.name.clone(),
+                        version: package.version.clone(),
                     });
+                    download_artifact_candidate(
+                        &repositories,
+                        &sender,
+                        &package,
+                        fallback,
+                        InstallKind::Source,
+                        "source".to_string(),
+                    )
+                });
                 let _ = sender.send(DownloadEvent::Finished {
                     package: Box::new(package),
                     result,
@@ -2052,6 +2302,59 @@ fn download_artifacts_in_parallel(
     }
 
     Ok(downloaded)
+}
+
+fn download_artifact_candidate(
+    repositories: &RepositorySet,
+    sender: &mpsc::Sender<DownloadEvent>,
+    package: &PendingInstall,
+    artifact: &ArtifactRequest,
+    install_kind: InstallKind,
+    install_type: String,
+) -> Result<DownloadedInstall, String> {
+    let _ = sender.send(DownloadEvent::Started {
+        name: package.name.clone(),
+        version: package.version.clone(),
+        kind: artifact.kind,
+    });
+
+    let progress_sender = sender.clone();
+    let progress_name = package.name.clone();
+    repositories
+        .source_for_url(&artifact.url)
+        .ok_or_else(|| {
+            format!(
+                "could not determine repository source for {}@{}",
+                package.name, package.version
+            )
+        })
+        .and_then(|source| {
+            repositories.download_artifact_with_progress(
+                &source,
+                &package.name,
+                &package.version,
+                artifact,
+                move |progress| match progress {
+                    DownloadProgress::ContentLength(length) => {
+                        let _ = progress_sender.send(DownloadEvent::ContentLength {
+                            name: progress_name.clone(),
+                            length,
+                        });
+                    }
+                    DownloadProgress::Advanced(bytes) => {
+                        let _ = progress_sender.send(DownloadEvent::Advanced {
+                            name: progress_name.clone(),
+                            bytes,
+                        });
+                    }
+                },
+            )
+        })
+        .map(|artifact| DownloadedInstall {
+            artifact,
+            install_kind,
+            install_type,
+        })
 }
 
 fn ready_install_names(
@@ -2375,11 +2678,14 @@ fn read_log_tail(path: &Path, max_lines: usize) -> String {
 mod tests {
     use super::{
         LockfileCompatibilityError, add_resolution_roots, binary_artifact_request,
-        compiled_cache_key, constraints_from_resolved_roots, default_registry_base_url,
-        locked_install_order, lockfile_from_resolution, persisted_constraints, r_minor_version,
-        semver_add_constraint, should_fallback_to_source, validate_lockfile_compatibility,
+        classify_repository_source, compiled_cache_key, constraints_from_resolved_roots,
+        cran_like_binary_artifact_request, default_registry_base_url, locked_install_order,
+        lockfile_from_resolution, persisted_constraints, preferred_artifact,
+        preferred_locked_versions, r_minor_version, repository_sources_from_project,
+        resolve_use_default_repository, semver_add_constraint, should_fallback_to_source,
+        validate_lockfile_compatibility,
     };
-    use crate::description::RDescription;
+    use crate::description::{ProjectDescription, RDescription};
     use crate::{
         description::DescriptionExt,
         lockfile::{
@@ -2388,9 +2694,11 @@ mod tests {
         },
         r::RuntimeInfo,
         registry::ResolutionRoot,
+        repository::{CranArchiveSupport, RepositoryKind, RepositorySet, RepositorySource},
         resolver::{ResolvedDependency, ResolvedPackage},
         sysreqs::SysreqDbSnapshot,
     };
+    use mockito::Server;
     use std::collections::BTreeMap;
     use std::{
         env,
@@ -2438,6 +2746,7 @@ mod tests {
                 },
             ],
             "https://api.rrepo.org",
+            true,
             &[
                 ResolvedPackage {
                     name: "cli".to_string(),
@@ -2476,6 +2785,8 @@ mod tests {
                 },
             ],
             &empty_sysreq_db(),
+            &[],
+            Some("4.5.2"),
         );
 
         assert_eq!(lockfile.registry, "https://api.rrepo.org");
@@ -2533,6 +2844,146 @@ mod tests {
         unsafe {
             env::remove_var("RPX_REGISTRY_BASE_URL");
         }
+    }
+
+    #[test]
+    fn resolves_default_repository_preference_from_flags_then_lockfile() {
+        let lockfile = Lockfile {
+            version: LOCKFILE_VERSION,
+            revision: LOCKFILE_REVISION,
+            registry: "https://api.rrepo.org".to_string(),
+            use_default_repository: false,
+            repositories: vec![],
+            r: LockedR::default(),
+            sysreqs: LockedSystemRequirements::default(),
+            roots: vec![],
+            packages: BTreeMap::new(),
+        };
+
+        assert!(resolve_use_default_repository(None, false, false));
+        assert!(!resolve_use_default_repository(
+            Some(&lockfile),
+            false,
+            false
+        ));
+        assert!(resolve_use_default_repository(Some(&lockfile), true, false));
+        assert!(!resolve_use_default_repository(
+            Some(&lockfile),
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn omits_default_repository_from_project_sources_when_disabled() {
+        let project = ProjectDescription {
+            description: RDescription::from_str("Package: test\nVersion: 0.1.0\n")
+                .expect("description should parse"),
+            additional_repositories: vec![],
+        };
+
+        let sources =
+            repository_sources_from_project(&project, false, None).expect("sources should build");
+
+        assert!(sources.is_empty());
+    }
+
+    #[test]
+    fn classifies_rrepo_repository_sources_up_front() {
+        let mut server = Server::new();
+        let packages_mock = server
+            .mock("GET", "/packages")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"repositorySlug":"test","packages":[]}"#)
+            .expect(1)
+            .create();
+
+        let source = classify_repository_source(&server.url()).expect("rrepo should classify");
+
+        assert_eq!(source.kind(), RepositoryKind::Rrepo);
+        packages_mock.assert();
+    }
+
+    #[test]
+    fn classifies_cran_like_repository_sources_up_front() {
+        let mut server = Server::new();
+        let rrepo_mock = server
+            .mock("GET", "/packages")
+            .with_status(404)
+            .expect(1)
+            .create();
+        let gz_mock = server
+            .mock("GET", "/src/contrib/PACKAGES.gz")
+            .with_status(404)
+            .expect(1)
+            .create();
+        let packages_mock = server
+            .mock("GET", "/src/contrib/PACKAGES")
+            .with_status(200)
+            .with_header("content-type", "text/plain")
+            .with_body("Package: digest\nVersion: 0.6.38\n")
+            .expect(1)
+            .create();
+        let archive_mock = server
+            .mock("GET", "/src/contrib/Archive/")
+            .with_status(404)
+            .expect(1)
+            .create();
+
+        let source = classify_repository_source(&server.url()).expect("CRAN-like should classify");
+
+        assert_eq!(source.kind(), RepositoryKind::CranLike);
+        assert_eq!(
+            source.cran_archive_support(),
+            Some(CranArchiveSupport::Unavailable)
+        );
+        rrepo_mock.assert();
+        gz_mock.assert();
+        packages_mock.assert();
+        archive_mock.assert();
+    }
+
+    #[test]
+    fn project_sources_include_classified_additional_repositories_once() {
+        let mut server = Server::new();
+        server
+            .mock("GET", "/packages")
+            .with_status(404)
+            .expect(1)
+            .create();
+        server
+            .mock("GET", "/src/contrib/PACKAGES.gz")
+            .with_status(404)
+            .expect(1)
+            .create();
+        server
+            .mock("GET", "/src/contrib/PACKAGES")
+            .with_status(200)
+            .with_header("content-type", "text/plain")
+            .with_body("Package: digest\nVersion: 0.6.38\n")
+            .expect(1)
+            .create();
+        server
+            .mock("GET", "/src/contrib/Archive/")
+            .with_status(200)
+            .expect(1)
+            .create();
+        let project = ProjectDescription {
+            description: RDescription::from_str("Package: test\nVersion: 0.1.0\n")
+                .expect("description should parse"),
+            additional_repositories: vec![server.url()],
+        };
+
+        let sources =
+            repository_sources_from_project(&project, false, None).expect("sources should build");
+
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].kind(), RepositoryKind::CranLike);
+        assert_eq!(
+            sources[0].cran_archive_support(),
+            Some(CranArchiveSupport::Available)
+        );
     }
 
     #[test]
@@ -2600,8 +3051,11 @@ mod tests {
                 constraint: "*".to_string(),
             }],
             "https://api.rrepo.org",
+            true,
             &[],
             &empty_sysreq_db(),
+            &[],
+            Some("4.5.2"),
         );
 
         assert_eq!(lockfile.r.base_packages, vec!["grid"]);
@@ -2636,11 +3090,74 @@ mod tests {
     }
 
     #[test]
+    fn prefers_all_existing_locked_versions_except_new_additions() {
+        let description =
+            RDescription::from_str("Package: test\nVersion: 0.1.0\nImports: direct\n")
+                .expect("description should parse");
+        let lockfile = Lockfile {
+            version: LOCKFILE_VERSION,
+            revision: LOCKFILE_REVISION,
+            registry: "https://api.rrepo.org".to_string(),
+            use_default_repository: true,
+            repositories: vec![],
+            r: LockedR::default(),
+            sysreqs: LockedSystemRequirements::default(),
+            roots: vec![],
+            packages: BTreeMap::from([
+                (
+                    "direct".to_string(),
+                    LockedPackage {
+                        package: "direct".to_string(),
+                        version: "1.0.0".to_string(),
+                        source: Some("registry".to_string()),
+                        source_url: None,
+                        dependencies: vec![],
+                    },
+                ),
+                (
+                    "transitive".to_string(),
+                    LockedPackage {
+                        package: "transitive".to_string(),
+                        version: "2.0.0".to_string(),
+                        source: Some("registry".to_string()),
+                        source_url: None,
+                        dependencies: vec![],
+                    },
+                ),
+                (
+                    "newpkg".to_string(),
+                    LockedPackage {
+                        package: "newpkg".to_string(),
+                        version: "3.0.0".to_string(),
+                        source: Some("registry".to_string()),
+                        source_url: None,
+                        dependencies: vec![],
+                    },
+                ),
+            ]),
+        };
+        let excluded = BTreeMap::from([("newpkg".to_string(), "*".to_string())]);
+
+        let preferred = preferred_locked_versions(&description, Some(&lockfile), &excluded)
+            .expect("preferred versions should build");
+
+        assert_eq!(
+            preferred,
+            BTreeMap::from([
+                ("direct".to_string(), "1.0.0".to_string()),
+                ("transitive".to_string(), "2.0.0".to_string()),
+            ])
+        );
+    }
+
+    #[test]
     fn accepts_newer_revision_but_rejects_newer_lockfile_version() {
         let mut lockfile = Lockfile {
             version: LOCKFILE_VERSION,
             revision: LOCKFILE_REVISION + 1,
             registry: "https://api.rrepo.org".to_string(),
+            use_default_repository: true,
+            repositories: vec![],
             r: LockedR::default(),
             sysreqs: LockedSystemRequirements::default(),
             roots: vec![],
@@ -2663,6 +3180,8 @@ mod tests {
             version: LOCKFILE_VERSION,
             revision: LOCKFILE_REVISION,
             registry: "https://api.rrepo.org".to_string(),
+            use_default_repository: true,
+            repositories: vec![],
             r: LockedR::default(),
             sysreqs: LockedSystemRequirements::default(),
             roots: vec![],
@@ -2735,6 +3254,8 @@ mod tests {
             version: LOCKFILE_VERSION,
             revision: LOCKFILE_REVISION,
             registry: "https://api.rrepo.org".to_string(),
+            use_default_repository: true,
+            repositories: vec![],
             r: LockedR::default(),
             sysreqs: LockedSystemRequirements::default(),
             roots: vec![],
@@ -2851,6 +3372,120 @@ mod tests {
     }
 
     #[test]
+    fn derives_windows_cran_like_binary_artifact_url_from_runtime() {
+        let runtime = RuntimeInfo {
+            version: "4.5.2".to_string(),
+            platform: "x86_64-w64-mingw32".to_string(),
+            pkg_type: "win.binary".to_string(),
+        };
+
+        let artifact =
+            cran_like_binary_artifact_request("https://cran.example", "digest", "0.6.38", &runtime)
+                .expect("windows CRAN-like binary should be supported");
+
+        assert_eq!(
+            artifact.url,
+            "https://cran.example/bin/windows/contrib/4.5/digest_0.6.38.zip"
+        );
+        assert_eq!(artifact.cache_file_name, "digest_0.6.38.zip");
+    }
+
+    #[test]
+    fn derives_macos_cran_like_binary_artifact_url_from_runtime() {
+        let runtime = RuntimeInfo {
+            version: "4.5.2".to_string(),
+            platform: "aarch64-apple-darwin20".to_string(),
+            pkg_type: "mac.binary.big-sur-arm64".to_string(),
+        };
+
+        let artifact = cran_like_binary_artifact_request(
+            "https://cran.example",
+            "jsonlite",
+            "2.0.0",
+            &runtime,
+        )
+        .expect("macOS CRAN-like binary should be supported");
+
+        assert_eq!(
+            artifact.url,
+            "https://cran.example/bin/macosx/big-sur-arm64/contrib/4.5/jsonlite_2.0.0.tgz"
+        );
+        assert_eq!(artifact.cache_file_name, "jsonlite_2.0.0.tgz");
+    }
+
+    #[test]
+    fn prefers_cran_like_binary_artifacts_with_locked_source_fallback() {
+        let runtime = RuntimeInfo {
+            version: "4.5.2".to_string(),
+            platform: "x86_64-w64-mingw32".to_string(),
+            pkg_type: "win.binary".to_string(),
+        };
+        let source = RepositorySource::cran_like("https://cran.example");
+        let repositories = RepositorySet::new(vec![source.clone()]);
+        let (artifact, binary_fallbacks, fallback, install_kind, install_type) = preferred_artifact(
+            &repositories,
+            &source,
+            "digest",
+            "0.6.38",
+            "https://cran.example/src/contrib/digest_0.6.38.tar.gz",
+            &runtime,
+        );
+
+        assert_eq!(
+            artifact.url,
+            "https://cran.example/bin/windows/contrib/4.5/digest_0.6.38.zip"
+        );
+        assert!(binary_fallbacks.is_empty());
+        assert_eq!(
+            fallback.expect("source fallback should exist").url,
+            "https://cran.example/src/contrib/digest_0.6.38.tar.gz"
+        );
+        assert_eq!(install_kind, crate::ui::InstallKind::Binary);
+        assert_eq!(install_type, "win.binary");
+    }
+
+    #[test]
+    fn tries_locked_repository_binary_before_other_repository_binaries() {
+        let runtime = RuntimeInfo {
+            version: "4.5.2".to_string(),
+            platform: "x86_64-w64-mingw32".to_string(),
+            pkg_type: "win.binary".to_string(),
+        };
+        let default = RepositorySource::new("https://default.example/cran");
+        let locked = RepositorySource::cran_like("https://cran.example");
+        let other = RepositorySource::cran_like("https://mirror.example");
+        let repositories = RepositorySet::new(vec![default.clone(), locked.clone(), other]);
+        let (artifact, binary_fallbacks, fallback, install_kind, _) = preferred_artifact(
+            &repositories,
+            &locked,
+            "digest",
+            "0.6.38",
+            "https://cran.example/src/contrib/digest_0.6.38.tar.gz",
+            &runtime,
+        );
+
+        assert_eq!(
+            artifact.url,
+            "https://cran.example/bin/windows/contrib/4.5/digest_0.6.38.zip"
+        );
+        assert_eq!(
+            binary_fallbacks
+                .iter()
+                .map(|artifact| artifact.url.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "https://default.example/cran/packages/digest/versions/0.6.38/binaries/windows/4.5",
+                "https://mirror.example/bin/windows/contrib/4.5/digest_0.6.38.zip",
+            ]
+        );
+        assert_eq!(
+            fallback.expect("source fallback should exist").url,
+            "https://cran.example/src/contrib/digest_0.6.38.tar.gz"
+        );
+        assert_eq!(install_kind, crate::ui::InstallKind::Binary);
+    }
+
+    #[test]
     fn extracts_r_minor_version_for_binary_urls() {
         assert_eq!(r_minor_version("4.5.2"), Some("4.5".to_string()));
         assert_eq!(r_minor_version("4.4"), Some("4.4".to_string()));
@@ -2858,7 +3493,7 @@ mod tests {
     }
 
     #[test]
-    fn fallback_statuses_are_limited_to_missing_or_upstream_binary_errors() {
+    fn source_fallback_statuses_are_limited_to_missing_or_upstream_binary_errors() {
         assert!(should_fallback_to_source(
             "artifact download failed (404 Not Found): missing"
         ));
@@ -2866,7 +3501,10 @@ mod tests {
             "artifact download failed (502 Bad Gateway): upstream failed"
         ));
         assert!(!should_fallback_to_source(
-            "artifact download failed (500 Internal Server Error): nope"
+            "artifact download failed (403 Forbidden): forbidden"
+        ));
+        assert!(!should_fallback_to_source(
+            "failed to read binary artifact: corrupt body"
         ));
     }
 
