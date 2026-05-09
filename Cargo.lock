@@ -2029,6 +2029,7 @@ dependencies = [
  "tar",
  "testcontainers",
  "thiserror",
+ "tokio",
  "tracing",
  "tracing-indicatif",
  "tracing-subscriber",

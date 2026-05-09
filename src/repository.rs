@@ -11,11 +11,13 @@ use std::{
     hash::{Hash, Hasher},
     io::{self, IsTerminal, Read},
     path::{Path, PathBuf},
-    sync::{Arc, mpsc},
+    sync::Arc,
 };
 use tar::Archive;
+use tokio::task::JoinSet;
 
 use crate::project::cache_dir_path;
+use crate::r_version::compare_r_versions;
 
 const KEYRING_SERVICE: &str = "rpx";
 
@@ -323,7 +325,11 @@ impl RepositorySet {
         let packages = index
             .into_iter()
             .filter_map(|(name, versions)| {
-                let latest_version = versions.last()?.version.clone();
+                let latest_version = versions
+                    .iter()
+                    .max_by(|left, right| compare_r_versions(&left.version, &right.version))?
+                    .version
+                    .clone();
                 Some(RepositoryPackageSummary {
                     name,
                     latest_version,
@@ -637,7 +643,7 @@ fn fetch_cran_like_current_index(
     }
 
     for versions in index.values_mut() {
-        versions.sort_by(|left, right| left.version.cmp(&right.version));
+        sort_version_summaries(versions);
     }
 
     Ok(index)
@@ -761,8 +767,12 @@ fn fetch_cran_like_archive_versions(
             })
         })
         .collect::<Vec<_>>();
-    versions.sort_by(|left, right| left.version.cmp(&right.version));
+    sort_version_summaries(&mut versions);
     Ok(CranLikePackageArchive::Available(versions))
+}
+
+fn sort_version_summaries(versions: &mut [VersionSummary]) {
+    versions.sort_by(|left, right| compare_r_versions(&left.version, &right.version));
 }
 
 fn versions_for_package(
@@ -794,9 +804,12 @@ fn package_versions_response(
         return Err(missing_package_error(package));
     }
 
+    let mut versions = by_version.into_values().collect::<Vec<_>>();
+    sort_version_summaries(&mut versions);
+
     Ok(PackageVersionsResponse {
         package: package.to_string(),
-        versions: by_version.into_values().collect(),
+        versions,
     })
 }
 
@@ -839,27 +852,33 @@ fn fetch_description_from_cran_like_tarballs(
         DescriptionCandidate::tarball(current_url, package, version),
         DescriptionCandidate::tarball(archive_url, package, version),
     ];
-    let candidate_count = candidates.len();
-    let (tx, rx) = mpsc::channel();
+    tokio::runtime::Runtime::new()
+        .map_err(|error| format!("failed to start DESCRIPTION fetch runtime: {error}"))?
+        .block_on(fetch_first_description_candidate(candidates))
+}
 
+async fn fetch_first_description_candidate(
+    candidates: [DescriptionCandidate; 3],
+) -> Result<String, String> {
+    let mut tasks = JoinSet::new();
     for candidate in candidates {
-        let tx = tx.clone();
-        std::thread::spawn(move || {
+        tasks.spawn(async move {
             let url = candidate.url.clone();
-            let result = candidate.fetch();
-            let _ = tx.send((url, result));
+            (url, candidate.fetch_async().await)
         });
     }
-    drop(tx);
 
     let mut errors = Vec::new();
-    for _ in 0..candidate_count {
-        match rx.recv() {
-            Ok((_, Ok(description))) => return Ok(description),
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok((_, Ok(description))) => {
+                tasks.abort_all();
+                return Ok(description);
+            }
             Ok((url, Err(error))) => errors.push((url, error)),
             Err(error) => errors.push((
                 "DESCRIPTION worker".to_string(),
-                format!("failed to receive DESCRIPTION result: {error}"),
+                format!("failed to join DESCRIPTION result: {error}"),
             )),
         }
     }
@@ -898,13 +917,14 @@ impl DescriptionCandidate {
         }
     }
 
-    fn fetch(self) -> Result<String, String> {
+    async fn fetch_async(self) -> Result<String, String> {
         match self.kind {
             DescriptionCandidateKind::Direct => {
-                fetch_description_from_direct_url(&self.url, &self.package, &self.version)
+                fetch_description_from_direct_url_async(&self.url, &self.package, &self.version)
+                    .await
             }
             DescriptionCandidateKind::Tarball => {
-                fetch_description_from_tarball(&self.url, &self.package, &self.version)
+                fetch_description_from_tarball_async(&self.url, &self.package, &self.version).await
             }
         }
     }
@@ -994,25 +1014,28 @@ fn html_unescape_minimal(value: &str) -> String {
         .replace("&quot;", "\"")
 }
 
-fn fetch_description_from_direct_url(
+async fn fetch_description_from_direct_url_async(
     url: &str,
     package: &str,
     version: &str,
 ) -> Result<String, String> {
-    let response = reqwest::blocking::get(url)
+    let response = reqwest::get(url)
+        .await
         .map_err(|error| format!("failed to download DESCRIPTION: {error}"))?;
     let status = response.status();
     if !status.is_success() {
-        return Err(unexpected_cran_like_response(response));
+        return Err(unexpected_cran_like_response_async(response).await);
     }
 
     let description = response
         .text()
+        .await
         .map_err(|error| format!("failed to read DESCRIPTION: {error}"))?;
     validate_description(&description, package, version, url)?;
     Ok(description)
 }
 
+#[cfg(test)]
 fn fetch_description_from_tarball(
     url: &str,
     package: &str,
@@ -1028,7 +1051,36 @@ fn fetch_description_from_tarball(
     let bytes = response
         .bytes()
         .map_err(|error| format!("failed to read source package for DESCRIPTION: {error}"))?;
-    let decoder = GzDecoder::new(bytes.as_ref());
+    description_from_tarball_bytes(bytes.as_ref(), url, package, version)
+}
+
+async fn fetch_description_from_tarball_async(
+    url: &str,
+    package: &str,
+    version: &str,
+) -> Result<String, String> {
+    let response = reqwest::get(url)
+        .await
+        .map_err(|error| format!("failed to download source package for DESCRIPTION: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(unexpected_cran_like_response_async(response).await);
+    }
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| format!("failed to read source package for DESCRIPTION: {error}"))?;
+    description_from_tarball_bytes(bytes.as_ref(), url, package, version)
+}
+
+fn description_from_tarball_bytes(
+    bytes: &[u8],
+    url: &str,
+    package: &str,
+    version: &str,
+) -> Result<String, String> {
+    let decoder = GzDecoder::new(bytes);
     let mut archive = Archive::new(decoder);
     let entries = archive
         .entries()
@@ -1120,6 +1172,18 @@ fn write_text_cache(path: &Path, value: &str) {
 fn unexpected_cran_like_response(response: reqwest::blocking::Response) -> String {
     let status = response.status();
     let body = response.text().unwrap_or_default();
+    let body = body.trim();
+
+    if body.is_empty() {
+        return format!("unexpected registry response ({status})");
+    }
+
+    format!("unexpected registry response ({status}): {body}")
+}
+
+async fn unexpected_cran_like_response_async(response: reqwest::Response) -> String {
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
     let body = body.trim();
 
     if body.is_empty() {

@@ -16,6 +16,7 @@ use r_description::VersionConstraint;
 
 use crate::{
     description::{DescriptionDependency, RDescription},
+    r_version::{compare_version_components, r_version_components},
     registry::ResolutionRoot,
     repository::{RepositorySet, RepositorySource},
     ui::ResolutionUi,
@@ -68,17 +69,7 @@ impl FromStr for RPackageVersion {
     type Err = String;
 
     fn from_str(version: &str) -> Result<Self, Self::Err> {
-        let components = version
-            .split(['.', '-'])
-            .map(|part| {
-                if part.is_empty() {
-                    return Err(format!("invalid version {version}"));
-                }
-
-                part.parse::<u32>()
-                    .map_err(|_| format!("invalid version {version}"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let components = r_version_components(version)?;
 
         Ok(Self {
             raw: version.to_string(),
@@ -89,14 +80,7 @@ impl FromStr for RPackageVersion {
 
 impl Ord for RPackageVersion {
     fn cmp(&self, other: &Self) -> Ordering {
-        for (left, right) in self.components.iter().zip(&other.components) {
-            match left.cmp(right) {
-                Ordering::Equal => continue,
-                ordering => return ordering,
-            }
-        }
-
-        self.components.len().cmp(&other.components.len())
+        compare_version_components(&self.components, &other.components)
     }
 }
 

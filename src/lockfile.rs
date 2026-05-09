@@ -13,12 +13,36 @@ pub struct Lockfile {
     pub registry: String,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub use_default_repository: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repositories: Vec<LockedRepository>,
     #[serde(default)]
     pub r: LockedR,
     #[serde(default)]
     pub sysreqs: LockedSystemRequirements,
     pub roots: Vec<LockedRoot>,
     pub packages: BTreeMap<String, LockedPackage>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
+pub struct LockedRepository {
+    pub url: String,
+    pub kind: LockedRepositoryKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cran_archive_support: Option<LockedCranArchiveSupport>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
+#[serde(rename_all = "kebab-case")]
+pub enum LockedRepositoryKind {
+    Rrepo,
+    CranLike,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
+#[serde(rename_all = "kebab-case")]
+pub enum LockedCranArchiveSupport {
+    Available,
+    Unavailable,
 }
 
 fn default_true() -> bool {
@@ -101,7 +125,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        LOCKFILE_REVISION, LOCKFILE_VERSION, LockedDependency, LockedPackage, LockedR, LockedRoot,
+        LOCKFILE_REVISION, LOCKFILE_VERSION, LockedCranArchiveSupport, LockedDependency,
+        LockedPackage, LockedR, LockedRepository, LockedRepositoryKind, LockedRoot,
         LockedSystemRequirements, Lockfile,
     };
 
@@ -112,6 +137,7 @@ mod tests {
             revision: LOCKFILE_REVISION,
             registry: "https://api.rrepo.org".to_string(),
             use_default_repository: true,
+            repositories: vec![],
             r: LockedR {
                 version: "4.4.1".to_string(),
                 base_packages: vec!["utils".to_string()],
@@ -168,6 +194,7 @@ mod tests {
             revision: LOCKFILE_REVISION,
             registry: "https://api.rrepo.org".to_string(),
             use_default_repository: false,
+            repositories: vec![],
             r: LockedR::default(),
             sysreqs: LockedSystemRequirements::default(),
             roots: vec![],
@@ -177,6 +204,30 @@ mod tests {
         let json = serde_json::to_string_pretty(&lockfile).expect("lockfile should serialize");
 
         assert!(json.contains("\"use_default_repository\": false"));
+    }
+
+    #[test]
+    fn round_trips_repository_metadata() {
+        let lockfile = Lockfile {
+            version: LOCKFILE_VERSION,
+            revision: LOCKFILE_REVISION,
+            registry: "https://api.rrepo.org".to_string(),
+            use_default_repository: true,
+            repositories: vec![LockedRepository {
+                url: "https://cran.example".to_string(),
+                kind: LockedRepositoryKind::CranLike,
+                cran_archive_support: Some(LockedCranArchiveSupport::Unavailable),
+            }],
+            r: LockedR::default(),
+            sysreqs: LockedSystemRequirements::default(),
+            roots: vec![],
+            packages: BTreeMap::new(),
+        };
+
+        let json = serde_json::to_string(&lockfile).expect("lockfile should serialize");
+        let parsed: Lockfile = serde_json::from_str(&json).expect("lockfile should parse");
+
+        assert_eq!(parsed.repositories, lockfile.repositories);
     }
 
     #[test]
