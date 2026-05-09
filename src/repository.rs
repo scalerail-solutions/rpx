@@ -103,8 +103,16 @@ impl RepositorySource {
         }
 
         match self.kind {
-            RepositoryKind::Rrepo => !url.contains("/src/contrib/"),
-            RepositoryKind::CranLike => url.contains("/src/contrib/"),
+            RepositoryKind::Rrepo => {
+                !url.contains("/src/contrib/")
+                    && !url.contains("/bin/windows/")
+                    && !url.contains("/bin/macosx/")
+            }
+            RepositoryKind::CranLike => {
+                url.contains("/src/contrib/")
+                    || url.contains("/bin/windows/")
+                    || url.contains("/bin/macosx/")
+            }
         }
     }
 }

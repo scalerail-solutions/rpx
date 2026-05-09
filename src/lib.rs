@@ -910,6 +910,7 @@ struct PendingInstall {
     name: String,
     version: String,
     artifact: ArtifactRequest,
+    binary_fallback_artifacts: Vec<ArtifactRequest>,
     fallback_artifact: Option<ArtifactRequest>,
     install_kind: InstallKind,
     install_type: String,
@@ -1826,6 +1827,7 @@ fn registry_source_url(registry: &str, package: &str, version: &str) -> String {
 }
 
 fn preferred_artifact(
+    repositories: &RepositorySet,
     source: &RepositorySource,
     package: &str,
     version: &str,
@@ -1833,6 +1835,7 @@ fn preferred_artifact(
     runtime: &RuntimeInfo,
 ) -> (
     ArtifactRequest,
+    Vec<ArtifactRequest>,
     Option<ArtifactRequest>,
     InstallKind,
     String,
@@ -1843,30 +1846,73 @@ fn preferred_artifact(
         cache_file_name: source_cache_file_name(package, version),
     };
 
-    if source.kind() == RepositoryKind::CranLike {
+    let mut binary_candidates =
+        binary_artifact_candidates(repositories, source, package, version, runtime);
+    let Some(binary) = binary_candidates.first().cloned() else {
         return (
             source_artifact,
-            None,
-            InstallKind::Source,
-            "source".to_string(),
-        );
-    }
-
-    let Some(binary) = binary_artifact_request(source.base_url(), package, version, runtime) else {
-        return (
-            source_artifact,
+            vec![],
             None,
             InstallKind::Source,
             "source".to_string(),
         );
     };
+    binary_candidates.remove(0);
 
     (
         binary,
+        binary_candidates,
         Some(source_artifact),
         InstallKind::Binary,
         runtime.pkg_type.clone(),
     )
+}
+
+fn binary_artifact_candidates(
+    repositories: &RepositorySet,
+    locked_source: &RepositorySource,
+    package: &str,
+    version: &str,
+    runtime: &RuntimeInfo,
+) -> Vec<ArtifactRequest> {
+    let sources = std::iter::once(locked_source)
+        .chain(
+            repositories
+                .sources()
+                .iter()
+                .filter(|source| *source != locked_source),
+        )
+        .collect::<Vec<_>>();
+    let mut seen = BTreeSet::new();
+    let mut artifacts = Vec::new();
+
+    for source in sources {
+        let Some(artifact) = binary_artifact_request_for_source(source, package, version, runtime)
+        else {
+            continue;
+        };
+        if seen.insert(artifact.url.clone()) {
+            artifacts.push(artifact);
+        }
+    }
+
+    artifacts
+}
+
+fn binary_artifact_request_for_source(
+    source: &RepositorySource,
+    package: &str,
+    version: &str,
+    runtime: &RuntimeInfo,
+) -> Option<ArtifactRequest> {
+    match source.kind() {
+        RepositoryKind::Rrepo => {
+            binary_artifact_request(source.base_url(), package, version, runtime)
+        }
+        RepositoryKind::CranLike => {
+            cran_like_binary_artifact_request(source.base_url(), package, version, runtime)
+        }
+    }
 }
 
 fn binary_artifact_request(
@@ -1892,6 +1938,36 @@ fn binary_artifact_request(
         kind: ArtifactKind::Binary,
         url: format!(
             "{}/packages/{package}/versions/{version}/binaries/macos/{target}/{}",
+            registry.trim_end_matches('/'),
+            r_minor_version(&runtime.version)?
+        ),
+        cache_file_name: macos_binary_cache_file_name(package, version),
+    })
+}
+
+fn cran_like_binary_artifact_request(
+    registry: &str,
+    package: &str,
+    version: &str,
+    runtime: &RuntimeInfo,
+) -> Option<ArtifactRequest> {
+    if runtime.pkg_type == "win.binary" {
+        return Some(ArtifactRequest {
+            kind: ArtifactKind::Binary,
+            url: format!(
+                "{}/bin/windows/contrib/{}/{package}_{version}.zip",
+                registry.trim_end_matches('/'),
+                r_minor_version(&runtime.version)?
+            ),
+            cache_file_name: windows_binary_cache_file_name(package, version),
+        });
+    }
+
+    let target = runtime.pkg_type.strip_prefix("mac.binary.")?;
+    Some(ArtifactRequest {
+        kind: ArtifactKind::Binary,
+        url: format!(
+            "{}/bin/macosx/{target}/contrib/{}/{package}_{version}.tgz",
             registry.trim_end_matches('/'),
             r_minor_version(&runtime.version)?
         ),
@@ -1940,8 +2016,20 @@ fn collect_pending_installs(
                 let source = repositories
                     .source_for_url(&source_url)
                     .unwrap_or_else(|| RepositorySource::new(lockfile.registry.clone()));
-                let (artifact, fallback_artifact, install_kind, install_type) =
-                    preferred_artifact(&source, name, &package.version, &source_url, runtime);
+                let (
+                    artifact,
+                    binary_fallback_artifacts,
+                    fallback_artifact,
+                    install_kind,
+                    install_type,
+                ) = preferred_artifact(
+                    repositories,
+                    &source,
+                    name,
+                    &package.version,
+                    &source_url,
+                    runtime,
+                );
                 let dependencies = package
                     .dependencies
                     .iter()
@@ -1957,6 +2045,7 @@ fn collect_pending_installs(
                         name: name.clone(),
                         version: package.version.clone(),
                         artifact,
+                        binary_fallback_artifacts,
                         fallback_artifact,
                         install_kind,
                         install_type,
@@ -2011,102 +2100,55 @@ fn download_artifacts_in_parallel(
                     break;
                 };
 
-                let _ = sender.send(DownloadEvent::Started {
-                    name: package.name.clone(),
-                    version: package.version.clone(),
-                    kind: package.artifact.kind,
-                });
+                let mut result = download_artifact_candidate(
+                    &repositories,
+                    &sender,
+                    &package,
+                    &package.artifact,
+                    package.install_kind,
+                    package.install_type.clone(),
+                );
 
-                let progress_sender = sender.clone();
-                let progress_name = package.name.clone();
-                let result = repositories
-                    .source_for_url(&package.artifact.url)
-                    .ok_or_else(|| {
-                        format!(
-                            "could not determine repository source for {}@{}",
-                            package.name, package.version
-                        )
-                    })
-                    .and_then(|source| {
-                        repositories.download_artifact_with_progress(
-                            &source,
-                            &package.name,
-                            &package.version,
-                            &package.artifact,
-                            move |progress| match progress {
-                                DownloadProgress::ContentLength(length) => {
-                                    let _ = progress_sender.send(DownloadEvent::ContentLength {
-                                        name: progress_name.clone(),
-                                        length,
-                                    });
-                                }
-                                DownloadProgress::Advanced(bytes) => {
-                                    let _ = progress_sender.send(DownloadEvent::Advanced {
-                                        name: progress_name.clone(),
-                                        bytes,
-                                    });
-                                }
-                            },
-                        )
-                    })
-                    .map(|artifact| DownloadedInstall {
+                for artifact in &package.binary_fallback_artifacts {
+                    if result.is_ok() {
+                        break;
+                    }
+                    let Err(error) = &result else {
+                        continue;
+                    };
+                    if !should_fallback_to_source(error) {
+                        break;
+                    }
+                    result = download_artifact_candidate(
+                        &repositories,
+                        &sender,
+                        &package,
                         artifact,
-                        install_kind: package.install_kind,
-                        install_type: package.install_type.clone(),
-                    })
-                    .or_else(|error| {
-                        let Some(fallback) = &package.fallback_artifact else {
-                            return Err(error);
-                        };
-                        if !should_fallback_to_source(&error) {
-                            return Err(error);
-                        }
-                        let _ = sender.send(DownloadEvent::FallbackToSource {
-                            name: package.name.clone(),
-                            version: package.version.clone(),
-                        });
-                        let _ = sender.send(DownloadEvent::Started {
-                            name: package.name.clone(),
-                            version: package.version.clone(),
-                            kind: fallback.kind,
-                        });
-                        let source =
-                            repositories.source_for_url(&fallback.url).ok_or_else(|| {
-                                format!(
-                                    "could not determine repository source for {}@{}",
-                                    package.name, package.version
-                                )
-                            })?;
-                        let progress_sender = sender.clone();
-                        let progress_name = package.name.clone();
-                        repositories
-                            .download_artifact_with_progress(
-                                &source,
-                                &package.name,
-                                &package.version,
-                                fallback,
-                                move |progress| match progress {
-                                    DownloadProgress::ContentLength(length) => {
-                                        let _ =
-                                            progress_sender.send(DownloadEvent::ContentLength {
-                                                name: progress_name.clone(),
-                                                length,
-                                            });
-                                    }
-                                    DownloadProgress::Advanced(bytes) => {
-                                        let _ = progress_sender.send(DownloadEvent::Advanced {
-                                            name: progress_name.clone(),
-                                            bytes,
-                                        });
-                                    }
-                                },
-                            )
-                            .map(|artifact| DownloadedInstall {
-                                artifact,
-                                install_kind: InstallKind::Source,
-                                install_type: "source".to_string(),
-                            })
+                        InstallKind::Binary,
+                        package.install_type.clone(),
+                    );
+                }
+
+                let result = result.or_else(|error| {
+                    let Some(fallback) = &package.fallback_artifact else {
+                        return Err(error);
+                    };
+                    if !should_fallback_to_source(&error) {
+                        return Err(error);
+                    }
+                    let _ = sender.send(DownloadEvent::FallbackToSource {
+                        name: package.name.clone(),
+                        version: package.version.clone(),
                     });
+                    download_artifact_candidate(
+                        &repositories,
+                        &sender,
+                        &package,
+                        fallback,
+                        InstallKind::Source,
+                        "source".to_string(),
+                    )
+                });
                 let _ = sender.send(DownloadEvent::Finished {
                     package: Box::new(package),
                     result,
@@ -2144,6 +2186,59 @@ fn download_artifacts_in_parallel(
     }
 
     Ok(downloaded)
+}
+
+fn download_artifact_candidate(
+    repositories: &RepositorySet,
+    sender: &mpsc::Sender<DownloadEvent>,
+    package: &PendingInstall,
+    artifact: &ArtifactRequest,
+    install_kind: InstallKind,
+    install_type: String,
+) -> Result<DownloadedInstall, String> {
+    let _ = sender.send(DownloadEvent::Started {
+        name: package.name.clone(),
+        version: package.version.clone(),
+        kind: artifact.kind,
+    });
+
+    let progress_sender = sender.clone();
+    let progress_name = package.name.clone();
+    repositories
+        .source_for_url(&artifact.url)
+        .ok_or_else(|| {
+            format!(
+                "could not determine repository source for {}@{}",
+                package.name, package.version
+            )
+        })
+        .and_then(|source| {
+            repositories.download_artifact_with_progress(
+                &source,
+                &package.name,
+                &package.version,
+                artifact,
+                move |progress| match progress {
+                    DownloadProgress::ContentLength(length) => {
+                        let _ = progress_sender.send(DownloadEvent::ContentLength {
+                            name: progress_name.clone(),
+                            length,
+                        });
+                    }
+                    DownloadProgress::Advanced(bytes) => {
+                        let _ = progress_sender.send(DownloadEvent::Advanced {
+                            name: progress_name.clone(),
+                            bytes,
+                        });
+                    }
+                },
+            )
+        })
+        .map(|artifact| DownloadedInstall {
+            artifact,
+            install_kind,
+            install_type,
+        })
 }
 
 fn ready_install_names(
@@ -2467,10 +2562,11 @@ fn read_log_tail(path: &Path, max_lines: usize) -> String {
 mod tests {
     use super::{
         LockfileCompatibilityError, add_resolution_roots, binary_artifact_request,
-        compiled_cache_key, constraints_from_resolved_roots, default_registry_base_url,
-        locked_install_order, lockfile_from_resolution, persisted_constraints, preferred_artifact,
-        r_minor_version, repository_sources_from_project, resolve_use_default_repository,
-        semver_add_constraint, should_fallback_to_source, validate_lockfile_compatibility,
+        compiled_cache_key, constraints_from_resolved_roots, cran_like_binary_artifact_request,
+        default_registry_base_url, locked_install_order, lockfile_from_resolution,
+        persisted_constraints, preferred_artifact, r_minor_version,
+        repository_sources_from_project, resolve_use_default_repository, semver_add_constraint,
+        should_fallback_to_source, validate_lockfile_compatibility,
     };
     use crate::description::{ProjectDescription, RDescription};
     use crate::{
@@ -2481,7 +2577,7 @@ mod tests {
         },
         r::RuntimeInfo,
         registry::ResolutionRoot,
-        repository::RepositorySource,
+        repository::{RepositorySet, RepositorySource},
         resolver::{ResolvedDependency, ResolvedPackage},
         sysreqs::SysreqDbSnapshot,
     };
@@ -2995,14 +3091,58 @@ mod tests {
     }
 
     #[test]
-    fn uses_source_artifacts_for_cran_like_repositories() {
+    fn derives_windows_cran_like_binary_artifact_url_from_runtime() {
+        let runtime = RuntimeInfo {
+            version: "4.5.2".to_string(),
+            platform: "x86_64-w64-mingw32".to_string(),
+            pkg_type: "win.binary".to_string(),
+        };
+
+        let artifact =
+            cran_like_binary_artifact_request("https://cran.example", "digest", "0.6.38", &runtime)
+                .expect("windows CRAN-like binary should be supported");
+
+        assert_eq!(
+            artifact.url,
+            "https://cran.example/bin/windows/contrib/4.5/digest_0.6.38.zip"
+        );
+        assert_eq!(artifact.cache_file_name, "digest_0.6.38.zip");
+    }
+
+    #[test]
+    fn derives_macos_cran_like_binary_artifact_url_from_runtime() {
+        let runtime = RuntimeInfo {
+            version: "4.5.2".to_string(),
+            platform: "aarch64-apple-darwin20".to_string(),
+            pkg_type: "mac.binary.big-sur-arm64".to_string(),
+        };
+
+        let artifact = cran_like_binary_artifact_request(
+            "https://cran.example",
+            "jsonlite",
+            "2.0.0",
+            &runtime,
+        )
+        .expect("macOS CRAN-like binary should be supported");
+
+        assert_eq!(
+            artifact.url,
+            "https://cran.example/bin/macosx/big-sur-arm64/contrib/4.5/jsonlite_2.0.0.tgz"
+        );
+        assert_eq!(artifact.cache_file_name, "jsonlite_2.0.0.tgz");
+    }
+
+    #[test]
+    fn prefers_cran_like_binary_artifacts_with_locked_source_fallback() {
         let runtime = RuntimeInfo {
             version: "4.5.2".to_string(),
             platform: "x86_64-w64-mingw32".to_string(),
             pkg_type: "win.binary".to_string(),
         };
         let source = RepositorySource::cran_like("https://cran.example");
-        let (artifact, fallback, install_kind, install_type) = preferred_artifact(
+        let repositories = RepositorySet::new(vec![source.clone()]);
+        let (artifact, binary_fallbacks, fallback, install_kind, install_type) = preferred_artifact(
+            &repositories,
             &source,
             "digest",
             "0.6.38",
@@ -3012,11 +3152,56 @@ mod tests {
 
         assert_eq!(
             artifact.url,
+            "https://cran.example/bin/windows/contrib/4.5/digest_0.6.38.zip"
+        );
+        assert!(binary_fallbacks.is_empty());
+        assert_eq!(
+            fallback.expect("source fallback should exist").url,
             "https://cran.example/src/contrib/digest_0.6.38.tar.gz"
         );
-        assert!(fallback.is_none());
-        assert_eq!(install_kind, crate::ui::InstallKind::Source);
-        assert_eq!(install_type, "source");
+        assert_eq!(install_kind, crate::ui::InstallKind::Binary);
+        assert_eq!(install_type, "win.binary");
+    }
+
+    #[test]
+    fn tries_locked_repository_binary_before_other_repository_binaries() {
+        let runtime = RuntimeInfo {
+            version: "4.5.2".to_string(),
+            platform: "x86_64-w64-mingw32".to_string(),
+            pkg_type: "win.binary".to_string(),
+        };
+        let default = RepositorySource::new("https://default.example/cran");
+        let locked = RepositorySource::cran_like("https://cran.example");
+        let other = RepositorySource::cran_like("https://mirror.example");
+        let repositories = RepositorySet::new(vec![default.clone(), locked.clone(), other]);
+        let (artifact, binary_fallbacks, fallback, install_kind, _) = preferred_artifact(
+            &repositories,
+            &locked,
+            "digest",
+            "0.6.38",
+            "https://cran.example/src/contrib/digest_0.6.38.tar.gz",
+            &runtime,
+        );
+
+        assert_eq!(
+            artifact.url,
+            "https://cran.example/bin/windows/contrib/4.5/digest_0.6.38.zip"
+        );
+        assert_eq!(
+            binary_fallbacks
+                .iter()
+                .map(|artifact| artifact.url.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "https://default.example/cran/packages/digest/versions/0.6.38/binaries/windows/4.5",
+                "https://mirror.example/bin/windows/contrib/4.5/digest_0.6.38.zip",
+            ]
+        );
+        assert_eq!(
+            fallback.expect("source fallback should exist").url,
+            "https://cran.example/src/contrib/digest_0.6.38.tar.gz"
+        );
+        assert_eq!(install_kind, crate::ui::InstallKind::Binary);
     }
 
     #[test]
