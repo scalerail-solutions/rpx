@@ -481,6 +481,7 @@ fn cmd_add(packages: &[String], default_repo: bool, no_default_repo: bool) -> Rp
             use_default_repository,
             &resolved_addition.resolved,
             &sysreq_db,
+            None,
         ));
     }
 
@@ -1123,8 +1124,14 @@ fn lock_from_description(default_repo: bool, no_default_repo: bool) -> RpxResult
     let sysreq_db = load_sysreq_snapshot_for_lock(existing_lockfile.as_ref());
 
     if roots.is_empty() {
-        let lockfile =
-            lockfile_from_resolution(vec![], &registry, use_default_repository, &[], &sysreq_db);
+        let lockfile = lockfile_from_resolution(
+            vec![],
+            &registry,
+            use_default_repository,
+            &[],
+            &sysreq_db,
+            None,
+        );
         let changed = existing_lockfile.as_ref() != Some(&lockfile);
         write_project_lockfile(lockfile)?;
         return Ok(LockOutcome { changed });
@@ -1150,6 +1157,7 @@ fn lock_from_description(default_repo: bool, no_default_repo: bool) -> RpxResult
         use_default_repository,
         &resolved,
         &sysreq_db,
+        None,
     );
     let changed = existing_lockfile.as_ref() != Some(&lockfile);
     write_project_lockfile(lockfile)?;
@@ -1434,6 +1442,7 @@ fn lockfile_from_resolution(
     use_default_repository: bool,
     resolved: &[ResolvedPackage],
     sysreq_db: &sysreqs::SysreqDbSnapshot,
+    r_version: Option<&str>,
 ) -> Lockfile {
     let required_base_packages = locked_base_packages(&roots, resolved);
     let sysreqs = locked_system_requirements(resolved, sysreq_db);
@@ -1443,7 +1452,9 @@ fn lockfile_from_resolution(
         registry: registry.to_string(),
         use_default_repository,
         r: LockedR {
-            version: runtime_info().version,
+            version: r_version
+                .map(ToString::to_string)
+                .unwrap_or_else(|| runtime_info().version),
             base_packages: required_base_packages,
         },
         sysreqs,
@@ -2677,6 +2688,7 @@ mod tests {
                 },
             ],
             &empty_sysreq_db(),
+            Some("4.5.2"),
         );
 
         assert_eq!(lockfile.registry, "https://api.rrepo.org");
@@ -2943,6 +2955,7 @@ mod tests {
             true,
             &[],
             &empty_sysreq_db(),
+            Some("4.5.2"),
         );
 
         assert_eq!(lockfile.r.base_packages, vec!["grid"]);
