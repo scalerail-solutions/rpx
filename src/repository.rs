@@ -961,9 +961,7 @@ fn combine_description_errors(errors: Vec<(String, String)>) -> String {
         .map(|(url, error)| format!("{url}: {error}"))
         .collect::<Vec<_>>()
         .join("; ");
-    format!(
-        "failed to fetch DESCRIPTION from direct, current, or archive source package ({details})"
-    )
+    format!("failed to fetch DESCRIPTION from any candidate location ({details})")
 }
 
 fn parse_dcf_records(input: &str) -> Vec<BTreeMap<String, String>> {
@@ -1139,13 +1137,11 @@ fn validate_description(
     url: &str,
 ) -> Result<(), String> {
     if description.trim().is_empty() {
-        return Err(format!(
-            "source package {url} contains an empty DESCRIPTION"
-        ));
+        return Err(format!("DESCRIPTION at {url} is empty"));
     }
     if !description_declares_package_version(description, package, version) {
         return Err(format!(
-            "source package {url} DESCRIPTION does not describe package {package} {version}"
+            "DESCRIPTION at {url} does not describe package {package} {version}"
         ));
     }
     Ok(())
