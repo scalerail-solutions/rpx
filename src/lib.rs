@@ -553,10 +553,12 @@ fn classify_repository_source(url: &str) -> Result<RepositorySource, String> {
             match cran_like_set.fetch_repository_packages(&cran_like) {
                 Ok(_) => {
                     let archive_support = detect_cran_like_archive_support(&cran_like)?;
-                    Ok(RepositorySource::cran_like_with_archive_support(
-                        url,
-                        archive_support,
-                    ))
+                    Ok(match archive_support {
+                        Some(archive_support) => {
+                            RepositorySource::cran_like_with_archive_support(url, archive_support)
+                        }
+                        None => RepositorySource::cran_like(url),
+                    })
                 }
                 Err(cran_error) => Err(format!(
                     "not an rrepo API ({rrepo_error}) or CRAN-like repository ({cran_error})"
@@ -2095,6 +2097,11 @@ fn r_minor_version(version: &str) -> Option<String> {
     Some(format!("{}.{}", parts.next()?, parts.next()?))
 }
 
+fn should_fallback_to_source(error: &str) -> bool {
+    error.contains("artifact download failed (404 ")
+        || error.contains("artifact download failed (502 ")
+}
+
 fn collect_pending_installs(
     lockfile: &Lockfile,
     installed: &BTreeMap<String, r::InstalledPackage>,
@@ -2206,6 +2213,15 @@ fn download_artifacts_in_parallel(
                     package.install_kind,
                     package.install_type.clone(),
                 );
+                let mut source_fallback_allowed = result
+                    .as_ref()
+                    .err()
+                    .is_none_or(|error| should_fallback_to_source(error));
+                let mut first_non_fallback_error = result
+                    .as_ref()
+                    .err()
+                    .filter(|error| !should_fallback_to_source(error))
+                    .cloned();
 
                 for artifact in &package.binary_fallback_artifacts {
                     if result.is_ok() {
@@ -2219,9 +2235,20 @@ fn download_artifacts_in_parallel(
                         InstallKind::Binary,
                         package.install_type.clone(),
                     );
+                    if let Err(error) = &result
+                        && !should_fallback_to_source(error)
+                    {
+                        source_fallback_allowed = false;
+                        if first_non_fallback_error.is_none() {
+                            first_non_fallback_error = Some(error.clone());
+                        }
+                    }
                 }
 
                 let result = result.or_else(|error| {
+                    if !source_fallback_allowed {
+                        return Err(first_non_fallback_error.unwrap_or(error));
+                    }
                     let Some(fallback) = &package.fallback_artifact else {
                         return Err(error);
                     };
@@ -2655,7 +2682,8 @@ mod tests {
         cran_like_binary_artifact_request, default_registry_base_url, locked_install_order,
         lockfile_from_resolution, persisted_constraints, preferred_artifact,
         preferred_locked_versions, r_minor_version, repository_sources_from_project,
-        resolve_use_default_repository, semver_add_constraint, validate_lockfile_compatibility,
+        resolve_use_default_repository, semver_add_constraint, should_fallback_to_source,
+        validate_lockfile_compatibility,
     };
     use crate::description::{ProjectDescription, RDescription};
     use crate::{
@@ -3462,6 +3490,22 @@ mod tests {
         assert_eq!(r_minor_version("4.5.2"), Some("4.5".to_string()));
         assert_eq!(r_minor_version("4.4"), Some("4.4".to_string()));
         assert_eq!(r_minor_version("4"), None);
+    }
+
+    #[test]
+    fn source_fallback_statuses_are_limited_to_missing_or_upstream_binary_errors() {
+        assert!(should_fallback_to_source(
+            "artifact download failed (404 Not Found): missing"
+        ));
+        assert!(should_fallback_to_source(
+            "artifact download failed (502 Bad Gateway): upstream failed"
+        ));
+        assert!(!should_fallback_to_source(
+            "artifact download failed (403 Forbidden): forbidden"
+        ));
+        assert!(!should_fallback_to_source(
+            "failed to read binary artifact: corrupt body"
+        ));
     }
 
     #[test]

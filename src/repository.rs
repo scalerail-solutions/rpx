@@ -11,7 +11,7 @@ use std::{
     hash::{Hash, Hasher},
     io::{self, IsTerminal, Read},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 use tar::Archive;
 use tokio::task::JoinSet;
@@ -20,6 +20,7 @@ use crate::project::cache_dir_path;
 use crate::r_version::compare_r_versions;
 
 const KEYRING_SERVICE: &str = "rpx";
+static DESCRIPTION_FETCH_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RepositorySource {
@@ -437,14 +438,19 @@ impl RepositorySet {
             (_, Ok(CranLikePackageArchive::Available(_))) => {
                 self.record_cran_archive_support(source, CranArchiveSupport::Available);
             }
-            (Ok(false), _) | (Err(CranLikeArchiveError::Unavailable), _) => {
+            (Ok(CranLikeArchiveListingSupport::Unavailable), _) => {
                 self.record_cran_archive_support(source, CranArchiveSupport::Unavailable);
             }
             (Err(CranLikeArchiveError::Failed(error)), _) => return Err(error.clone()),
-            (Ok(true), Err(CranLikeArchiveError::Failed(error))) => return Err(error.clone()),
-            (Ok(true), _) => {
+            (
+                Ok(CranLikeArchiveListingSupport::Available),
+                Err(CranLikeArchiveError::Failed(error)),
+            ) => return Err(error.clone()),
+            (Ok(CranLikeArchiveListingSupport::Available), _) => {
                 self.record_cran_archive_support(source, CranArchiveSupport::Available);
             }
+            (Ok(CranLikeArchiveListingSupport::Unknown), _)
+            | (Err(CranLikeArchiveError::Unavailable), _) => {}
         }
 
         if let Ok(CranLikePackageArchive::Available(versions)) = package_archive {
@@ -693,6 +699,13 @@ enum CranLikeArchiveError {
     Failed(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CranLikeArchiveListingSupport {
+    Available,
+    Unavailable,
+    Unknown,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum CranArchiveSupport {
     Available,
@@ -707,13 +720,16 @@ enum CranLikePackageArchive {
 
 fn fetch_cran_like_archive_listing_available(
     source: &RepositorySource,
-) -> Result<bool, CranLikeArchiveError> {
+) -> Result<CranLikeArchiveListingSupport, CranLikeArchiveError> {
     let url = format!("{}/src/contrib/Archive/", source.base_url());
-    let response = reqwest::blocking::get(&url).map_err(|_| CranLikeArchiveError::Unavailable)?;
+    let response = match reqwest::blocking::get(&url) {
+        Ok(response) => response,
+        Err(_) => return Ok(CranLikeArchiveListingSupport::Unknown),
+    };
     let status = response.status();
 
     if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::FORBIDDEN {
-        return Ok(false);
+        return Ok(CranLikeArchiveListingSupport::Unavailable);
     }
     if !status.is_success() {
         return Err(CranLikeArchiveError::Failed(unexpected_cran_like_response(
@@ -721,15 +737,18 @@ fn fetch_cran_like_archive_listing_available(
         )));
     }
 
-    Ok(true)
+    Ok(CranLikeArchiveListingSupport::Available)
 }
 
 pub(crate) fn detect_cran_like_archive_support(
     source: &RepositorySource,
-) -> Result<CranArchiveSupport, String> {
+) -> Result<Option<CranArchiveSupport>, String> {
     match fetch_cran_like_archive_listing_available(source) {
-        Ok(true) => Ok(CranArchiveSupport::Available),
-        Ok(false) | Err(CranLikeArchiveError::Unavailable) => Ok(CranArchiveSupport::Unavailable),
+        Ok(CranLikeArchiveListingSupport::Available) => Ok(Some(CranArchiveSupport::Available)),
+        Ok(CranLikeArchiveListingSupport::Unavailable) => Ok(Some(CranArchiveSupport::Unavailable)),
+        Ok(CranLikeArchiveListingSupport::Unknown) | Err(CranLikeArchiveError::Unavailable) => {
+            Ok(None)
+        }
         Err(CranLikeArchiveError::Failed(error)) => Err(error),
     }
 }
@@ -852,8 +871,10 @@ fn fetch_description_from_cran_like_tarballs(
         DescriptionCandidate::tarball(current_url, package, version),
         DescriptionCandidate::tarball(archive_url, package, version),
     ];
-    tokio::runtime::Runtime::new()
-        .map_err(|error| format!("failed to start DESCRIPTION fetch runtime: {error}"))?
+    DESCRIPTION_FETCH_RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Runtime::new().expect("DESCRIPTION fetch runtime should start")
+        })
         .block_on(fetch_first_description_candidate(candidates))
 }
 
@@ -1566,6 +1587,16 @@ Version: 1.1.6
             repositories.cran_archive_unavailable_repositories(),
             vec![server.url()]
         );
+    }
+
+    #[test]
+    fn treats_archive_listing_transport_failure_as_unknown_support() {
+        let source = RepositorySource::cran_like("http://127.0.0.1:9");
+
+        let result = fetch_cran_like_archive_listing_available(&source)
+            .expect("transport failures should not be hard archive probe errors");
+
+        assert_eq!(result, CranLikeArchiveListingSupport::Unknown);
     }
 
     #[test]
