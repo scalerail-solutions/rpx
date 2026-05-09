@@ -11,7 +11,7 @@ use std::{
     hash::{Hash, Hasher},
     io::{self, IsTerminal, Read},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, mpsc},
 };
 use tar::Archive;
 
@@ -61,6 +61,8 @@ pub struct RepositorySet {
     cran_current_indexes:
         Arc<std::sync::Mutex<BTreeMap<String, BTreeMap<String, Vec<VersionSummary>>>>>,
     cran_archive_unavailable: Arc<std::sync::Mutex<BTreeSet<String>>>,
+    cran_archive_listing_support: Arc<std::sync::Mutex<BTreeMap<String, CranArchiveSupport>>>,
+    unavailable_rrepo_sources: Arc<std::sync::Mutex<BTreeSet<String>>>,
 }
 
 impl std::fmt::Debug for RepositorySet {
@@ -136,6 +138,8 @@ impl RepositorySet {
             prompter,
             cran_current_indexes: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             cran_archive_unavailable: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
+            cran_archive_listing_support: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            unavailable_rrepo_sources: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -160,6 +164,16 @@ impl RepositorySet {
         package: &str,
     ) -> Result<SourcedPackageVersions, String> {
         for source in &self.sources {
+            if source.kind() == RepositoryKind::Rrepo
+                && self
+                    .unavailable_rrepo_sources
+                    .lock()
+                    .expect("unavailable rrepo cache should lock")
+                    .contains(source.base_url())
+            {
+                continue;
+            }
+
             let result = match source.kind() {
                 RepositoryKind::Rrepo => self.with_authorized_client(source, |client| {
                     client.fetch_package_versions_with_retry(package)
@@ -173,6 +187,15 @@ impl RepositorySet {
                         source: source.clone(),
                         response,
                     });
+                }
+                Err(error)
+                    if source.kind() == RepositoryKind::Rrepo && is_not_found_error(&error) =>
+                {
+                    self.unavailable_rrepo_sources
+                        .lock()
+                        .expect("unavailable rrepo cache should lock")
+                        .insert(source.base_url().to_string());
+                    continue;
                 }
                 Err(error) if is_not_found_error(&error) => continue,
                 Err(error) => return Err(error),
@@ -270,6 +293,22 @@ impl RepositorySet {
         source: &RepositorySource,
         package: &str,
     ) -> Result<PackageVersionsResponse, String> {
+        match self.cran_archive_support(source) {
+            Some(CranArchiveSupport::Unavailable) => {
+                self.cran_versions_without_archive(source, package)
+            }
+            Some(CranArchiveSupport::Available) => {
+                self.cran_versions_with_known_archive(source, package)
+            }
+            None => self.cran_versions_with_unknown_archive(source, package),
+        }
+    }
+
+    fn cran_versions_without_archive(
+        &self,
+        source: &RepositorySource,
+        package: &str,
+    ) -> Result<PackageVersionsResponse, String> {
         let mut by_version = BTreeMap::new();
 
         for version in self
@@ -280,29 +319,100 @@ impl RepositorySet {
             by_version.insert(version.version.clone(), version);
         }
 
-        match fetch_cran_like_archive_versions(source, package) {
-            Ok(versions) => {
-                for version in versions {
-                    by_version.entry(version.version.clone()).or_insert(version);
-                }
+        package_versions_response(package, by_version)
+    }
+
+    fn cran_versions_with_known_archive(
+        &self,
+        source: &RepositorySource,
+        package: &str,
+    ) -> Result<PackageVersionsResponse, String> {
+        let (index, archive) = std::thread::scope(|scope| {
+            let current = scope.spawn(|| self.cran_like_current_index(source));
+            let archive = scope.spawn(|| fetch_cran_like_archive_versions(source, package));
+            (
+                current
+                    .join()
+                    .expect("current index worker should not panic"),
+                archive.join().expect("archive worker should not panic"),
+            )
+        });
+        let mut by_version = versions_for_package(index?, package);
+
+        match archive {
+            Ok(CranLikePackageArchive::Available(versions)) => {
+                merge_versions(&mut by_version, versions)
             }
-            Err(CranLikeArchiveError::Unavailable) => {
-                self.cran_archive_unavailable
-                    .lock()
-                    .expect("CRAN-like archive availability should lock")
-                    .insert(source.base_url().to_string());
-            }
+            Ok(CranLikePackageArchive::Missing) | Err(CranLikeArchiveError::Unavailable) => {}
             Err(CranLikeArchiveError::Failed(error)) => return Err(error),
         }
 
-        if by_version.is_empty() {
-            return Err(missing_package_error(package));
+        package_versions_response(package, by_version)
+    }
+
+    fn cran_versions_with_unknown_archive(
+        &self,
+        source: &RepositorySource,
+        package: &str,
+    ) -> Result<PackageVersionsResponse, String> {
+        let (index, root_archive, package_archive) = std::thread::scope(|scope| {
+            let current = scope.spawn(|| self.cran_like_current_index(source));
+            let root_archive = scope.spawn(|| fetch_cran_like_archive_listing_available(source));
+            let package_archive = scope.spawn(|| fetch_cran_like_archive_versions(source, package));
+            (
+                current
+                    .join()
+                    .expect("current index worker should not panic"),
+                root_archive
+                    .join()
+                    .expect("archive support worker should not panic"),
+                package_archive
+                    .join()
+                    .expect("archive package worker should not panic"),
+            )
+        });
+        let mut by_version = versions_for_package(index?, package);
+
+        match (&root_archive, &package_archive) {
+            (_, Ok(CranLikePackageArchive::Available(_))) => {
+                self.record_cran_archive_support(source, CranArchiveSupport::Available);
+            }
+            (Ok(false), _) | (Err(CranLikeArchiveError::Unavailable), _) => {
+                self.record_cran_archive_support(source, CranArchiveSupport::Unavailable);
+            }
+            (Err(CranLikeArchiveError::Failed(error)), _) => return Err(error.clone()),
+            (Ok(true), Err(CranLikeArchiveError::Failed(error))) => return Err(error.clone()),
+            (Ok(true), _) => {
+                self.record_cran_archive_support(source, CranArchiveSupport::Available);
+            }
         }
 
-        Ok(PackageVersionsResponse {
-            package: package.to_string(),
-            versions: by_version.into_values().collect(),
-        })
+        if let Ok(CranLikePackageArchive::Available(versions)) = package_archive {
+            merge_versions(&mut by_version, versions);
+        }
+
+        package_versions_response(package, by_version)
+    }
+
+    fn cran_archive_support(&self, source: &RepositorySource) -> Option<CranArchiveSupport> {
+        self.cran_archive_listing_support
+            .lock()
+            .expect("CRAN-like archive listing support should lock")
+            .get(source.base_url())
+            .copied()
+    }
+
+    fn record_cran_archive_support(&self, source: &RepositorySource, support: CranArchiveSupport) {
+        self.cran_archive_listing_support
+            .lock()
+            .expect("CRAN-like archive listing support should lock")
+            .insert(source.base_url().to_string(), support);
+        if support == CranArchiveSupport::Unavailable {
+            self.cran_archive_unavailable
+                .lock()
+                .expect("CRAN-like archive availability should lock")
+                .insert(source.base_url().to_string());
+        }
     }
 
     fn cran_like_current_index(
@@ -331,20 +441,13 @@ impl RepositorySet {
     ) -> Result<String, String> {
         let path = cran_like_description_cache_path(source, package, version);
         if let Ok(description) = fs::read_to_string(&path) {
-            if description_declares_package(&description, package) {
+            if description_declares_package_version(&description, package, version) {
                 return Ok(description);
             }
             let _ = fs::remove_file(&path);
         }
 
-        let versions = self.fetch_cran_like_package_versions(source, package)?;
-        let tarball_url = versions
-            .versions
-            .into_iter()
-            .find(|candidate| candidate.version == version)
-            .map(|candidate| candidate.source_url)
-            .ok_or_else(|| missing_package_error(package))?;
-        let description = fetch_description_from_tarball(&tarball_url, package)?;
+        let description = fetch_description_from_cran_like_tarballs(source, package, version)?;
         write_text_cache(&path, &description);
         Ok(description)
     }
@@ -459,17 +562,7 @@ pub fn cran_like_source_from_package_url(url: &str) -> Option<String> {
 fn fetch_cran_like_current_index(
     source: &RepositorySource,
 ) -> Result<BTreeMap<String, Vec<VersionSummary>>, String> {
-    let url = format!("{}/src/contrib/PACKAGES", source.base_url());
-    let body = reqwest::blocking::get(&url)
-        .map_err(|error| format!("failed to contact CRAN-like repository: {error}"))?;
-    let status = body.status();
-    if !status.is_success() {
-        return Err(unexpected_cran_like_response(body));
-    }
-
-    let body = body
-        .text()
-        .map_err(|error| format!("failed to read CRAN-like PACKAGES index: {error}"))?;
+    let body = fetch_cran_like_packages_index(source)?;
     let mut index: BTreeMap<String, Vec<VersionSummary>> = BTreeMap::new();
 
     for record in parse_dcf_records(&body) {
@@ -496,20 +589,92 @@ fn fetch_cran_like_current_index(
     Ok(index)
 }
 
+fn fetch_cran_like_packages_index(source: &RepositorySource) -> Result<String, String> {
+    fetch_cran_like_packages_gz_index(source)
+        .or_else(|_| fetch_cran_like_packages_plain_index(source))
+}
+
+fn fetch_cran_like_packages_gz_index(source: &RepositorySource) -> Result<String, String> {
+    let url = format!("{}/src/contrib/PACKAGES.gz", source.base_url());
+    let response = reqwest::blocking::get(&url)
+        .map_err(|error| format!("failed to contact CRAN-like repository: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(unexpected_cran_like_response(response));
+    }
+
+    let bytes = response
+        .bytes()
+        .map_err(|error| format!("failed to read CRAN-like PACKAGES.gz index: {error}"))?;
+    let mut decoder = GzDecoder::new(bytes.as_ref());
+    let mut body = String::new();
+    decoder
+        .read_to_string(&mut body)
+        .map_err(|error| format!("failed to decompress CRAN-like PACKAGES.gz index: {error}"))?;
+    Ok(body)
+}
+
+fn fetch_cran_like_packages_plain_index(source: &RepositorySource) -> Result<String, String> {
+    let url = format!("{}/src/contrib/PACKAGES", source.base_url());
+    let body = reqwest::blocking::get(&url)
+        .map_err(|error| format!("failed to contact CRAN-like repository: {error}"))?;
+    let status = body.status();
+    if !status.is_success() {
+        return Err(unexpected_cran_like_response(body));
+    }
+
+    body.text()
+        .map_err(|error| format!("failed to read CRAN-like PACKAGES index: {error}"))
+}
+
 #[derive(Debug)]
 enum CranLikeArchiveError {
     Unavailable,
     Failed(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CranArchiveSupport {
+    Available,
+    Unavailable,
+}
+
+#[derive(Debug)]
+enum CranLikePackageArchive {
+    Available(Vec<VersionSummary>),
+    Missing,
+}
+
+fn fetch_cran_like_archive_listing_available(
+    source: &RepositorySource,
+) -> Result<bool, CranLikeArchiveError> {
+    let url = format!("{}/src/contrib/Archive/", source.base_url());
+    let response = reqwest::blocking::get(&url).map_err(|_| CranLikeArchiveError::Unavailable)?;
+    let status = response.status();
+
+    if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::FORBIDDEN {
+        return Ok(false);
+    }
+    if !status.is_success() {
+        return Err(CranLikeArchiveError::Failed(unexpected_cran_like_response(
+            response,
+        )));
+    }
+
+    Ok(true)
+}
+
 fn fetch_cran_like_archive_versions(
     source: &RepositorySource,
     package: &str,
-) -> Result<Vec<VersionSummary>, CranLikeArchiveError> {
+) -> Result<CranLikePackageArchive, CranLikeArchiveError> {
     let url = format!("{}/src/contrib/Archive/{package}/", source.base_url());
     let response = reqwest::blocking::get(&url).map_err(|_| CranLikeArchiveError::Unavailable)?;
     let status = response.status();
-    if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::FORBIDDEN {
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(CranLikePackageArchive::Missing);
+    }
+    if status == reqwest::StatusCode::FORBIDDEN {
         return Err(CranLikeArchiveError::Unavailable);
     }
     if !status.is_success() {
@@ -533,7 +698,42 @@ fn fetch_cran_like_archive_versions(
         })
         .collect::<Vec<_>>();
     versions.sort_by(|left, right| left.version.cmp(&right.version));
-    Ok(versions)
+    Ok(CranLikePackageArchive::Available(versions))
+}
+
+fn versions_for_package(
+    mut index: BTreeMap<String, Vec<VersionSummary>>,
+    package: &str,
+) -> BTreeMap<String, VersionSummary> {
+    index
+        .remove(package)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|version| (version.version.clone(), version))
+        .collect()
+}
+
+fn merge_versions(
+    by_version: &mut BTreeMap<String, VersionSummary>,
+    versions: Vec<VersionSummary>,
+) {
+    for version in versions {
+        by_version.entry(version.version.clone()).or_insert(version);
+    }
+}
+
+fn package_versions_response(
+    package: &str,
+    by_version: BTreeMap<String, VersionSummary>,
+) -> Result<PackageVersionsResponse, String> {
+    if by_version.is_empty() {
+        return Err(missing_package_error(package));
+    }
+
+    Ok(PackageVersionsResponse {
+        package: package.to_string(),
+        versions: by_version.into_values().collect(),
+    })
 }
 
 fn cran_like_current_tarball_url(
@@ -555,6 +755,109 @@ fn cran_like_archive_tarball_url(
     format!(
         "{}/src/contrib/Archive/{package}/{package}_{version}.tar.gz",
         source.base_url()
+    )
+}
+
+fn cran_like_current_description_url(source: &RepositorySource, package: &str) -> String {
+    format!("{}/web/packages/{package}/DESCRIPTION", source.base_url())
+}
+
+fn fetch_description_from_cran_like_tarballs(
+    source: &RepositorySource,
+    package: &str,
+    version: &str,
+) -> Result<String, String> {
+    let current_url = cran_like_current_tarball_url(source, package, version);
+    let archive_url = cran_like_archive_tarball_url(source, package, version);
+    let direct_url = cran_like_current_description_url(source, package);
+    let candidates = [
+        DescriptionCandidate::direct(direct_url, package, version),
+        DescriptionCandidate::tarball(current_url, package, version),
+        DescriptionCandidate::tarball(archive_url, package, version),
+    ];
+    let candidate_count = candidates.len();
+    let (tx, rx) = mpsc::channel();
+
+    for candidate in candidates {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let url = candidate.url.clone();
+            let result = candidate.fetch();
+            let _ = tx.send((url, result));
+        });
+    }
+    drop(tx);
+
+    let mut errors = Vec::new();
+    for _ in 0..candidate_count {
+        match rx.recv() {
+            Ok((_, Ok(description))) => return Ok(description),
+            Ok((url, Err(error))) => errors.push((url, error)),
+            Err(error) => errors.push((
+                "DESCRIPTION worker".to_string(),
+                format!("failed to receive DESCRIPTION result: {error}"),
+            )),
+        }
+    }
+
+    Err(combine_description_errors(errors))
+}
+
+struct DescriptionCandidate {
+    url: String,
+    package: String,
+    version: String,
+    kind: DescriptionCandidateKind,
+}
+
+enum DescriptionCandidateKind {
+    Direct,
+    Tarball,
+}
+
+impl DescriptionCandidate {
+    fn direct(url: String, package: &str, version: &str) -> Self {
+        Self {
+            url,
+            package: package.to_string(),
+            version: version.to_string(),
+            kind: DescriptionCandidateKind::Direct,
+        }
+    }
+
+    fn tarball(url: String, package: &str, version: &str) -> Self {
+        Self {
+            url,
+            package: package.to_string(),
+            version: version.to_string(),
+            kind: DescriptionCandidateKind::Tarball,
+        }
+    }
+
+    fn fetch(self) -> Result<String, String> {
+        match self.kind {
+            DescriptionCandidateKind::Direct => {
+                fetch_description_from_direct_url(&self.url, &self.package, &self.version)
+            }
+            DescriptionCandidateKind::Tarball => {
+                fetch_description_from_tarball(&self.url, &self.package, &self.version)
+            }
+        }
+    }
+}
+
+fn combine_description_errors(errors: Vec<(String, String)>) -> String {
+    if let Some((_, error)) = errors.iter().find(|(_, error)| !is_not_found_error(error)) {
+        return error.clone();
+    }
+
+    let details = errors
+        .into_iter()
+        .map(|(url, error)| format!("{url}: {error}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "failed to fetch DESCRIPTION from direct, current, or archive source package ({details})"
     )
 }
 
@@ -627,7 +930,30 @@ fn html_unescape_minimal(value: &str) -> String {
         .replace("&quot;", "\"")
 }
 
-fn fetch_description_from_tarball(url: &str, package: &str) -> Result<String, String> {
+fn fetch_description_from_direct_url(
+    url: &str,
+    package: &str,
+    version: &str,
+) -> Result<String, String> {
+    let response = reqwest::blocking::get(url)
+        .map_err(|error| format!("failed to download DESCRIPTION: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(unexpected_cran_like_response(response));
+    }
+
+    let description = response
+        .text()
+        .map_err(|error| format!("failed to read DESCRIPTION: {error}"))?;
+    validate_description(&description, package, version, url)?;
+    Ok(description)
+}
+
+fn fetch_description_from_tarball(
+    url: &str,
+    package: &str,
+    version: &str,
+) -> Result<String, String> {
     let response = reqwest::blocking::get(url)
         .map_err(|error| format!("failed to download source package for DESCRIPTION: {error}"))?;
     let status = response.status();
@@ -660,22 +986,32 @@ fn fetch_description_from_tarball(url: &str, package: &str) -> Result<String, St
         entry
             .read_to_string(&mut description)
             .map_err(|error| format!("failed to read DESCRIPTION from source package: {error}"))?;
-        if description.trim().is_empty() {
-            return Err(format!(
-                "source package {url} contains an empty DESCRIPTION"
-            ));
-        }
-        if !description_declares_package(&description, package) {
-            return Err(format!(
-                "source package {url} DESCRIPTION does not describe package {package}"
-            ));
-        }
+        validate_description(&description, package, version, url)?;
         return Ok(description);
     }
 
     Err(format!(
         "source package {url} does not contain {package}/DESCRIPTION"
     ))
+}
+
+fn validate_description(
+    description: &str,
+    package: &str,
+    version: &str,
+    url: &str,
+) -> Result<(), String> {
+    if description.trim().is_empty() {
+        return Err(format!(
+            "source package {url} contains an empty DESCRIPTION"
+        ));
+    }
+    if !description_declares_package_version(description, package, version) {
+        return Err(format!(
+            "source package {url} DESCRIPTION does not describe package {package} {version}"
+        ));
+    }
+    Ok(())
 }
 
 fn path_is_top_level_description(path: &Path, package: &str) -> bool {
@@ -689,11 +1025,12 @@ fn path_is_top_level_description(path: &Path, package: &str) -> bool {
         && components.next().is_none()
 }
 
-fn description_declares_package(description: &str, package: &str) -> bool {
-    parse_dcf_records(description)
-        .first()
-        .and_then(|record| record.get("Package"))
-        .is_some_and(|name| name == package)
+fn description_declares_package_version(description: &str, package: &str, version: &str) -> bool {
+    let Some(record) = parse_dcf_records(description).into_iter().next() else {
+        return false;
+    };
+    record.get("Package").is_some_and(|name| name == package)
+        && record.get("Version").is_some_and(|value| value == version)
 }
 
 fn cran_like_description_cache_path(
@@ -931,6 +1268,11 @@ Version: 1.1.6
             .expect(1)
             .create();
         let archive_mock = server
+            .mock("GET", "/src/contrib/Archive/")
+            .with_status(200)
+            .expect(1)
+            .create();
+        let package_archive_mock = server
             .mock("GET", "/src/contrib/Archive/digest/")
             .with_status(200)
             .with_header("content-type", "text/html")
@@ -955,6 +1297,7 @@ Version: 1.1.6
 
         current_mock.assert();
         archive_mock.assert();
+        package_archive_mock.assert();
         assert_eq!(result.source.kind(), RepositoryKind::CranLike);
         assert_eq!(
             result
@@ -972,6 +1315,55 @@ Version: 1.1.6
     }
 
     #[test]
+    fn skips_rrepo_candidate_after_not_found_for_same_repository_base() {
+        let mut server = Server::new();
+        let digest_rrepo_mock = server
+            .mock("GET", "/packages/digest/versions")
+            .with_status(404)
+            .expect(1)
+            .create();
+        let rlang_rrepo_mock = server
+            .mock("GET", "/packages/rlang/versions")
+            .with_status(404)
+            .expect(0)
+            .create();
+        let current_mock = server
+            .mock("GET", "/src/contrib/PACKAGES")
+            .with_status(200)
+            .with_header("content-type", "text/plain")
+            .with_body("Package: digest\nVersion: 0.6.38\n\nPackage: rlang\nVersion: 1.1.6\n")
+            .expect(1)
+            .create();
+        let archive_mock = server
+            .mock("GET", "/src/contrib/Archive/")
+            .with_status(404)
+            .expect(1)
+            .create();
+        let repositories = RepositorySet::with_support(
+            vec![
+                RepositorySource::new(server.url()),
+                RepositorySource::cran_like(server.url()),
+            ],
+            Arc::new(MemoryCredentialStore::default()),
+            Arc::new(StaticPrompter {
+                token: "secret".to_string(),
+            }),
+        );
+
+        repositories
+            .fetch_package_versions_with_retry("digest")
+            .expect("digest should resolve from CRAN-like source");
+        repositories
+            .fetch_package_versions_with_retry("rlang")
+            .expect("rlang should resolve from CRAN-like source");
+
+        digest_rrepo_mock.assert();
+        rlang_rrepo_mock.assert();
+        current_mock.assert();
+        archive_mock.assert();
+    }
+
+    #[test]
     fn resolves_cran_like_current_versions_when_archive_listing_is_unavailable() {
         let mut server = Server::new();
         let current_mock = server
@@ -982,7 +1374,7 @@ Version: 1.1.6
             .expect(1)
             .create();
         let archive_mock = server
-            .mock("GET", "/src/contrib/Archive/digest/")
+            .mock("GET", "/src/contrib/Archive/")
             .with_status(404)
             .expect(1)
             .create();
@@ -1012,18 +1404,6 @@ Version: 1.1.6
     fn fetches_cran_like_description_from_source_tarball() {
         let mut server = Server::new();
         let current_mock = server
-            .mock("GET", "/src/contrib/PACKAGES")
-            .with_status(200)
-            .with_header("content-type", "text/plain")
-            .with_body("Package: digest\nVersion: 0.6.38\n")
-            .expect(1)
-            .create();
-        let archive_mock = server
-            .mock("GET", "/src/contrib/Archive/digest/")
-            .with_status(404)
-            .expect(1)
-            .create();
-        let tarball_mock = server
             .mock("GET", "/src/contrib/digest_0.6.38.tar.gz")
             .with_status(200)
             .with_header("content-type", "application/gzip")
@@ -1032,6 +1412,10 @@ Version: 1.1.6
                 "Package: digest\nVersion: 0.6.38\nImports: utils\n",
             ))
             .expect(1)
+            .create();
+        let _archive_mock = server
+            .mock("GET", "/src/contrib/Archive/digest/digest_0.6.38.tar.gz")
+            .with_status(404)
             .create();
         let source = RepositorySource::cran_like(server.url());
         write_text_cache(
@@ -1051,10 +1435,71 @@ Version: 1.1.6
             .expect("DESCRIPTION should be extracted");
 
         current_mock.assert();
-        archive_mock.assert();
-        tarball_mock.assert();
         assert!(description.contains("Package: digest"));
         assert!(description.contains("Imports: utils"));
+    }
+
+    #[test]
+    fn fetches_cran_like_description_from_direct_endpoint() {
+        let mut server = Server::new();
+        let direct_mock = server
+            .mock("GET", "/web/packages/digest/DESCRIPTION")
+            .with_status(200)
+            .with_header("content-type", "text/plain")
+            .with_body("Package: digest\nVersion: 0.6.38\nImports: utils\n")
+            .expect(1)
+            .create();
+        let source = RepositorySource::cran_like(server.url());
+        let repositories = RepositorySet::with_support(
+            vec![source.clone()],
+            Arc::new(MemoryCredentialStore::default()),
+            Arc::new(StaticPrompter {
+                token: "secret".to_string(),
+            }),
+        );
+
+        let description = repositories
+            .fetch_description_with_retry(&source, "digest", "0.6.38")
+            .expect("direct DESCRIPTION should be used");
+
+        direct_mock.assert();
+        assert!(description.contains("Package: digest"));
+        assert!(description.contains("Version: 0.6.38"));
+    }
+
+    #[test]
+    fn fetches_cran_like_description_from_archive_tarball() {
+        let mut server = Server::new();
+        let _current_mock = server
+            .mock("GET", "/src/contrib/digest_0.6.37.tar.gz")
+            .with_status(404)
+            .create();
+        let archive_mock = server
+            .mock("GET", "/src/contrib/Archive/digest/digest_0.6.37.tar.gz")
+            .with_status(200)
+            .with_header("content-type", "application/gzip")
+            .with_body(source_tarball(
+                "digest",
+                "Package: digest\nVersion: 0.6.37\nImports: utils\n",
+            ))
+            .expect(1)
+            .create();
+        let source = RepositorySource::cran_like(server.url());
+        let repositories = RepositorySet::with_support(
+            vec![source.clone()],
+            Arc::new(MemoryCredentialStore::default()),
+            Arc::new(StaticPrompter {
+                token: "secret".to_string(),
+            }),
+        );
+
+        let description = repositories
+            .fetch_description_with_retry(&source, "digest", "0.6.37")
+            .expect("archive DESCRIPTION should be extracted");
+
+        archive_mock.assert();
+        assert!(description.contains("Package: digest"));
+        assert!(description.contains("Version: 0.6.37"));
     }
 
     #[test]
@@ -1081,6 +1526,7 @@ Version: 1.1.6
         let description = fetch_description_from_tarball(
             &format!("{}/src/contrib/rprojroot_2.1.1.tar.gz", server.url()),
             "rprojroot",
+            "2.1.1",
         )
         .expect("top-level DESCRIPTION should be extracted");
 
