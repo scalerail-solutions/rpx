@@ -61,10 +61,11 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
-      - name: Install dist from fork
-        # This intentionally overrides generated dist installation while testing
-        # native Azure signing from scalerail-solutions/cargo-dist.
-        run: cargo install --git https://github.com/scalerail-solutions/cargo-dist --branch opencode/stellar-falcon --locked cargo-dist
+      - name: Install dist
+        # we specify bash to get pipefail; it guards against the `curl` command
+        # failing. otherwise `sh` won't catch that `curl` returned non-0
+        shell: bash
+        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh"
       - name: Cache dist
         uses: actions/upload-artifact@v7
         with:
@@ -131,10 +132,8 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
-      - name: Install dist from fork
-        # This intentionally overrides generated dist installation while testing
-        # native Azure signing from scalerail-solutions/cargo-dist.
-        run: cargo install --git https://github.com/scalerail-solutions/cargo-dist --branch opencode/stellar-falcon --locked cargo-dist
+      - name: Install dist
+        run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest
       - name: Fetch local artifacts
         uses: actions/download-artifact@v8
@@ -187,21 +186,21 @@ jobs:
     needs:
       - plan
       - build-local-artifacts
-    runs-on: "ubuntu-22.04"
+    runs-on: "windows-2022"
+    environment: release
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
+      AZURE_CODESIGNING_ENDPOINT: ${{ secrets.AZURE_CODESIGNING_ENDPOINT }}
+      AZURE_CODESIGNING_ACCOUNT_NAME: ${{ secrets.AZURE_CODESIGNING_ACCOUNT_NAME }}
+      AZURE_CODESIGNING_CERT_PROFILE_NAME: ${{ secrets.AZURE_CODESIGNING_CERT_PROFILE_NAME }}
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
           submodules: recursive
-      - name: Install cached dist
-        uses: actions/download-artifact@v8
-        with:
-          name: cargo-dist-cache
-          path: ~/.cargo/bin/
-      - run: chmod +x ~/.cargo/bin/dist
+      - name: Install dist
+        run: "irm https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.ps1 | iex"
       # Get all the local artifacts for the global tasks to use (for e.g. checksums)
       - name: Fetch local artifacts
         uses: actions/download-artifact@v8
@@ -209,18 +208,27 @@ jobs:
           pattern: artifacts-*
           path: target/distrib/
           merge-multiple: true
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Install Azure Artifact Signing module
+        shell: pwsh
+        run: Install-Module -Name ArtifactSigning -Force -Repository PSGallery
       - id: cargo-dist
-        shell: bash
+        shell: pwsh
         run: |
-          dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json "--artifacts=global" > dist-manifest.json
-          echo "dist ran successfully"
+          dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json "--artifacts=global" | Out-File -FilePath dist-manifest.json -Encoding utf8
+          Write-Host "dist ran successfully"
 
           # Parse out what we just built and upload it to scratch storage
-          echo "paths<<EOF" >> "$GITHUB_OUTPUT"
-          jq --raw-output ".upload_files[]" dist-manifest.json >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          "paths<<EOF" >> $env:GITHUB_OUTPUT
+          (Get-Content dist-manifest.json -Raw | ConvertFrom-Json).upload_files | ForEach-Object { $_ >> $env:GITHUB_OUTPUT }
+          "EOF" >> $env:GITHUB_OUTPUT
 
-          cp dist-manifest.json "$BUILD_MANIFEST_NAME"
+          Copy-Item dist-manifest.json $env:BUILD_MANIFEST_NAME
       - name: "Upload artifacts"
         uses: actions/upload-artifact@v7
         with:
