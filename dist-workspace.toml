@@ -5,6 +5,8 @@ members = ["cargo:."]
 [dist]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.31.0"
+# Skip checking whether the specified configuration files are up to date
+allow-dirty = ["ci"]
 # Whether to sign Windows executables with Azure Artifact Signing
 azure-windows-sign = true
 # CI backends to support

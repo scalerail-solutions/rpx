@@ -61,11 +61,10 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
-      - name: Install dist
-        # we specify bash to get pipefail; it guards against the `curl` command
-        # failing. otherwise `sh` won't catch that `curl` returned non-0
-        shell: bash
-        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh"
+      - name: Install dist from fork
+        # This intentionally overrides generated dist installation while testing
+        # native Azure signing from scalerail-solutions/cargo-dist.
+        run: cargo install --git https://github.com/scalerail-solutions/cargo-dist --branch opencode/stellar-falcon --locked cargo-dist
       - name: Cache dist
         uses: actions/upload-artifact@v7
         with:
@@ -132,8 +131,10 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
-      - name: Install dist
-        run: ${{ matrix.install_dist.run }}
+      - name: Install dist from fork
+        # This intentionally overrides generated dist installation while testing
+        # native Azure signing from scalerail-solutions/cargo-dist.
+        run: cargo install --git https://github.com/scalerail-solutions/cargo-dist --branch opencode/stellar-falcon --locked cargo-dist
       # Get the dist-manifest
       - name: Fetch local artifacts
         uses: actions/download-artifact@v8
@@ -199,8 +200,10 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
-      - name: Install dist
-        run: "irm https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.ps1 | iex"
+      - name: Install dist from fork
+        # This intentionally overrides generated dist installation while testing
+        # native Azure signing from scalerail-solutions/cargo-dist.
+        run: cargo install --git https://github.com/scalerail-solutions/cargo-dist --branch opencode/stellar-falcon --locked cargo-dist
       # Get all the local artifacts for the global tasks to use (for e.g. checksums)
       - name: Fetch local artifacts
         uses: actions/download-artifact@v8
