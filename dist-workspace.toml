@@ -5,13 +5,12 @@ members = ["cargo:."]
 [dist]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.31.0"
-# The generated release workflow has a custom Azure Artifact Signing block.
-# Re-add that block if regenerating .github/workflows/release.yml with dist.
-allow-dirty = ["ci"]
+# Whether to sign Windows executables with Azure Artifact Signing
+azure-windows-sign = true
 # CI backends to support
 ci = "github"
 # The installers to generate for each app
-installers = ["shell", "powershell"]
+installers = ["shell", "powershell", "msi"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # Path that installers should place binaries in
