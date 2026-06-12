@@ -86,7 +86,21 @@ Install R:
 - macOS: https://cran.r-project.org/bin/macosx/
 - CRAN mirrors: https://cran.r-project.org/mirrors.html
 
-Install `rpx` from Git with Cargo:
+Install the latest release on macOS or Linux:
+
+```bash
+curl -LsSf https://github.com/scalerail-solutions/rpx/releases/latest/download/rpx-installer.sh | sh
+```
+
+Install the latest release on Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/scalerail-solutions/rpx/releases/latest/download/rpx-installer.ps1 | iex"
+```
+
+Windows binary signing is still being worked on. The PowerShell installer is available, but Windows Defender or SmartScreen may warn until the signing flow is finalized.
+
+You can also install `rpx` from Git with Cargo:
 
 ```bash
 cargo install --git https://github.com/scalerail-solutions/rpx.git
@@ -100,8 +114,6 @@ If you do not already have Rust and Cargo installed, install them with `rustup`:
 `rpx` prefers binary R package artifacts on Windows and macOS when available, but some packages may still need to be built from source. On Windows, install Rtools if you hit source-build requirements:
 
 - Rtools: https://cran.r-project.org/bin/windows/Rtools/
-
-The native PowerShell installer flow for Windows is being worked on separately and is not the recommended install path yet. For now, use the Cargo install command above.
 
 You can also run the Docker image directly:
 
@@ -168,18 +180,21 @@ rpx clean
 
 ## Repository Management
 
-The public rrepo registry is enabled by default. It is the preferred primary source because dependency resolution needs registry metadata, including historical package metadata, not just the latest package index.
+The package universe is the set of package versions and metadata available to the resolver.
 
-Projects can add additional repositories. `rpx repo add` detects whether a repository exposes the rrepo API or a CRAN-like `src/contrib/PACKAGES` index:
+By default, `rpx` uses the public rrepo-backed CRAN universe at `https://upstream.rrepo.dev/cran`. This gives the resolver CRAN package metadata through rrepo APIs, including historical package metadata instead of only today's latest package state.
+
+Projects can add additional repositories. `rpx` supports rrepo API repositories, CRAN repositories, and CRAN-like repositories:
 
 ```bash
-rpx repo add https://<org-slug>.rrepo.dev/<repo-slug>
+rpx repo add https://cloud.r-project.org
 rpx repo add https://packagemanager.posit.co/cran/latest
+rpx repo add https://<org-slug>.rrepo.dev/<repo-slug>
 rpx repo list
 rpx repo remove https://packagemanager.posit.co/cran/latest
 ```
 
-A useful setup is to keep the default rrepo registry enabled and add Posit Package Manager's latest CRAN repository as a fallback for binary artifacts:
+The default rrepo-backed CRAN universe remains enabled unless you explicitly disable it. A useful setup is to keep the default universe enabled and add another CRAN or CRAN-like repository as a fallback for binary artifacts:
 
 ```bash
 rpx repo add https://packagemanager.posit.co/cran/latest
@@ -196,6 +211,12 @@ RPX_REGISTRY_BASE_URL=https://example.rrepo.dev/cran rpx lock
 ```
 
 To lock without the default public registry, use `rpx lock --no-default-repo`. The default-repo choice is recorded in `rpx.lock`; use `--default-repo` to enable it again when regenerating the lockfile.
+
+For private package universes, add an rrepo repository for your organization:
+
+```bash
+rpx repo add https://<org-slug>.rrepo.dev/<repo-slug>
+```
 
 ## rrepo
 
