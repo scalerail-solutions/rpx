@@ -1,35 +1,98 @@
 # rpx
 
-`rpx` is a package manager for R projects. It resolves dependencies from package metadata, writes a committed `rpx.lock`, and runs R inside an isolated project library.
+**Modern package management for R.**
 
-Use it when you want everyone on a project, including CI, to install the same R package versions without depending on a global user library.
+`rpx` brings modern package-management semantics to R projects. Packages declare compatible dependency ranges in [`DESCRIPTION`](https://cran.r-project.org/doc/manuals/r-release/R-exts.html#The-DESCRIPTION-file), `rpx` resolves those constraints before installation, and `rpx.lock` records the exact result.
 
-`rpx` uses [`DESCRIPTION`](https://cran.r-project.org/doc/manuals/r-release/R-exts.html#The-DESCRIPTION-file) as the manifest. It resolves packages through the public rrepo registry at `https://upstream.rrepo.dev/cran` by default.
+`rpx` works with `rrepo`, the registry infrastructure that provides the package metadata needed for reliable resolution across public, private, and historical R packages.
 
-## Documentation
+The short version:
 
-The full user guide lives at [rrepo.org](https://rrepo.org/documentation/overview):
+- `rpx` is the developer workflow.
+- `rrepo` is the registry that makes the workflow reliable.
+- `DESCRIPTION` declares compatibility.
+- `rpx.lock` records the exact solution.
 
-- [Install rpx](https://rrepo.org/documentation/install-rpx)
-- [Start a project](https://rrepo.org/documentation/start-a-project)
-- [Use an existing project](https://rrepo.org/documentation/use-an-existing-project)
-- [Run R](https://rrepo.org/documentation/run-r)
-- [Private packages](https://rrepo.org/documentation/private-packages)
+## Why rpx Exists
+
+R has excellent packages, but package management still often depends on installed state, latest package indexes, manual intervention, or after-the-fact compatibility checks.
+
+`rpx` starts earlier:
+
+1. Declare compatibility in `DESCRIPTION`.
+2. Resolve the dependency graph before installing packages.
+3. Lock the exact package versions that were selected.
+4. Sync the local project library from the lockfile.
+5. Run R inside the managed project environment.
+
+This gives R developers a workflow closer to modern ecosystems built around explicit constraints, registries, solvers, and lockfiles.
+
+## Compatibility Contracts
+
+`rpx add` turns dependency declarations into compatibility contracts.
+
+When you add a package, `rpx` resolves the current compatible version and records a semver-aware range in `DESCRIPTION`. For example, adding a package resolved at `1.4.2` records a lower bound at the resolved version and an upper bound before the next major version:
+
+```text
+Imports:
+    examplepkg (>= 1.4.2),
+    examplepkg (< 2.0.0)
+```
+
+That declaration says more than "this project uses `examplepkg`." It says the project is compatible with `examplepkg` in that major-version range, at or above the version that was selected when the dependency was added.
+
+This matters because the compatibility intent becomes useful to:
+
+- The package author
+- Downstream packages
+- Applications depending on the package
+- The dependency resolver
+- The registry
+
+## DESCRIPTION vs rpx.lock
+
+`DESCRIPTION` and `rpx.lock` have different jobs.
+
+`DESCRIPTION` is the compatibility contract. It answers:
+
+> What dependency versions should this package or project be compatible with?
+
+`rpx.lock` is the exact resolved receipt. It answers:
+
+> What exact package versions were selected for this environment?
+
+Commit both files. Do not commit the project library or local cache; `rpx sync` recreates local state from the lockfile.
+
+## Semver Caveat
+
+`rpx` makes a pragmatic semver bet. It cannot force every upstream R package to follow semantic versioning, and it does not guarantee that every upstream major-version boundary is correct.
+
+What it can do is make safer defaults explicit:
+
+- No silent downgrades below the version selected when a dependency was added
+- No accidental major-version jumps without changing the declared constraint
+- Solver-first installation instead of install-first discovery
+- Exact lockfiles for reproducible environments
+
+For `0.x` packages, `rpx` still records a lower bound at the resolved version and an upper bound before `1.0.0`, reflecting the conservative treatment of pre-`1.0` versions.
 
 ## Install
 
-`rpx` requires R to be installed and available on `PATH`.
+`rpx` requires R to be installed and available on `PATH`. Before using `rpx`, confirm that `Rscript` works in your shell.
 
-### Prerequisites
+Install R:
 
-`Rscript` should be available in your shell before using `rpx`.
+- Windows: https://cran.r-project.org/bin/windows/base/
+- macOS: https://cran.r-project.org/bin/macosx/
+- CRAN mirrors: https://cran.r-project.org/mirrors.html
 
-- Install R:
-  - Windows: https://cran.r-project.org/bin/windows/base/
-  - macOS: https://cran.r-project.org/bin/macosx/
-  - CRAN mirrors: https://cran.r-project.org/mirrors.html
+Install `rpx` from Git with Cargo:
 
-Windows currently uses `cargo install --git ...` as the recommended install path, so you also need the Rust toolchain installed:
+```bash
+cargo install --git https://github.com/scalerail-solutions/rpx.git
+```
+
+If you do not already have Rust and Cargo installed, install them with `rustup`:
 
 - Rust: https://rustup.rs/
 - Windows Rust/MSVC prerequisites: https://rust-lang.github.io/rustup/installation/windows-msvc.html
@@ -38,21 +101,7 @@ Windows currently uses `cargo install --git ...` as the recommended install path
 
 - Rtools: https://cran.r-project.org/bin/windows/Rtools/
 
-Install the latest release on macOS or Linux:
-
-```bash
-curl -LsSf https://github.com/scalerail-solutions/rpx/releases/latest/download/rpx-installer.sh | sh
-```
-
-Install on Windows via Cargo for now:
-
-```powershell
-cargo install --git https://github.com/scalerail-solutions/rpx.git
-```
-
-Windows is supported, but the native signed Windows installer flow is still in progress. The current PowerShell installer can trigger Windows Defender or SmartScreen warnings while that work is being finalized, so installing from Git is the most reliable Windows path for now. We will update the Windows install guidance as the signing and installer flow improve.
-
-Rust users on other platforms can also install from source with `cargo install --git https://github.com/scalerail-solutions/rpx.git`.
+The native PowerShell installer flow for Windows is being worked on separately and is not the recommended install path yet. For now, use the Cargo install command above.
 
 You can also run the Docker image directly:
 
@@ -89,8 +138,6 @@ rpx sync
 rpx run R
 ```
 
-Commit both `DESCRIPTION` and `rpx.lock`. Do not commit the project library or local cache; `rpx sync` recreates local state from the lockfile.
-
 ## Daily Workflow
 
 Add or remove direct dependencies with `rpx` so the manifest, lockfile, and project library stay together:
@@ -121,7 +168,7 @@ rpx clean
 
 ## Repository Management
 
-The public rrepo registry is enabled by default. It is the preferred primary source because it exposes package metadata through a low-latency API, which keeps dependency resolution fast.
+The public rrepo registry is enabled by default. It is the preferred primary source because dependency resolution needs registry metadata, including historical package metadata, not just the latest package index.
 
 Projects can add additional repositories. `rpx repo add` detects whether a repository exposes the rrepo API or a CRAN-like `src/contrib/PACKAGES` index:
 
@@ -150,9 +197,25 @@ RPX_REGISTRY_BASE_URL=https://example.rrepo.dev/cran rpx lock
 
 To lock without the default public registry, use `rpx lock --no-default-repo`. The default-repo choice is recorded in `rpx.lock`; use `--default-repo` to enable it again when regenerating the lockfile.
 
+## rrepo
+
+`rrepo` exists because modern dependency resolution needs registry metadata.
+
+A resolver cannot reliably solve public, private, and historical packages if it can only see today's latest package index. The public rrepo registry supports the open R ecosystem and demonstrates the registry-backed model. Commercial rrepo extends the same workflow to private packages, internal package ecosystems, organizations, access control, publishing, and higher usage limits.
+
+## Documentation
+
+The full user guide lives at [rrepo.org](https://rrepo.org/documentation/overview):
+
+- [Install rpx](https://rrepo.org/documentation/install-rpx)
+- [Start a project](https://rrepo.org/documentation/start-a-project)
+- [Use an existing project](https://rrepo.org/documentation/use-an-existing-project)
+- [Run R](https://rrepo.org/documentation/run-r)
+- [Private packages](https://rrepo.org/documentation/private-packages)
+
 ## How It Works
 
-- `DESCRIPTION` is the dependency manifest.
+- `DESCRIPTION` is the dependency manifest and compatibility contract.
 - `rpx.lock` records the resolved package set, package sources, and R runtime metadata.
 - `rpx lock` resolves dependencies from enabled repositories and writes `rpx.lock`; it does not install packages.
 - `rpx` prefers existing locked versions when they are still available from enabled repositories.
