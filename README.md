@@ -49,20 +49,6 @@ This matters because the compatibility intent becomes useful to:
 - The dependency resolver
 - The registry
 
-## DESCRIPTION vs rpx.lock
-
-`DESCRIPTION` and `rpx.lock` have different jobs.
-
-`DESCRIPTION` is the compatibility contract. It answers:
-
-> What dependency versions should this package or project be compatible with?
-
-`rpx.lock` is the exact resolved receipt. It answers:
-
-> What exact package versions were selected for this environment?
-
-Commit both files. Do not commit the project library or local cache; `rpx sync` recreates local state from the lockfile.
-
 ## Semver Caveat
 
 `rpx` makes a pragmatic semver bet. It cannot force every upstream R package to follow semantic versioning, and it does not guarantee that every upstream major-version boundary is correct.
@@ -150,6 +136,8 @@ rpx sync
 rpx run R
 ```
 
+Commit both `DESCRIPTION` and `rpx.lock`. Do not commit the project library or local cache; `rpx sync` recreates local state from the lockfile.
+
 ## Daily Workflow
 
 Add or remove direct dependencies with `rpx` so the manifest, lockfile, and project library stay together:
@@ -220,9 +208,19 @@ rpx repo add https://<org-slug>.rrepo.dev/<repo-slug>
 
 ## rrepo
 
-`rrepo` exists because modern dependency resolution needs registry metadata.
+`rrepo` exists because modern dependency resolution needs a registry, not just a download server.
 
-A resolver cannot reliably solve public, private, and historical packages if it can only see today's latest package index. The public rrepo registry supports the open R ecosystem and demonstrates the registry-backed model. Commercial rrepo extends the same workflow to private packages, internal package ecosystems, organizations, access control, publishing, and higher usage limits.
+Traditional CRAN-style repositories are excellent at distributing package files, but they were not designed as a complete registry API for solver-first package management. A modern resolver needs to ask questions like:
+
+- What versions of this package exist?
+- What did each version depend on when it was published?
+- Which artifact should this platform install?
+- Can public and private packages be resolved together?
+- Can an older environment still be reconstructed after the latest package state has moved on?
+
+If the package manager can only see the current repository state, it has too little information to reliably solve historical, private, and mixed public/private dependency graphs.
+
+`rrepo` provides the registry layer for that workflow. The public rrepo-backed CRAN universe supports open R packages through registry APIs. Commercial rrepo extends the same model to private packages, internal package ecosystems, organizations, access control, publishing, and higher usage limits.
 
 ## Documentation
 
