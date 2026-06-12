@@ -15,17 +15,16 @@ The short version:
 
 ## Why rpx Exists
 
-`rpx` is for R projects that want dependency constraints resolved before packages are installed, with the exact result recorded in a lockfile.
+R projects should not depend on whatever happens to be installed in a user's global library. `rpx` gives each project its own locked package set and runs R with that project library active.
 
-The workflow is:
+Use `rpx` when you want:
 
-1. Declare compatibility in `DESCRIPTION`.
-2. Resolve the dependency graph before installing packages.
-3. Lock the exact package versions that were selected.
-4. Sync the local project library from the lockfile.
-5. Run R inside the managed project environment.
+1. A committed `rpx.lock` for the exact package versions used by the project.
+2. A local project library that can be recreated from that lockfile.
+3. Dependency declarations in `DESCRIPTION` that give the resolver useful version bounds.
+4. CI and developer machines using the same package set without sharing a global library.
 
-The important difference is that `DESCRIPTION` is not only a list of package names. It is the input to the resolver.
+The important difference from a snapshot-only workflow is that `DESCRIPTION` is not only a list of package names. It is the input to the resolver.
 
 ## Dependency Bounds
 
