@@ -28,7 +28,7 @@ The important difference from a snapshot-only workflow is that `DESCRIPTION` is 
 
 ## Dependency Bounds
 
-Most R packages either leave dependency versions unbounded or only set a lower bound. Compatibility is often handled outside the dependency declaration, especially through [CRAN reverse dependency checks](https://cran.r-project.org/web/packages/policies.html#Submission).
+Most R packages either leave dependency versions unbounded or only set a lower bound. Compatibility is often handled outside the dependency declaration, especially through [CRAN reverse dependency checks](https://r-pkgs.org/release.html#sec-release-revdep-checks).
 
 `rpx` moves more of that compatibility information into `DESCRIPTION`, where the resolver can use it directly. When you add a package, `rpx` records the version it selected as the lower bound and the next major version as the upper bound.
 
