@@ -9,15 +9,15 @@
 The short version:
 
 - `rpx` is the developer workflow.
-- `rrepo` is the registry that makes the workflow reliable.
+- `rrepo` provides registry APIs for CRAN mirrors and private repositories.
 - `DESCRIPTION` declares compatibility.
 - `rpx.lock` records the exact solution.
 
 ## Why rpx Exists
 
-R has excellent packages, but package management still often depends on installed state, latest package indexes, manual intervention, or after-the-fact compatibility checks.
+`rpx` is for R projects that want dependency constraints resolved before packages are installed, with the exact result recorded in a lockfile.
 
-`rpx` starts earlier:
+The workflow is:
 
 1. Declare compatibility in `DESCRIPTION`.
 2. Resolve the dependency graph before installing packages.
@@ -25,13 +25,15 @@ R has excellent packages, but package management still often depends on installe
 4. Sync the local project library from the lockfile.
 5. Run R inside the managed project environment.
 
-This gives R developers a workflow closer to modern ecosystems built around explicit constraints, registries, solvers, and lockfiles.
+The important difference is that `DESCRIPTION` is not only a list of package names. It is the input to the resolver.
 
-## Compatibility Contracts
+## Dependency Bounds
 
-`rpx add` turns dependency declarations into compatibility contracts.
+Most R packages either leave dependency versions unbounded or only set a lower bound. Compatibility is often handled outside the dependency declaration, especially through CRAN reverse dependency checks.
 
-When you add a package, `rpx` resolves the current compatible version and records a semver-aware range in `DESCRIPTION`. For example, adding a package resolved at `1.4.2` records a lower bound at the resolved version and an upper bound before the next major version:
+`rpx` moves more of that compatibility information into `DESCRIPTION`, where the resolver can use it directly. When you add a package, `rpx` records the version it selected as the lower bound and the next major version as the upper bound.
+
+For example, adding a package resolved at `1.4.2` writes:
 
 ```text
 Imports:
@@ -39,28 +41,11 @@ Imports:
     examplepkg (< 2.0.0)
 ```
 
-That declaration says more than "this project uses `examplepkg`." It says the project is compatible with `examplepkg` in that major-version range, at or above the version that was selected when the dependency was added.
+The lower bound prevents the solver from choosing a version older than the one you added. The upper bound prevents an automatic jump to the next major version unless you change the constraint.
 
-This matters because the compatibility intent becomes useful to:
+This uses semver because the major version is the common place to signal breaking changes. R packages do not universally follow semver, so this is not a guarantee that every `1.x` release is compatible or every `2.x` release is incompatible. It is a default constraint that is safer than leaving the dependency open-ended.
 
-- The package author
-- Downstream packages
-- Applications depending on the package
-- The dependency resolver
-- The registry
-
-## Semver Caveat
-
-`rpx` makes a pragmatic semver bet. It cannot force every upstream R package to follow semantic versioning, and it does not guarantee that every upstream major-version boundary is correct.
-
-What it can do is make safer defaults explicit:
-
-- No silent downgrades below the version selected when a dependency was added
-- No accidental major-version jumps without changing the declared constraint
-- Solver-first installation instead of install-first discovery
-- Exact lockfiles for reproducible environments
-
-For `0.x` packages, `rpx` still records a lower bound at the resolved version and an upper bound before `1.0.0`, reflecting the conservative treatment of pre-`1.0` versions.
+For `0.x` packages, `rpx` records the selected version as the lower bound and `< 1.0.0` as the upper bound.
 
 ## Install
 
@@ -208,19 +193,13 @@ rpx repo add https://<org-slug>.rrepo.dev/<repo-slug>
 
 ## rrepo
 
-`rrepo` exists because modern dependency resolution needs a registry, not just a download server.
+`rpx` can use CRAN and CRAN-like repositories, but its default package universe is the rrepo-backed CRAN mirror at `https://upstream.rrepo.dev/cran`.
 
-Traditional CRAN-style repositories are excellent at distributing package files, but they were not designed as a complete registry API for solver-first package management. A modern resolver needs to ask questions like:
+A plain CRAN-style mirror is mostly a package distribution endpoint. It is enough for installing available packages, but it is not a registry API built around dependency solving, package history, artifact selection, authentication, and private packages.
 
-- What versions of this package exist?
-- What did each version depend on when it was published?
-- Which artifact should this platform install?
-- Can public and private packages be resolved together?
-- Can an older environment still be reconstructed after the latest package state has moved on?
+`rrepo.org` mirrors CRAN and exposes that package universe through rrepo APIs. That gives `rpx` a default source for CRAN package versions, dependency metadata, historical package metadata, and platform artifacts.
 
-If the package manager can only see the current repository state, it has too little information to reliably solve historical, private, and mixed public/private dependency graphs.
-
-`rrepo` provides the registry layer for that workflow. The public rrepo-backed CRAN universe supports open R packages through registry APIs. Commercial rrepo extends the same model to private packages, internal package ecosystems, organizations, access control, publishing, and higher usage limits.
+For teams, rrepo provides the same registry model for private R packages: publishing, access control, and private package metadata that can be resolved together with CRAN packages.
 
 ## Documentation
 
