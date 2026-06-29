@@ -82,7 +82,7 @@ fn runs_rpx_lock_from_current_library() {
 
     let lockfile = read_project_file(&container, project_path, "rpx.lock");
     assert!(
-        lockfile.contains("\"revision\": 0"),
+        lockfile.contains("\"revision\": 1"),
         "lockfile was: {lockfile}"
     );
     assert!(
@@ -169,7 +169,7 @@ fn runs_rpx_sync_restores_locked_versions() {
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
 
     let seed_lockfile = format!(
-        "mkdir -p {project_path} && cd {project_path} && cat > rpx.lock <<'EOF'\n{{\n  \"version\": 3,\n  \"registry\": \"https://api.rrepo.org\",\n  \"roots\": [\n    {{\n      \"package\": \"digest\",\n      \"constraint\": \"*\"\n    }}\n  ],\n  \"packages\": {{\n    \"digest\": {{\n      \"package\": \"digest\",\n      \"version\": \"0.6.37\",\n      \"source\": \"registry\",\n      \"source_url\": \"https://api.rrepo.org/packages/digest/versions/0.6.37/source\"\n    }}\n  }}\n}}\nEOF"
+        "mkdir -p {project_path} && cd {project_path} && cat > rpx.lock <<'EOF'\n{{\n  \"version\": 3,\n  \"revision\": 1,\n  \"registry\": \"https://upstream.rrepo.dev/cran\",\n  \"roots\": [\n    {{\n      \"package\": \"digest\",\n      \"constraint\": \"*\"\n    }}\n  ],\n  \"packages\": {{\n    \"digest\": {{\n      \"package\": \"digest\",\n      \"version\": \"0.6.37\",\n      \"source\": \"registry\",\n      \"source_url\": \"https://upstream.rrepo.dev/cran/packages/digest/versions/0.6.37/source\"\n    }}\n  }}\n}}\nEOF"
     );
     let (exit_code, stdout, stderr) = run_shell_command(&container, &seed_lockfile);
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");

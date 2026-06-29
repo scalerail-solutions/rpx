@@ -1,7 +1,12 @@
 use deb822_fast::Paragraph;
 use miette::Diagnostic;
 use r_description::{Version, VersionConstraint};
-use std::{collections::BTreeSet, fs, path::PathBuf, str::FromStr};
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 use thiserror::Error;
 
 use crate::project::{ProjectPathError, description_path, new_project_description_path};
@@ -46,12 +51,6 @@ pub trait DescriptionExt {
 #[derive(Debug, Clone)]
 pub struct RDescription {
     paragraph: Paragraph,
-}
-
-#[derive(Debug)]
-pub struct ProjectDescription {
-    pub description: RDescription,
-    pub additional_repositories: Vec<String>,
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -144,16 +143,21 @@ impl RDescription {
             .unwrap_or_default()
     }
 
+    pub fn set_additional_repositories(&mut self, repositories: &[String]) {
+        if repositories.is_empty() {
+            self.paragraph.remove("Additional_repositories");
+            return;
+        }
+
+        self.set_field("Additional_repositories", &repositories.join(",\n"));
+    }
+
     pub fn system_requirements(&self) -> Option<String> {
         self.paragraph
             .get("SystemRequirements")
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToString::to_string)
-    }
-
-    pub fn remove_field(&mut self, field_name: &str) {
-        self.paragraph.remove(field_name);
     }
 
     fn set_field(&mut self, field_name: &str, value: &str) {
@@ -180,34 +184,20 @@ impl RDescription {
     }
 }
 
-pub fn read_description() -> Result<ProjectDescription, DescriptionError> {
+pub fn read_description() -> Result<RDescription, DescriptionError> {
     let path = description_path()?;
     let contents = fs::read_to_string(&path).map_err(|source| DescriptionError::ReadFailed {
         path: path.clone(),
         source,
     })?;
-    let mut description =
-        RDescription::from_str(&contents).map_err(|details| DescriptionError::ParseFailed {
-            path: path.clone(),
-            details,
-        })?;
-    let additional_repositories = description.additional_repositories();
-    description.remove_field("Additional_repositories");
-
-    Ok(ProjectDescription {
-        description,
-        additional_repositories,
+    RDescription::from_str(&contents).map_err(|details| DescriptionError::ParseFailed {
+        path: path.clone(),
+        details,
     })
 }
 
-pub fn write_description(project: &ProjectDescription) -> Result<(), DescriptionError> {
-    let mut contents = format_description_for_write(&project.description);
-    if !project.additional_repositories.is_empty() {
-        contents.push('\n');
-        contents.push_str(&format_additional_repositories(
-            &project.additional_repositories,
-        ));
-    }
+pub fn write_description(description: &RDescription) -> Result<(), DescriptionError> {
+    let mut contents = format_description_for_write(description);
     contents.push('\n');
     let path = description_path()?;
     fs::write(&path, contents).map_err(|source| DescriptionError::WriteFailed { path, source })
@@ -219,14 +209,10 @@ pub fn init_description() -> Result<String, DescriptionError> {
         return Err(DescriptionError::AlreadyExists { path });
     }
 
-    let package_name = package_name_from_current_directory()
-        .map_err(|details| DescriptionError::PackageNameFailed { details })?;
-    let description = ProjectDescription {
-        description: initial_description(&package_name),
-        additional_repositories: vec![],
-    };
+    let package_name = package_name_from_description_path(&path)?;
+    let description = initial_description(&package_name);
 
-    let mut contents = format_description_for_write(&description.description);
+    let mut contents = format_description_for_write(&description);
     contents.push('\n');
     fs::write(&path, contents).map_err(|source| DescriptionError::WriteFailed {
         path: path.clone(),
@@ -364,6 +350,24 @@ fn format_description_field(field: &str, value: &str) -> String {
         return lines.join("\n");
     }
 
+    if field == "Additional_repositories" {
+        let entries = split_repository_entries(value);
+        if entries.is_empty() {
+            return format!("{field}:");
+        }
+
+        if entries.len() == 1 {
+            return format!("{field}: {}", entries[0]);
+        }
+
+        let mut lines = vec![format!("{field}:")];
+        for (index, entry) in entries.iter().enumerate() {
+            let suffix = if index + 1 < entries.len() { "," } else { "" };
+            lines.push(format!("    {entry}{suffix}"));
+        }
+        return lines.join("\n");
+    }
+
     let value_lines = value.lines().collect::<Vec<_>>();
     if value_lines.len() <= 1 {
         return format!("{field}: {value}");
@@ -372,21 +376,6 @@ fn format_description_field(field: &str, value: &str) -> String {
     let mut lines = vec![format!("{field}:")];
     lines.extend(value_lines.into_iter().map(|line| format!(" {line}")));
     lines.join("\n")
-}
-
-fn format_additional_repositories(repositories: &[String]) -> String {
-    if repositories.is_empty() {
-        return String::new();
-    }
-
-    if repositories.len() == 1 {
-        return format!("Additional_repositories: {}", repositories[0]);
-    }
-
-    format!(
-        "Additional_repositories:\n    {}",
-        repositories.join(",\n    ")
-    )
 }
 
 fn compare_dependencies(
@@ -531,17 +520,19 @@ fn initial_description(package_name: &str) -> RDescription {
     RDescription { paragraph }
 }
 
-fn package_name_from_current_directory() -> Result<String, String> {
-    let current_dir = std::env::current_dir().map_err(|error| error.to_string())?;
-    let directory_name = current_dir
-        .file_name()
+fn package_name_from_description_path(path: &Path) -> Result<String, DescriptionError> {
+    let directory_name = path
+        .parent()
+        .and_then(Path::file_name)
         .and_then(|name| name.to_str())
-        .ok_or_else(|| "failed to derive package name from current directory".to_string())?;
+        .ok_or_else(|| DescriptionError::PackageNameFailed {
+            details: "failed to derive package name from DESCRIPTION path".to_string(),
+        })?;
 
     sanitize_package_name(directory_name)
 }
 
-fn sanitize_package_name(directory_name: &str) -> Result<String, String> {
+fn sanitize_package_name(directory_name: &str) -> Result<String, DescriptionError> {
     let mut package_name = String::new();
 
     for character in directory_name.chars() {
@@ -558,11 +549,15 @@ fn sanitize_package_name(directory_name: &str) -> Result<String, String> {
 
     let package_name = package_name.trim_matches('.').to_string();
     let Some(first) = package_name.chars().next() else {
-        return Err("current directory does not produce a valid package name".to_string());
+        return Err(DescriptionError::PackageNameFailed {
+            details: "current directory does not produce a valid package name".to_string(),
+        });
     };
 
     if !first.is_ascii_alphabetic() {
-        return Err("package name must start with a letter".to_string());
+        return Err(DescriptionError::PackageNameFailed {
+            details: "package name must start with a letter".to_string(),
+        });
     }
 
     Ok(package_name)
@@ -587,9 +582,9 @@ fn title_from_package_name(package_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DescriptionExt, RDescription, format_additional_repositories, format_description_for_write,
-        parse_constraint, relation_with_constraint, sanitize_package_name,
-        split_repository_entries, title_from_package_name,
+        DescriptionExt, RDescription, format_description_for_write, parse_constraint,
+        relation_with_constraint, sanitize_package_name, split_repository_entries,
+        title_from_package_name,
     };
     use crate::registry::ResolutionRoot;
     use r_description::VersionConstraint;
@@ -606,8 +601,8 @@ mod tests {
     #[test]
     fn rejects_package_name_without_leading_letter() {
         assert_eq!(
-            sanitize_package_name("123pkg").unwrap_err(),
-            "package name must start with a letter"
+            sanitize_package_name("123pkg").unwrap_err().to_string(),
+            "failed to derive package name for DESCRIPTION: package name must start with a letter"
         );
     }
 
@@ -765,13 +760,16 @@ mod tests {
 
     #[test]
     fn formats_additional_repositories_as_multiline_field() {
-        assert_eq!(
-            format_additional_repositories(&[
-                "https://one.example/repo".to_string(),
-                "https://two.example/repo".to_string(),
-            ]),
+        let mut description =
+            RDescription::from_str("Package: testpkg\n").expect("description should parse");
+        description.set_additional_repositories(&[
+            "https://one.example/repo".to_string(),
+            "https://two.example/repo".to_string(),
+        ]);
+
+        assert!(format_description_for_write(&description).contains(
             "Additional_repositories:\n    https://one.example/repo,\n    https://two.example/repo"
-        );
+        ));
     }
 
     #[test]
