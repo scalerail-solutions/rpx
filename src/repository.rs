@@ -195,7 +195,7 @@ impl RepositorySet {
     ) -> Result<RepositoryPackagesResponse, String> {
         match source.kind() {
             RepositoryKind::Rrepo => {
-                self.with_authorized_client(source, |client| client.fetch_repository_packages())
+                self.with_authorized_client(source, RegistryClient::fetch_repository_packages)
             }
             RepositoryKind::CranLike => self.fetch_cran_like_repository_packages(source),
         }
@@ -221,7 +221,7 @@ impl RepositorySet {
                         response,
                     });
                 }
-                Err(error) if is_not_found_error(&error) => continue,
+                Err(error) if is_not_found_error(&error) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -250,7 +250,7 @@ impl RepositorySet {
                     source: source.clone(),
                     response,
                 }),
-                Err(error) if is_not_found_error(&error) => continue,
+                Err(error) if is_not_found_error(&error) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -274,7 +274,7 @@ impl RepositorySet {
             RepositoryKind::Rrepo => self.with_authorized_client(source, |client| {
                 client.fetch_description_with_retry(package, version)
             }),
-            RepositoryKind::CranLike => self.fetch_cran_like_description(source, package, version),
+            RepositoryKind::CranLike => Self::fetch_cran_like_description(source, package, version),
         }
     }
 
@@ -402,7 +402,7 @@ impl RepositorySet {
 
         match archive {
             Ok(CranLikePackageArchive::Available(versions)) => {
-                merge_versions(&mut by_version, versions)
+                merge_versions(&mut by_version, versions);
             }
             Ok(CranLikePackageArchive::Missing) | Err(CranLikeArchiveError::Unavailable) => {}
             Err(CranLikeArchiveError::Failed(error)) => return Err(error),
@@ -441,16 +441,18 @@ impl RepositorySet {
             (Ok(CranLikeArchiveListingSupport::Unavailable), _) => {
                 self.record_cran_archive_support(source, CranArchiveSupport::Unavailable);
             }
-            (Err(CranLikeArchiveError::Failed(error)), _) => return Err(error.clone()),
-            (
+            (Err(CranLikeArchiveError::Failed(error)), _)
+            | (
                 Ok(CranLikeArchiveListingSupport::Available),
                 Err(CranLikeArchiveError::Failed(error)),
             ) => return Err(error.clone()),
             (Ok(CranLikeArchiveListingSupport::Available), _) => {
                 self.record_cran_archive_support(source, CranArchiveSupport::Available);
             }
-            (Ok(CranLikeArchiveListingSupport::Unknown), _)
-            | (Err(CranLikeArchiveError::Unavailable), _) => {}
+            (
+                Ok(CranLikeArchiveListingSupport::Unknown) | Err(CranLikeArchiveError::Unavailable),
+                _,
+            ) => {}
         }
 
         if let Ok(CranLikePackageArchive::Available(versions)) = package_archive {
@@ -500,7 +502,6 @@ impl RepositorySet {
     }
 
     fn fetch_cran_like_description(
-        &self,
         source: &RepositorySource,
         package: &str,
         version: &str,
@@ -556,7 +557,7 @@ impl CredentialStore for KeyringCredentialStore {
 
         match entry.get_password() {
             Ok(password) => Ok(Some(password)),
-            Err(keyring::Error::NoEntry) | Err(_) => Ok(None),
+            Err(_) => Ok(None),
         }
     }
 
@@ -722,9 +723,8 @@ fn fetch_cran_like_archive_listing_available(
     source: &RepositorySource,
 ) -> Result<CranLikeArchiveListingSupport, CranLikeArchiveError> {
     let url = format!("{}/src/contrib/Archive/", source.base_url());
-    let response = match reqwest::blocking::get(&url) {
-        Ok(response) => response,
-        Err(_) => return Ok(CranLikeArchiveListingSupport::Unknown),
+    let Ok(response) = reqwest::blocking::get(&url) else {
+        return Ok(CranLikeArchiveListingSupport::Unknown);
     };
     let status = response.status();
 
@@ -1403,12 +1403,12 @@ mod tests {
             .with_status(200)
             .with_header("content-type", "text/plain")
             .with_body(
-                r#"Package: digest
+                r"Package: digest
 Version: 0.6.38
 
 Package: rlang
 Version: 1.1.6
-"#,
+",
             )
             .expect(1)
             .create();

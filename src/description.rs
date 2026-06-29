@@ -457,11 +457,10 @@ fn parse_constraint(constraint: &str) -> Result<(VersionConstraint, &str), Strin
 }
 
 fn resolution_root_from_relation(relation: &DescriptionDependency) -> ResolutionRoot {
-    let constraint = relation
-        .version
-        .as_ref()
-        .map(|(operator, version)| format!("{} {version}", relation_operator(operator)))
-        .unwrap_or_else(|| "*".to_string());
+    let constraint = relation.version.as_ref().map_or_else(
+        || "*".to_string(),
+        |(operator, version)| format!("{} {version}", relation_operator(operator)),
+    );
 
     ResolutionRoot {
         name: relation.name.clone(),

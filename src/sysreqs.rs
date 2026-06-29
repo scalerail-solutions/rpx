@@ -419,7 +419,11 @@ fn download_snapshot(commit: &str) -> Result<SysreqDbSnapshot, String> {
 
         let top = components[1].as_os_str().to_string_lossy();
         let name = components[2].as_os_str().to_string_lossy().to_string();
-        if top == "rules" && name.ends_with(".json") {
+        if top == "rules"
+            && std::path::Path::new(&name)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+        {
             let mut contents = String::new();
             entry
                 .read_to_string(&mut contents)
@@ -633,8 +637,7 @@ fn apt_simulation_missing_packages(packages: &[String], output: &str) -> Vec<Str
         .filter(|package| {
             let candidate = selected_aliases
                 .get(package.as_str())
-                .map(String::as_str)
-                .unwrap_or(package.as_str());
+                .map_or(package.as_str(), String::as_str);
             packages_to_install.contains(candidate)
         })
         .cloned()

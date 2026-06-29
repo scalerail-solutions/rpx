@@ -49,6 +49,7 @@ fn default_true() -> bool {
     true
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_true(value: &bool) -> bool {
     *value
 }
@@ -115,8 +116,8 @@ pub fn read_lockfile_optional() -> Result<Option<Lockfile>, String> {
     Ok(Some(lockfile))
 }
 
-pub fn write_lockfile(lockfile: Lockfile) -> Result<(), String> {
-    let contents = serde_json::to_string_pretty(&lockfile).map_err(|error| error.to_string())?;
+pub fn write_lockfile(lockfile: &Lockfile) -> Result<(), String> {
+    let contents = serde_json::to_string_pretty(lockfile).map_err(|error| error.to_string())?;
     fs::write(lockfile_path_result()?, format!("{contents}\n")).map_err(|error| error.to_string())
 }
 

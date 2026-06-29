@@ -3,6 +3,7 @@ use miette::Diagnostic;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     env, fs,
+    hash::{Hash, Hasher},
     io::IsTerminal,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
@@ -388,10 +389,15 @@ fn read_project_lockfile_optional() -> Result<Option<Lockfile>, ProjectError> {
     read_lockfile_optional().map_err(|details| ProjectError::LockfileRead { details })
 }
 
-fn write_project_lockfile(lockfile: Lockfile) -> Result<(), ProjectError> {
+fn write_project_lockfile(lockfile: &Lockfile) -> Result<(), ProjectError> {
     write_lockfile(lockfile).map_err(|details| ProjectError::LockfileWrite { details })
 }
 
+/// Runs the CLI application.
+///
+/// # Errors
+///
+/// Returns an error when command execution or diagnostic rendering fails.
 pub fn run() -> miette::Result<()> {
     run_inner()?;
     Ok(())
@@ -491,7 +497,7 @@ fn cmd_add(packages: &[String], default_repo: bool, no_default_repo: bool) -> Rp
 
     write_project_description(&project)?;
     if let Some(lockfile) = lockfile {
-        write_project_lockfile(lockfile)?;
+        write_project_lockfile(&lockfile)?;
     } else {
         let _ = lock_from_description(default_repo, no_default_repo)?;
     }
@@ -546,7 +552,7 @@ fn classify_repository_source(url: &str) -> Result<RepositorySource, String> {
     let rrepo = RepositorySource::new(url);
     let rrepo_set = RepositorySet::new(vec![rrepo.clone()]);
     match rrepo_set.fetch_repository_packages(&rrepo) {
-        Ok(_) => return Ok(rrepo),
+        Ok(_) => Ok(rrepo),
         Err(rrepo_error) => {
             let cran_like = RepositorySource::cran_like(url);
             let cran_like_set = RepositorySet::new(vec![cran_like.clone()]);
@@ -820,10 +826,9 @@ fn cmd_status() -> RpxResult<()> {
         && extra_in_library.is_empty()
         && version_mismatches.is_empty()
         && runtime_status.missing_base_packages.is_empty()
-        && system_plan
-            .as_ref()
-            .map(|plan| plan.missing_packages.is_empty() && plan.unsupported_rules.is_empty())
-            .unwrap_or(true)
+        && system_plan.as_ref().is_none_or(|plan| {
+            plan.missing_packages.is_empty() && plan.unsupported_rules.is_empty()
+        })
     {
         print_runtime_version_warning(&runtime_status);
         status("Project is in sync");
@@ -835,10 +840,9 @@ fn cmd_status() -> RpxResult<()> {
         || !extra_in_library.is_empty()
         || !version_mismatches.is_empty();
     let runtime_out_of_date = !runtime_status.missing_base_packages.is_empty();
-    let system_out_of_date = system_plan
-        .as_ref()
-        .map(|plan| !plan.missing_packages.is_empty() || !plan.unsupported_rules.is_empty())
-        .unwrap_or(false);
+    let system_out_of_date = system_plan.as_ref().is_some_and(|plan| {
+        !plan.missing_packages.is_empty() || !plan.unsupported_rules.is_empty()
+    });
 
     if lockfile_out_of_date && library_out_of_date {
         status("Project is out of sync");
@@ -1024,7 +1028,7 @@ fn resolve_additions_from_latest(
         .cloned()
         .map(|package| (package, "*".to_string()))
         .collect::<BTreeMap<_, _>>();
-    let preferred_versions = preferred_locked_versions(description, lockfile, &new_packages)?;
+    let preferred_versions = preferred_locked_versions(lockfile, &new_packages);
     let roots = add_resolution_roots(description, &new_packages);
     let resolved =
         resolve_from_registry(repositories, &roots, &preferred_versions).map_err(|error| {
@@ -1066,20 +1070,19 @@ fn add_resolution_roots(
 }
 
 fn preferred_locked_versions(
-    _description: &description::RDescription,
     lockfile: Option<&Lockfile>,
     excluded_packages: &BTreeMap<String, String>,
-) -> Result<BTreeMap<String, String>, String> {
+) -> BTreeMap<String, String> {
     let Some(lockfile) = lockfile else {
-        return Ok(BTreeMap::new());
+        return BTreeMap::new();
     };
 
-    Ok(lockfile
+    lockfile
         .packages
         .iter()
         .filter(|(name, _)| !excluded_packages.contains_key(name.as_str()))
         .map(|(name, package)| (name.clone(), package.version.clone()))
-        .collect())
+        .collect()
 }
 
 fn semver_add_constraint(version: &str) -> Result<String, String> {
@@ -1171,16 +1174,12 @@ fn lock_from_description(default_repo: bool, no_default_repo: bool) -> RpxResult
             None,
         );
         let changed = existing_lockfile.as_ref() != Some(&lockfile);
-        write_project_lockfile(lockfile)?;
+        write_project_lockfile(&lockfile)?;
         return Ok(LockOutcome { changed });
     }
 
-    let preferred_versions = preferred_locked_versions(
-        &project.description,
-        existing_lockfile.as_ref(),
-        &BTreeMap::new(),
-    )
-    .map_err(|details| LockError::ResolveFailed { details })?;
+    let preferred_versions =
+        preferred_locked_versions(existing_lockfile.as_ref(), &BTreeMap::new());
     let resolved =
         resolve_from_registry(&repositories, &roots, &preferred_versions).map_err(|details| {
             LockError::ResolveFailed {
@@ -1199,7 +1198,7 @@ fn lock_from_description(default_repo: bool, no_default_repo: bool) -> RpxResult
         None,
     );
     let changed = existing_lockfile.as_ref() != Some(&lockfile);
-    write_project_lockfile(lockfile)?;
+    write_project_lockfile(&lockfile)?;
     Ok(LockOutcome { changed })
 }
 
@@ -1481,9 +1480,7 @@ fn resolve_use_default_repository(
     if no_default_repo {
         return false;
     }
-    lockfile
-        .map(|lockfile| lockfile.use_default_repository)
-        .unwrap_or(true)
+    lockfile.is_none_or(|lockfile| lockfile.use_default_repository)
 }
 
 fn lockfile_from_resolution(
@@ -1504,9 +1501,7 @@ fn lockfile_from_resolution(
         use_default_repository,
         repositories: locked_repositories(repositories),
         r: LockedR {
-            version: r_version
-                .map(ToString::to_string)
-                .unwrap_or_else(|| runtime_info().version),
+            version: r_version.map_or_else(|| runtime_info().version, ToString::to_string),
             base_packages: required_base_packages,
         },
         sysreqs,
@@ -2170,7 +2165,6 @@ fn compiled_cache_key(package: &str, version: &str, runtime: &RuntimeInfo) -> St
         runtime.version, runtime.platform, runtime.pkg_type
     );
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    use std::hash::{Hash, Hasher};
     input.hash(&mut hasher);
     format!("{}-{}-{:016x}", package, version, hasher.finish())
 }
@@ -2289,7 +2283,7 @@ fn download_artifacts_in_parallel(
             DownloadEvent::ContentLength { name, length } => ui.set_download_length(&name, length),
             DownloadEvent::Advanced { name, bytes } => ui.advance_download(&name, bytes),
             DownloadEvent::FallbackToSource { name, version } => {
-                ui.fallback_to_source(&name, &version)
+                ui.fallback_to_source(&name, &version);
             }
             DownloadEvent::Finished { package, result } => {
                 finished += 1;
@@ -2491,7 +2485,7 @@ fn spawn_install_worker(
             &temp_library,
             &[dependency_library],
         )
-        .map(|_| CompletedBuild {
+        .map(|()| CompletedBuild {
             package: package_for_success,
             temp_library,
         });
@@ -2654,10 +2648,10 @@ fn install_failure_diagnostic(name: &str, version: &str, failure: &InstallFailur
     SyncError::InstallFailed {
         package: name.to_string(),
         version: version.to_string(),
-        exit_status: failure
-            .exit_code
-            .map(|code| code.to_string())
-            .unwrap_or_else(|| "terminated by signal".to_string()),
+        exit_status: failure.exit_code.map_or_else(
+            || "terminated by signal".to_string(),
+            |code| code.to_string(),
+        ),
         summary: failure.summary.clone(),
         log_path: failure.log_path.display().to_string(),
         recent_output,
@@ -3091,9 +3085,6 @@ mod tests {
 
     #[test]
     fn prefers_all_existing_locked_versions_except_new_additions() {
-        let description =
-            RDescription::from_str("Package: test\nVersion: 0.1.0\nImports: direct\n")
-                .expect("description should parse");
         let lockfile = Lockfile {
             version: LOCKFILE_VERSION,
             revision: LOCKFILE_REVISION,
@@ -3138,8 +3129,7 @@ mod tests {
         };
         let excluded = BTreeMap::from([("newpkg".to_string(), "*".to_string())]);
 
-        let preferred = preferred_locked_versions(&description, Some(&lockfile), &excluded)
-            .expect("preferred versions should build");
+        let preferred = preferred_locked_versions(Some(&lockfile), &excluded);
 
         assert_eq!(
             preferred,

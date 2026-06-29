@@ -321,14 +321,13 @@ impl DependencyProvider for RegistryDependencyProvider<'_> {
         let matches = self
             .package_versions(package)
             .ok()
-            .map(|versions| {
+            .map_or(usize::MAX, |versions| {
                 versions
                     .iter()
                     .filter_map(|version| parse_version(&version.version).ok())
                     .filter(|version| range.contains(version))
                     .count()
-            })
-            .unwrap_or(usize::MAX);
+            });
 
         (package_conflicts_counts.conflict_count(), Reverse(matches))
     }
@@ -646,16 +645,12 @@ mod tests {
             range: &Self::VS,
             package_conflicts_counts: &PackageResolutionStatistics,
         ) -> Self::Priority {
-            let matches = self
-                .packages
-                .get(package)
-                .map(|versions| {
-                    versions
-                        .iter()
-                        .filter(|version| range.contains(&version.version))
-                        .count()
-                })
-                .unwrap_or(usize::MAX);
+            let matches = self.packages.get(package).map_or(usize::MAX, |versions| {
+                versions
+                    .iter()
+                    .filter(|version| range.contains(&version.version))
+                    .count()
+            });
             (package_conflicts_counts.conflict_count(), Reverse(matches))
         }
 

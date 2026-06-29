@@ -34,7 +34,7 @@ impl InstallKind {
 #[derive(Debug)]
 pub(crate) struct SyncUi {
     interactive: bool,
-    _multi: Option<MultiProgress>,
+    multi: Option<MultiProgress>,
     downloads: RefCell<Option<ProgressBar>>,
     binary_installs: RefCell<Option<ProgressBar>>,
     source_builds: RefCell<Option<ProgressBar>>,
@@ -57,7 +57,7 @@ impl SyncUi {
 
             Self {
                 interactive,
-                _multi: Some(multi),
+                multi: Some(multi),
                 downloads: RefCell::new(None),
                 binary_installs: RefCell::new(None),
                 source_builds: RefCell::new(None),
@@ -73,7 +73,7 @@ impl SyncUi {
         } else {
             Self {
                 interactive,
-                _multi: None,
+                multi: None,
                 downloads: RefCell::new(None),
                 binary_installs: RefCell::new(None),
                 source_builds: RefCell::new(None),
@@ -159,7 +159,7 @@ impl SyncUi {
 
         if self.interactive {
             let bar = self
-                ._multi
+                .multi
                 .as_ref()
                 .map_or_else(ProgressBar::hidden, |multi| {
                     let bar = multi.add(ProgressBar::new(0));
@@ -284,7 +284,7 @@ impl SyncUi {
         for (name, version, kind) in packages {
             if self.interactive {
                 let bar = self
-                    ._multi
+                    .multi
                     .as_ref()
                     .map_or_else(ProgressBar::hidden, |multi| {
                         let bar = multi.add(ProgressBar::new_spinner());
@@ -390,7 +390,7 @@ impl SyncUi {
     }
 
     fn create_aggregate_bar(&self, template: &str) -> ProgressBar {
-        self._multi
+        self.multi
             .as_ref()
             .map_or_else(ProgressBar::hidden, |multi| {
                 let bar = multi.add(ProgressBar::new(0));

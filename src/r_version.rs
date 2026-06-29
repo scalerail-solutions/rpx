@@ -23,9 +23,9 @@ pub(crate) fn compare_r_versions(left: &str, right: &str) -> Ordering {
 
 pub(crate) fn compare_version_components(left: &[u32], right: &[u32]) -> Ordering {
     for (left, right) in left.iter().zip(right) {
-        match left.cmp(right) {
-            Ordering::Equal => continue,
-            ordering => return ordering,
+        let ordering = left.cmp(right);
+        if ordering != Ordering::Equal {
+            return ordering;
         }
     }
 
