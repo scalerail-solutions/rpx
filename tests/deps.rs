@@ -65,7 +65,11 @@ fn runs_rpx_add_inside_custom_r_image() {
     let lockfile = read_project_file(&container, project_path, "rpx.lock");
     assert!(lockfile.contains("\"digest\""), "lockfile was: {lockfile}");
     assert!(
-        lockfile.contains("\"registry\""),
+        lockfile.contains("\"repositories\""),
+        "lockfile was: {lockfile}"
+    );
+    assert!(
+        lockfile.contains("\"url\": \"https://upstream.rrepo.dev/cran\""),
         "lockfile was: {lockfile}"
     );
     assert!(lockfile.contains("\"roots\""), "lockfile was: {lockfile}");
@@ -219,7 +223,7 @@ Imports: digest",
 
     let lockfile = read_project_file(&container, project_path, "rpx.lock");
     assert!(
-        lockfile.contains("\"registry\": \"https://upstream.rrepo.dev/cran\""),
+        lockfile.contains("\"url\": \"https://upstream.rrepo.dev/cran\""),
         "lockfile was: {lockfile}"
     );
     assert!(

@@ -1,15 +1,11 @@
-use crate::{
-    project::{LOCKFILE_NAME, lockfile_path_result},
-    registry::DEFAULT_REGISTRY_BASE_URL,
-    repository::normalize_repository_url,
-};
-use serde::{Deserialize, Deserializer, Serialize};
+use crate::project::{LOCKFILE_NAME, lockfile_path_result};
+use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs};
 
-pub const LOCKFILE_VERSION: u32 = 3;
-pub const LOCKFILE_REVISION: u32 = 2;
+pub const LOCKFILE_VERSION: u32 = 4;
+pub const LOCKFILE_REVISION: u32 = 0;
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Lockfile {
     pub version: u32,
     #[serde(default)]
@@ -22,51 +18,6 @@ pub struct Lockfile {
     pub sysreqs: LockedSystemRequirements,
     pub roots: Vec<LockedRoot>,
     pub packages: BTreeMap<String, LockedPackage>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawLockfile {
-    version: u32,
-    #[serde(default)]
-    revision: u32,
-    registry: Option<String>,
-    use_default_repository: Option<bool>,
-    #[serde(default)]
-    repositories: Vec<LockedRepository>,
-    #[serde(default)]
-    r: LockedR,
-    #[serde(default)]
-    sysreqs: LockedSystemRequirements,
-    roots: Vec<LockedRoot>,
-    packages: BTreeMap<String, LockedPackage>,
-}
-
-impl From<RawLockfile> for Lockfile {
-    fn from(raw: RawLockfile) -> Self {
-        let mut repositories = raw.repositories;
-        if raw.revision < LOCKFILE_REVISION && raw.use_default_repository.unwrap_or(true) {
-            prepend_legacy_default_repository(&mut repositories, raw.registry.as_deref());
-        }
-
-        Self {
-            version: raw.version,
-            revision: raw.revision,
-            repositories,
-            r: raw.r,
-            sysreqs: raw.sysreqs,
-            roots: raw.roots,
-            packages: raw.packages,
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for Lockfile {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        RawLockfile::deserialize(deserializer).map(Self::from)
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
@@ -89,22 +40,6 @@ pub enum LockedRepositoryKind {
 pub enum LockedCranArchiveSupport {
     Available,
     Unavailable,
-}
-
-fn prepend_legacy_default_repository(
-    repositories: &mut Vec<LockedRepository>,
-    registry: Option<&str>,
-) {
-    let url = normalize_repository_url(registry.unwrap_or(DEFAULT_REGISTRY_BASE_URL));
-    repositories.retain(|repository| repository.url != url);
-    repositories.insert(
-        0,
-        LockedRepository {
-            url,
-            kind: LockedRepositoryKind::Rrepo,
-            cran_archive_support: None,
-        },
-    );
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -165,9 +100,7 @@ pub fn read_lockfile_optional() -> Result<Option<Lockfile>, String> {
     }
 
     let contents = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-    let lockfile = serde_json::from_str::<RawLockfile>(&contents)
-        .map(Lockfile::from)
-        .map_err(|error| error.to_string())?;
+    let lockfile = serde_json::from_str(&contents).map_err(|error| error.to_string())?;
     Ok(Some(lockfile))
 }
 
@@ -230,8 +163,8 @@ mod tests {
 
         let json = serde_json::to_string_pretty(&lockfile).expect("lockfile should serialize");
 
-        assert!(json.contains("\"version\": 3"));
-        assert!(json.contains("\"revision\": 2"));
+        assert!(json.contains("\"version\": 4"));
+        assert!(json.contains("\"revision\": 0"));
         assert!(json.contains("\"repositories\""));
         assert!(json.contains("\"r\""));
         assert!(json.contains("\"sysreqs\""));
@@ -267,105 +200,10 @@ mod tests {
     }
 
     #[test]
-    fn prepends_legacy_default_repository_when_enabled() {
+    fn reads_repository_list_as_source_of_truth() {
         let json = r#"{
-  "version": 3,
-  "registry": "https://api.rrepo.org/",
-  "repositories": [
-    {
-      "url": "https://cran.example",
-      "kind": "cran-like"
-    }
-  ],
-  "roots": [],
-  "packages": {}
-}"#;
-
-        let lockfile: Lockfile = serde_json::from_str(json).expect("lockfile should parse");
-
-        assert_eq!(lockfile.repositories.len(), 2);
-        assert_eq!(lockfile.repositories[0].url, "https://api.rrepo.org");
-        assert_eq!(lockfile.repositories[0].kind, LockedRepositoryKind::Rrepo);
-        assert_eq!(lockfile.repositories[1].url, "https://cran.example");
-    }
-
-    #[test]
-    fn omits_legacy_default_repository_when_disabled() {
-        let json = r#"{
-  "version": 3,
-  "registry": "https://api.rrepo.org",
-  "use_default_repository": false,
-  "repositories": [
-    {
-      "url": "https://cran.example",
-      "kind": "cran-like"
-    }
-  ],
-  "roots": [],
-  "packages": {}
-}"#;
-
-        let lockfile: Lockfile = serde_json::from_str(json).expect("lockfile should parse");
-
-        assert_eq!(lockfile.repositories.len(), 1);
-        assert_eq!(lockfile.repositories[0].url, "https://cran.example");
-    }
-
-    #[test]
-    fn dedupes_legacy_default_repository_when_prepending() {
-        let json = r#"{
-  "version": 3,
-  "registry": "https://api.rrepo.org/",
-  "use_default_repository": true,
-  "repositories": [
-    {
-      "url": "https://api.rrepo.org",
-      "kind": "rrepo"
-    },
-    {
-      "url": "https://cran.example",
-      "kind": "cran-like"
-    }
-  ],
-  "roots": [],
-  "packages": {}
-}"#;
-
-        let lockfile: Lockfile = serde_json::from_str(json).expect("lockfile should parse");
-
-        assert_eq!(lockfile.repositories.len(), 2);
-        assert_eq!(lockfile.repositories[0].url, "https://api.rrepo.org");
-        assert_eq!(lockfile.repositories[1].url, "https://cran.example");
-    }
-
-    #[test]
-    fn does_not_prepend_default_repository_for_new_format() {
-        let json = r#"{
-  "version": 3,
-  "revision": 2,
-  "repositories": [
-    {
-      "url": "https://cran.example",
-      "kind": "cran-like"
-    }
-  ],
-  "roots": [],
-  "packages": {}
-}"#;
-
-        let lockfile: Lockfile = serde_json::from_str(json).expect("lockfile should parse");
-
-        assert_eq!(lockfile.repositories.len(), 1);
-        assert_eq!(lockfile.repositories[0].url, "https://cran.example");
-    }
-
-    #[test]
-    fn current_revision_uses_repository_list_as_source_of_truth() {
-        let json = r#"{
-  "version": 3,
-  "revision": 2,
-  "registry": "https://api.rrepo.org",
-  "use_default_repository": true,
+  "version": 4,
+  "revision": 0,
   "repositories": [
     {
       "url": "https://cran.example",
@@ -401,7 +239,7 @@ mod tests {
     #[test]
     fn reads_lockfile_without_runtime_requirements() {
         let json = r#"{
-  "version": 1,
+  "version": 4,
   "roots": [],
   "packages": {}
 }"#;
@@ -415,7 +253,7 @@ mod tests {
     #[test]
     fn reads_lockfile_without_revision_as_revision_zero() {
         let json = r#"{
-  "version": 3,
+  "version": 4,
   "roots": [],
   "packages": {}
 }"#;
