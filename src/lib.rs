@@ -378,17 +378,26 @@ fn run_inner() -> RpxResult<()> {
             default_repo,
             no_default_repo,
             packages,
-        } => cmd_add(&packages, default_repo, no_default_repo),
+        } => cmd_add(
+            &packages,
+            DefaultRepositoryPreference::from_flags(default_repo, no_default_repo),
+        ),
         Commands::Remove {
             default_repo,
             no_default_repo,
             packages,
-        } => cmd_remove(&packages, default_repo, no_default_repo),
+        } => cmd_remove(
+            &packages,
+            DefaultRepositoryPreference::from_flags(default_repo, no_default_repo),
+        ),
         Commands::Run { command } => cmd_run(&command),
         Commands::Lock {
             default_repo,
             no_default_repo,
-        } => cmd_lock(default_repo, no_default_repo),
+        } => cmd_lock(DefaultRepositoryPreference::from_flags(
+            default_repo,
+            no_default_repo,
+        )),
         Commands::Status => cmd_status(),
         Commands::Sync {
             install_system,
@@ -406,14 +415,13 @@ fn cmd_init() -> RpxResult<()> {
     Ok(())
 }
 
-fn cmd_add(packages: &[String], default_repo: bool, no_default_repo: bool) -> RpxResult<()> {
+fn cmd_add(
+    packages: &[String],
+    repository_preference: DefaultRepositoryPreference,
+) -> RpxResult<()> {
     let mut description = read_description()?;
     let mut lockfile = read_project_lockfile_optional()?;
-    let use_default_repository =
-        resolve_use_default_repository(lockfile.as_ref(), default_repo, no_default_repo);
-    let repositories =
-        configured_repositories(&description, use_default_repository, lockfile.as_ref())
-            .map_err(|details| LockError::ResolveFailed { details })?;
+    let repositories = repository_preference.repositories(&description, lockfile.as_ref())?;
     let mut new_packages = Vec::new();
 
     for package in packages {
@@ -478,8 +486,6 @@ fn cmd_add(packages: &[String], default_repo: bool, no_default_repo: bool) -> Rp
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect(),
-            &default_registry_base_url(),
-            use_default_repository,
             &resolved_addition.resolved,
             &sysreq_db,
             repositories.sources(),
@@ -491,7 +497,7 @@ fn cmd_add(packages: &[String], default_repo: bool, no_default_repo: bool) -> Rp
     if let Some(lockfile) = lockfile {
         write_project_lockfile(&lockfile)?;
     } else {
-        let _ = lock_from_description(default_repo, no_default_repo)?;
+        let _ = lock_from_description(repository_preference)?;
     }
     let _ = sync_from_lockfile(false, false)?;
     status(format_args!("Added {}", packages.join(", ")));
@@ -659,7 +665,10 @@ fn cmd_repo_list() -> RpxResult<()> {
     Ok(())
 }
 
-fn cmd_remove(packages: &[String], default_repo: bool, no_default_repo: bool) -> RpxResult<()> {
+fn cmd_remove(
+    packages: &[String],
+    repository_preference: DefaultRepositoryPreference,
+) -> RpxResult<()> {
     let mut description = read_description()?;
     for package in packages {
         description
@@ -687,7 +696,7 @@ fn cmd_remove(packages: &[String], default_repo: bool, no_default_repo: bool) ->
         remove_installed_packages(&removed);
     }
 
-    let _ = lock_from_description(default_repo, no_default_repo)?;
+    let _ = lock_from_description(repository_preference)?;
     let _ = sync_from_lockfile(false, false)?;
 
     if !removed.is_empty() {
@@ -720,8 +729,8 @@ fn cmd_run(command: &[String]) -> RpxResult<()> {
     Ok(())
 }
 
-fn cmd_lock(default_repo: bool, no_default_repo: bool) -> RpxResult<()> {
-    let outcome = lock_from_description(default_repo, no_default_repo)?;
+fn cmd_lock(repository_preference: DefaultRepositoryPreference) -> RpxResult<()> {
+    let outcome = lock_from_description(repository_preference)?;
     if outcome.changed {
         status("Updated rpx.lock");
     } else {
@@ -948,6 +957,67 @@ struct LockOutcome {
     changed: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DefaultRepositoryPreference {
+    FromLockfileOrDefault,
+    Enabled,
+    Disabled,
+}
+
+impl DefaultRepositoryPreference {
+    fn from_flags(default_repo: bool, no_default_repo: bool) -> Self {
+        if default_repo {
+            Self::Enabled
+        } else if no_default_repo {
+            Self::Disabled
+        } else {
+            Self::FromLockfileOrDefault
+        }
+    }
+
+    fn repositories(
+        self,
+        description: &description::RDescription,
+        lockfile: Option<&Lockfile>,
+    ) -> Result<RepositorySet, LockError> {
+        let default_url = default_registry_base_url();
+        let use_default_repository = match self {
+            Self::Enabled => true,
+            Self::Disabled => false,
+            Self::FromLockfileOrDefault => lockfile.is_none_or(|lockfile| {
+                let default_url = normalize_repository_url(&default_url);
+                lockfile
+                    .repositories
+                    .iter()
+                    .any(|repository| repository.url == default_url)
+            }),
+        };
+
+        let mut sources = Vec::new();
+        if use_default_repository {
+            sources.push(RepositorySource::new(default_url));
+        }
+        for url in &description.additional_repositories {
+            if let Some(source) =
+                lockfile.and_then(|lockfile| repository_source_from_lockfile(lockfile, url))
+            {
+                sources.push(source);
+                continue;
+            }
+
+            sources.push(classify_repository_source(url).map_err(|details| {
+                LockError::ResolveFailed {
+                    details: format!(
+                        "failed to classify configured repository {}: {details}",
+                        normalize_repository_url(url)
+                    ),
+                }
+            })?);
+        }
+        Ok(RepositorySet::new(sources))
+    }
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct SyncOutcome {
     installed: usize,
@@ -1159,7 +1229,9 @@ fn constraints_from_resolved_roots(
         .collect()
 }
 
-fn lock_from_description(default_repo: bool, no_default_repo: bool) -> RpxResult<LockOutcome> {
+fn lock_from_description(
+    repository_preference: DefaultRepositoryPreference,
+) -> RpxResult<LockOutcome> {
     let description = read_description()?;
     let roots = description
         .imports
@@ -1174,16 +1246,9 @@ fn lock_from_description(default_repo: bool, no_default_repo: bool) -> RpxResult
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let registry = default_registry_base_url();
     let existing_lockfile = read_project_lockfile_optional()?;
-    let use_default_repository =
-        resolve_use_default_repository(existing_lockfile.as_ref(), default_repo, no_default_repo);
-    let repositories = configured_repositories(
-        &description,
-        use_default_repository,
-        existing_lockfile.as_ref(),
-    )
-    .map_err(|details| LockError::ResolveFailed { details })?;
+    let repositories =
+        repository_preference.repositories(&description, existing_lockfile.as_ref())?;
     if let Some(lockfile) = &existing_lockfile
         && lockfile.version > LOCKFILE_VERSION
     {
@@ -1192,15 +1257,8 @@ fn lock_from_description(default_repo: bool, no_default_repo: bool) -> RpxResult
     let sysreq_db = load_sysreq_snapshot_for_lock(existing_lockfile.as_ref());
 
     if roots.is_empty() {
-        let lockfile = lockfile_from_resolution(
-            vec![],
-            &registry,
-            use_default_repository,
-            &[],
-            &sysreq_db,
-            repositories.sources(),
-            None,
-        );
+        let lockfile =
+            lockfile_from_resolution(vec![], &[], &sysreq_db, repositories.sources(), None);
         let changed = existing_lockfile.as_ref() != Some(&lockfile);
         write_project_lockfile(&lockfile)?;
         return Ok(LockOutcome { changed });
@@ -1216,15 +1274,8 @@ fn lock_from_description(default_repo: bool, no_default_repo: bool) -> RpxResult
         })?;
     warn_cran_archive_unavailable(&repositories);
 
-    let lockfile = lockfile_from_resolution(
-        roots,
-        &registry,
-        use_default_repository,
-        &resolved,
-        &sysreq_db,
-        repositories.sources(),
-        None,
-    );
+    let lockfile =
+        lockfile_from_resolution(roots, &resolved, &sysreq_db, repositories.sources(), None);
     let changed = existing_lockfile.as_ref() != Some(&lockfile);
     write_project_lockfile(&lockfile)?;
     Ok(LockOutcome { changed })
@@ -1302,8 +1353,7 @@ fn sync_from_lockfile(install_system: bool, install_only_system: bool) -> RpxRes
 
     let installed = installed_packages_by_name();
     let runtime = runtime_info();
-    let repositories = repositories_for_sync(&description, &lockfile)
-        .map_err(|details| SyncError::DownloadArtifactsFailed { details })?;
+    let repositories = repositories_for_sync(&lockfile);
     let mut outcome = SyncOutcome::default();
     let ui = SyncUi::new();
     let mut satisfied = installed
@@ -1447,54 +1497,12 @@ fn default_registry_base_url() -> String {
         .to_string()
 }
 
-fn configured_repositories(
-    description: &description::RDescription,
-    use_default_repository: bool,
-    lockfile: Option<&Lockfile>,
-) -> Result<RepositorySet, String> {
-    Ok(RepositorySet::new(repository_sources_from_project(
-        description,
-        use_default_repository,
-        lockfile,
-    )?))
-}
-
-fn repository_sources_from_project(
-    description: &description::RDescription,
-    use_default_repository: bool,
-    lockfile: Option<&Lockfile>,
-) -> Result<Vec<RepositorySource>, String> {
-    let mut sources = Vec::new();
-    if use_default_repository {
-        sources.push(RepositorySource::new(default_registry_base_url()));
-    }
-    for url in &description.additional_repositories {
-        if let Some(source) =
-            lockfile.and_then(|lockfile| repository_source_from_lockfile(lockfile, url))
-        {
-            sources.push(source);
-            continue;
-        }
-
-        sources.push(classify_repository_source(url).map_err(|details| {
-            format!(
-                "failed to classify configured repository {}: {details}",
-                normalize_repository_url(url)
-            )
-        })?);
-    }
-    Ok(sources)
-}
-
-fn repositories_for_sync(
-    description: &description::RDescription,
-    lockfile: &Lockfile,
-) -> Result<RepositorySet, String> {
-    let mut sources = repository_sources_from_project(
-        description,
-        lockfile.use_default_repository,
-        Some(lockfile),
-    )?;
+fn repositories_for_sync(lockfile: &Lockfile) -> RepositorySet {
+    let mut sources = lockfile
+        .repositories
+        .iter()
+        .map(repository_source_from_locked)
+        .collect::<Vec<_>>();
     sources.extend(lockfile.packages.values().filter_map(|package| {
         let source_url = package.source_url.as_deref()?;
         repository_source_from_package_url(source_url)
@@ -1503,27 +1511,11 @@ fn repositories_for_sync(
                 cran_like_source_from_package_url(source_url).map(RepositorySource::cran_like)
             })
     }));
-    Ok(RepositorySet::new(sources))
-}
-
-fn resolve_use_default_repository(
-    lockfile: Option<&Lockfile>,
-    default_repo: bool,
-    no_default_repo: bool,
-) -> bool {
-    if default_repo {
-        return true;
-    }
-    if no_default_repo {
-        return false;
-    }
-    lockfile.is_none_or(|lockfile| lockfile.use_default_repository)
+    RepositorySet::new(sources)
 }
 
 fn lockfile_from_resolution(
     roots: Vec<ResolutionRoot>,
-    registry: &str,
-    use_default_repository: bool,
     resolved: &[ResolvedPackage],
     sysreq_db: &sysreqs::SysreqDbSnapshot,
     repositories: &[RepositorySource],
@@ -1534,8 +1526,6 @@ fn lockfile_from_resolution(
     Lockfile {
         version: LOCKFILE_VERSION,
         revision: LOCKFILE_REVISION,
-        registry: registry.to_string(),
-        use_default_repository,
         repositories: locked_repositories(repositories),
         r: LockedR {
             version: r_version.map_or_else(|| runtime_info().version, ToString::to_string),
@@ -1956,13 +1946,6 @@ fn validate_runtime_for_sync(lockfile: &Lockfile) -> RpxResult<()> {
     .into())
 }
 
-fn registry_source_url(registry: &str, package: &str, version: &str) -> String {
-    format!(
-        "{}/packages/{package}/versions/{version}/source",
-        registry.trim_end_matches('/')
-    )
-}
-
 fn preferred_artifact(
     repositories: &RepositorySet,
     source: &RepositorySource,
@@ -2003,6 +1986,19 @@ fn preferred_artifact(
         InstallKind::Binary,
         runtime.pkg_type.clone(),
     )
+}
+
+fn package_source_url(source: &RepositorySource, package: &str, version: &str) -> String {
+    match source.kind() {
+        RepositoryKind::Rrepo => format!(
+            "{}/packages/{package}/versions/{version}/source",
+            source.base_url().trim_end_matches('/')
+        ),
+        RepositoryKind::CranLike => format!(
+            "{}/src/contrib/{package}_{version}.tar.gz",
+            source.base_url().trim_end_matches('/')
+        ),
+    }
 }
 
 fn binary_artifact_candidates(
@@ -2147,12 +2143,15 @@ fn collect_pending_installs(
         .filter_map(|(name, package)| match installed.get(name) {
             Some(installed_package) if installed_package.version == package.version => None,
             _ => {
-                let source_url = package.source_url.clone().unwrap_or_else(|| {
-                    registry_source_url(&lockfile.registry, name, &package.version)
-                });
+                let source_url = package.source_url.clone().or_else(|| {
+                    repositories
+                        .sources()
+                        .first()
+                        .map(|source| package_source_url(source, name, &package.version))
+                })?;
                 let source = repositories
                     .source_for_url(&source_url)
-                    .unwrap_or_else(|| RepositorySource::new(lockfile.registry.clone()));
+                    .or_else(|| repositories.sources().first().cloned())?;
                 let (
                     artifact,
                     binary_fallback_artifacts,
@@ -2708,19 +2707,18 @@ fn read_log_tail(path: &Path, max_lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        LockfileCompatibilityError, add_resolution_roots, binary_artifact_request,
-        classify_repository_source, compiled_cache_key, constraints_from_resolved_roots,
-        cran_like_binary_artifact_request, default_registry_base_url, locked_install_order,
-        lockfile_from_resolution, persisted_constraints, preferred_artifact,
-        preferred_locked_versions, r_minor_version, repository_sources_from_project,
-        resolve_use_default_repository, semver_add_constraint, should_fallback_to_source,
-        validate_lockfile_compatibility,
+        DefaultRepositoryPreference, LockfileCompatibilityError, add_resolution_roots,
+        binary_artifact_request, classify_repository_source, compiled_cache_key,
+        constraints_from_resolved_roots, cran_like_binary_artifact_request,
+        default_registry_base_url, locked_install_order, lockfile_from_resolution,
+        persisted_constraints, preferred_artifact, preferred_locked_versions, r_minor_version,
+        semver_add_constraint, should_fallback_to_source, validate_lockfile_compatibility,
     };
     use crate::description::{RDescription, resolution_root_from_relation};
     use crate::{
         lockfile::{
             LOCKFILE_REVISION, LOCKFILE_VERSION, LockedDependency, LockedPackage, LockedR,
-            LockedSystemRequirements, Lockfile,
+            LockedRepository, LockedRepositoryKind, LockedSystemRequirements, Lockfile,
         },
         r::RuntimeInfo,
         registry::ResolutionRoot,
@@ -2785,8 +2783,6 @@ mod tests {
                     constraint: "= 3.6.5".to_string(),
                 },
             ],
-            "https://api.rrepo.org",
-            true,
             &[
                 ResolvedPackage {
                     name: "cli".to_string(),
@@ -2825,12 +2821,12 @@ mod tests {
                 },
             ],
             &empty_sysreq_db(),
-            &[],
+            &[RepositorySource::new("https://api.rrepo.org")],
             Some("4.5.2"),
         );
 
-        assert_eq!(lockfile.registry, "https://api.rrepo.org");
         assert_eq!(lockfile.version, LOCKFILE_VERSION);
+        assert_eq!(lockfile.repositories[0].url, "https://api.rrepo.org");
         assert_eq!(lockfile.r.base_packages, vec!["base", "utils"]);
         assert_eq!(lockfile.roots[0].package, "digest");
         assert_eq!(lockfile.roots[1].package, "cli");
@@ -2888,30 +2884,69 @@ mod tests {
 
     #[test]
     fn resolves_default_repository_preference_from_flags_then_lockfile() {
+        let description = RDescription::from_str("Package: test\nVersion: 0.1.0\n")
+            .expect("description should parse");
         let lockfile = Lockfile {
             version: LOCKFILE_VERSION,
             revision: LOCKFILE_REVISION,
-            registry: "https://api.rrepo.org".to_string(),
-            use_default_repository: false,
             repositories: vec![],
             r: LockedR::default(),
             sysreqs: LockedSystemRequirements::default(),
             roots: vec![],
             packages: BTreeMap::new(),
         };
+        let lockfile_with_default = Lockfile {
+            version: LOCKFILE_VERSION,
+            revision: LOCKFILE_REVISION,
+            repositories: vec![LockedRepository {
+                url: default_registry_base_url(),
+                kind: LockedRepositoryKind::Rrepo,
+                cran_archive_support: None,
+            }],
+            r: LockedR::default(),
+            sysreqs: LockedSystemRequirements::default(),
+            roots: vec![],
+            packages: BTreeMap::new(),
+        };
 
-        assert!(resolve_use_default_repository(None, false, false));
-        assert!(!resolve_use_default_repository(
-            Some(&lockfile),
-            false,
-            false
-        ));
-        assert!(resolve_use_default_repository(Some(&lockfile), true, false));
-        assert!(!resolve_use_default_repository(
-            Some(&lockfile),
-            false,
-            true
-        ));
+        assert_eq!(
+            DefaultRepositoryPreference::from_flags(false, false)
+                .repositories(&description, None)
+                .expect("repositories should build")
+                .sources()
+                .len(),
+            1
+        );
+        assert!(
+            DefaultRepositoryPreference::from_flags(false, false)
+                .repositories(&description, Some(&lockfile))
+                .expect("repositories should build")
+                .sources()
+                .is_empty()
+        );
+        assert_eq!(
+            DefaultRepositoryPreference::from_flags(true, false)
+                .repositories(&description, Some(&lockfile))
+                .expect("repositories should build")
+                .sources()
+                .len(),
+            1
+        );
+        assert_eq!(
+            DefaultRepositoryPreference::from_flags(false, false)
+                .repositories(&description, Some(&lockfile_with_default))
+                .expect("repositories should build")
+                .sources()
+                .len(),
+            1
+        );
+        assert!(
+            DefaultRepositoryPreference::from_flags(false, true)
+                .repositories(&description, Some(&lockfile))
+                .expect("repositories should build")
+                .sources()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2919,8 +2954,10 @@ mod tests {
         let description = RDescription::from_str("Package: test\nVersion: 0.1.0\n")
             .expect("description should parse");
 
-        let sources = repository_sources_from_project(&description, false, None)
-            .expect("sources should build");
+        let repositories = DefaultRepositoryPreference::Disabled
+            .repositories(&description, None)
+            .expect("repositories should build");
+        let sources = repositories.sources();
 
         assert!(sources.is_empty());
     }
@@ -3010,8 +3047,10 @@ mod tests {
             .expect("description should parse");
         description.additional_repositories = vec![server.url()];
 
-        let sources = repository_sources_from_project(&description, false, None)
-            .expect("sources should build");
+        let repositories = DefaultRepositoryPreference::Disabled
+            .repositories(&description, None)
+            .expect("repositories should build");
+        let sources = repositories.sources();
 
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].kind(), RepositoryKind::CranLike);
@@ -3085,8 +3124,6 @@ mod tests {
                 name: "grid".to_string(),
                 constraint: "*".to_string(),
             }],
-            "https://api.rrepo.org",
-            true,
             &[],
             &empty_sysreq_db(),
             &[],
@@ -3129,8 +3166,6 @@ mod tests {
         let lockfile = Lockfile {
             version: LOCKFILE_VERSION,
             revision: LOCKFILE_REVISION,
-            registry: "https://api.rrepo.org".to_string(),
-            use_default_repository: true,
             repositories: vec![],
             r: LockedR::default(),
             sysreqs: LockedSystemRequirements::default(),
@@ -3186,8 +3221,6 @@ mod tests {
         let mut lockfile = Lockfile {
             version: LOCKFILE_VERSION,
             revision: LOCKFILE_REVISION + 1,
-            registry: "https://api.rrepo.org".to_string(),
-            use_default_repository: true,
             repositories: vec![],
             r: LockedR::default(),
             sysreqs: LockedSystemRequirements::default(),
@@ -3210,8 +3243,6 @@ mod tests {
         let lockfile = Lockfile {
             version: LOCKFILE_VERSION,
             revision: LOCKFILE_REVISION,
-            registry: "https://api.rrepo.org".to_string(),
-            use_default_repository: true,
             repositories: vec![],
             r: LockedR::default(),
             sysreqs: LockedSystemRequirements::default(),
@@ -3284,8 +3315,6 @@ mod tests {
         let lockfile = Lockfile {
             version: LOCKFILE_VERSION,
             revision: LOCKFILE_REVISION,
-            registry: "https://api.rrepo.org".to_string(),
-            use_default_repository: true,
             repositories: vec![],
             r: LockedR::default(),
             sysreqs: LockedSystemRequirements::default(),
