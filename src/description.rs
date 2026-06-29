@@ -1,6 +1,8 @@
 use deb822_fast::Paragraph;
+use miette::Diagnostic;
 use r_description::{Version, VersionConstraint};
-use std::{collections::BTreeSet, fs, str::FromStr};
+use std::{collections::BTreeSet, fs, path::PathBuf, str::FromStr};
+use thiserror::Error;
 
 use crate::project::{current_description_path, description_path_result};
 use crate::registry::ResolutionRoot;
@@ -52,6 +54,28 @@ pub struct ProjectDescription {
     pub additional_repositories: Vec<String>,
 }
 
+#[derive(Debug, Error, Diagnostic)]
+pub enum DescriptionError {
+    #[error("DESCRIPTION not found: {details}")]
+    #[diagnostic(
+        code(rpx::description::not_found),
+        help("Run `rpx init` to create a DESCRIPTION file in this project.")
+    )]
+    NotFound { details: String },
+
+    #[error("failed to read DESCRIPTION at {}: {source}", path.display())]
+    #[diagnostic(code(rpx::description::read_failed))]
+    ReadFailed {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to parse DESCRIPTION at {}: {details}", path.display())]
+    #[diagnostic(code(rpx::description::parse_failed))]
+    ParseFailed { path: PathBuf, details: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DescriptionDependency {
     pub name: String,
@@ -88,10 +112,6 @@ impl std::fmt::Display for RDescription {
 }
 
 impl RDescription {
-    pub fn package_name(&self) -> Option<&str> {
-        self.paragraph.get("Package")
-    }
-
     pub fn dependency_field(&self, field_name: &str) -> Result<Vec<DescriptionDependency>, String> {
         match self.paragraph.get(field_name) {
             Some(contents) => parse_dependency_field(contents),
@@ -142,21 +162,20 @@ impl RDescription {
     }
 }
 
-pub fn read_description() -> Result<ProjectDescription, String> {
-    let path = description_path_result()?;
-    let contents = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-    let mut description = RDescription::from_str(&contents)?;
+pub fn read_description() -> Result<ProjectDescription, DescriptionError> {
+    let path =
+        description_path_result().map_err(|details| DescriptionError::NotFound { details })?;
+    let contents = fs::read_to_string(&path).map_err(|source| DescriptionError::ReadFailed {
+        path: path.clone(),
+        source,
+    })?;
+    let mut description =
+        RDescription::from_str(&contents).map_err(|details| DescriptionError::ParseFailed {
+            path: path.clone(),
+            details,
+        })?;
     let additional_repositories = description.additional_repositories();
     description.remove_field("Additional_repositories");
-
-    if description
-        .package_name()
-        .unwrap_or_default()
-        .trim()
-        .is_empty()
-    {
-        return Err("DESCRIPTION is missing Package".to_string());
-    }
 
     Ok(ProjectDescription {
         description,

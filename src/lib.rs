@@ -73,6 +73,10 @@ type RpxResult<T> = Result<T, RpxError>;
 enum RpxError {
     #[error(transparent)]
     #[diagnostic(transparent)]
+    Description(#[from] description::DescriptionError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
     Project(#[from] ProjectError),
 
     #[error(transparent)]
@@ -106,13 +110,6 @@ enum RpxError {
 
 #[derive(Debug, Error, Diagnostic)]
 enum ProjectError {
-    #[error("failed to read DESCRIPTION: {details}")]
-    #[diagnostic(
-        code(rpx::project::description_read),
-        help("Run `rpx init` to create a DESCRIPTION file in this project.")
-    )]
-    DescriptionRead { details: String },
-
     #[error("failed to write DESCRIPTION: {details}")]
     #[diagnostic(code(rpx::project::description_write))]
     DescriptionWrite { details: String },
@@ -371,10 +368,6 @@ enum RpxWarning {
     CranArchiveUnavailable { url: String },
 }
 
-fn read_project_description() -> Result<description::ProjectDescription, ProjectError> {
-    read_description().map_err(|details| ProjectError::DescriptionRead { details })
-}
-
 fn write_project_description(
     project: &description::ProjectDescription,
 ) -> Result<(), ProjectError> {
@@ -447,7 +440,7 @@ fn cmd_init() -> RpxResult<()> {
 }
 
 fn cmd_add(packages: &[String], default_repo: bool, no_default_repo: bool) -> RpxResult<()> {
-    let mut project = read_project_description()?;
+    let mut project = read_description()?;
     let mut lockfile = read_project_lockfile_optional()?;
     let use_default_repository =
         resolve_use_default_repository(lockfile.as_ref(), default_repo, no_default_repo);
@@ -518,7 +511,7 @@ fn cmd_repo(command: RepoCommands) -> RpxResult<()> {
 }
 
 fn cmd_repo_add(url: &str) -> RpxResult<()> {
-    let mut project = read_project_description()?;
+    let mut project = read_description()?;
     let source = detect_repository_source(url).map_err(|details| RepoError::Add {
         url: normalize_repository_url(url),
         details,
@@ -607,7 +600,7 @@ fn repository_kind_label(lockfile: Option<&Lockfile>, url: &str) -> &'static str
 }
 
 fn cmd_repo_remove(url: &str, remove_credential: bool) -> RpxResult<()> {
-    let mut project = read_project_description()?;
+    let mut project = read_description()?;
     let source = RepositorySource::new(url);
     let original_len = project.additional_repositories.len();
     project
@@ -635,7 +628,7 @@ fn cmd_repo_remove(url: &str, remove_credential: bool) -> RpxResult<()> {
 }
 
 fn cmd_repo_list() -> RpxResult<()> {
-    let project = read_project_description()?;
+    let project = read_description()?;
     let lockfile = read_project_lockfile_optional()?;
 
     if project.additional_repositories.is_empty() {
@@ -667,7 +660,7 @@ fn cmd_repo_list() -> RpxResult<()> {
 }
 
 fn cmd_remove(packages: &[String], default_repo: bool, no_default_repo: bool) -> RpxResult<()> {
-    let mut project = read_project_description()?;
+    let mut project = read_description()?;
     for package in packages {
         project.description.remove_from_field("Imports", package);
         project.description.remove_from_field("Depends", package);
@@ -751,7 +744,7 @@ fn cmd_sync(install_system: bool, install_only_system: bool) -> RpxResult<()> {
 }
 
 fn cmd_status() -> RpxResult<()> {
-    let project = read_project_description()?;
+    let project = read_description()?;
     let lockfile = read_project_lockfile()?;
 
     match validate_lockfile_compatibility(&lockfile) {
@@ -1147,7 +1140,7 @@ fn constraints_from_resolved_roots(
 }
 
 fn lock_from_description(default_repo: bool, no_default_repo: bool) -> RpxResult<LockOutcome> {
-    let project = read_project_description()?;
+    let project = read_description()?;
     let roots = project.description.resolution_roots();
     let registry = default_registry_base_url();
     let existing_lockfile = read_project_lockfile_optional()?;
@@ -1236,7 +1229,7 @@ fn warn_cran_archive_unavailable(repositories: &RepositorySet) {
 }
 
 fn sync_from_lockfile(install_system: bool, install_only_system: bool) -> RpxResult<SyncOutcome> {
-    let project = read_project_description()?;
+    let project = read_description()?;
     let manifest_requirements = project
         .description
         .requirements()
