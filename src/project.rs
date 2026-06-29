@@ -1,24 +1,42 @@
 use directories::ProjectDirs;
+use miette::Diagnostic;
 use std::{
     collections::hash_map::DefaultHasher,
     env, fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
 };
+use thiserror::Error;
 
 pub const LOCKFILE_NAME: &str = "rpx.lock";
 pub const DESCRIPTION_NAME: &str = "DESCRIPTION";
 
-pub fn current_description_path() -> PathBuf {
-    current_dir().join(DESCRIPTION_NAME)
+#[derive(Debug, Error, Diagnostic)]
+pub enum ProjectPathError {
+    #[error("failed to get current directory: {source}")]
+    #[diagnostic(code(rpx::project::current_dir_failed))]
+    CurrentDirFailed {
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("{DESCRIPTION_NAME} not found in current directory or any parent directory")]
+    #[diagnostic(code(rpx::project::description_not_found))]
+    DescriptionNotFound,
 }
 
-pub fn description_path_result() -> Result<PathBuf, String> {
+pub fn new_project_description_path() -> Result<PathBuf, ProjectPathError> {
+    Ok(current_dir()?.join(DESCRIPTION_NAME))
+}
+
+pub fn description_path() -> Result<PathBuf, ProjectPathError> {
     Ok(project_root_result()?.join(DESCRIPTION_NAME))
 }
 
 pub fn lockfile_path_result() -> Result<PathBuf, String> {
-    Ok(project_root_result()?.join(LOCKFILE_NAME))
+    Ok(project_root_result()
+        .map_err(|error| error.to_string())?
+        .join(LOCKFILE_NAME))
 }
 
 pub fn project_library_path() -> PathBuf {
@@ -76,8 +94,8 @@ pub fn project_root() -> PathBuf {
     project_root_result().unwrap_or_else(|error| panic!("{error}"))
 }
 
-pub fn project_root_result() -> Result<PathBuf, String> {
-    let current_dir = current_dir();
+pub fn project_root_result() -> Result<PathBuf, ProjectPathError> {
+    let current_dir = current_dir()?;
     let current_dir = current_dir
         .canonicalize()
         .unwrap_or_else(|_| current_dir.clone());
@@ -88,13 +106,11 @@ pub fn project_root_result() -> Result<PathBuf, String> {
         }
     }
 
-    Err(format!(
-        "{DESCRIPTION_NAME} not found in current directory or any parent directory"
-    ))
+    Err(ProjectPathError::DescriptionNotFound)
 }
 
-fn current_dir() -> PathBuf {
-    env::current_dir().expect("failed to get current directory")
+fn current_dir() -> Result<PathBuf, ProjectPathError> {
+    env::current_dir().map_err(|source| ProjectPathError::CurrentDirFailed { source })
 }
 
 fn project_dirs() -> ProjectDirs {

@@ -4,7 +4,7 @@ use r_description::{Version, VersionConstraint};
 use std::{collections::BTreeSet, fs, path::PathBuf, str::FromStr};
 use thiserror::Error;
 
-use crate::project::{current_description_path, description_path_result};
+use crate::project::{ProjectPathError, description_path, new_project_description_path};
 use crate::registry::ResolutionRoot;
 
 const DESCRIPTION_FIELD_ORDER: &[&str] = &[
@@ -56,12 +56,9 @@ pub struct ProjectDescription {
 
 #[derive(Debug, Error, Diagnostic)]
 pub enum DescriptionError {
-    #[error("DESCRIPTION not found: {details}")]
-    #[diagnostic(
-        code(rpx::description::not_found),
-        help("Run `rpx init` to create a DESCRIPTION file in this project.")
-    )]
-    NotFound { details: String },
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    ProjectPath(#[from] ProjectPathError),
 
     #[error("failed to read DESCRIPTION at {}: {source}", path.display())]
     #[diagnostic(code(rpx::description::read_failed))]
@@ -74,6 +71,27 @@ pub enum DescriptionError {
     #[error("failed to parse DESCRIPTION at {}: {details}", path.display())]
     #[diagnostic(code(rpx::description::parse_failed))]
     ParseFailed { path: PathBuf, details: String },
+
+    #[error("DESCRIPTION already exists at {}", path.display())]
+    #[diagnostic(
+        code(rpx::description::already_exists),
+        help(
+            "Run rpx commands from this project, or remove DESCRIPTION before initializing a new project."
+        )
+    )]
+    AlreadyExists { path: PathBuf },
+
+    #[error("failed to derive package name for DESCRIPTION: {details}")]
+    #[diagnostic(code(rpx::description::package_name_failed))]
+    PackageNameFailed { details: String },
+
+    #[error("failed to write DESCRIPTION at {}: {source}", path.display())]
+    #[diagnostic(code(rpx::description::write_failed))]
+    WriteFailed {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,8 +181,7 @@ impl RDescription {
 }
 
 pub fn read_description() -> Result<ProjectDescription, DescriptionError> {
-    let path =
-        description_path_result().map_err(|details| DescriptionError::NotFound { details })?;
+    let path = description_path()?;
     let contents = fs::read_to_string(&path).map_err(|source| DescriptionError::ReadFailed {
         path: path.clone(),
         source,
@@ -183,7 +200,7 @@ pub fn read_description() -> Result<ProjectDescription, DescriptionError> {
     })
 }
 
-pub fn write_description(project: &ProjectDescription) -> Result<(), String> {
+pub fn write_description(project: &ProjectDescription) -> Result<(), DescriptionError> {
     let mut contents = format_description_for_write(&project.description);
     if !project.additional_repositories.is_empty() {
         contents.push('\n');
@@ -192,16 +209,18 @@ pub fn write_description(project: &ProjectDescription) -> Result<(), String> {
         ));
     }
     contents.push('\n');
-    fs::write(description_path_result()?, contents).map_err(|error| error.to_string())
+    let path = description_path()?;
+    fs::write(&path, contents).map_err(|source| DescriptionError::WriteFailed { path, source })
 }
 
-pub fn init_description() -> Result<String, String> {
-    let path = current_description_path();
+pub fn init_description() -> Result<String, DescriptionError> {
+    let path = new_project_description_path()?;
     if path.exists() {
-        return Err("DESCRIPTION already exists".to_string());
+        return Err(DescriptionError::AlreadyExists { path });
     }
 
-    let package_name = package_name_from_current_directory()?;
+    let package_name = package_name_from_current_directory()
+        .map_err(|details| DescriptionError::PackageNameFailed { details })?;
     let description = ProjectDescription {
         description: initial_description(&package_name),
         additional_repositories: vec![],
@@ -209,7 +228,10 @@ pub fn init_description() -> Result<String, String> {
 
     let mut contents = format_description_for_write(&description.description);
     contents.push('\n');
-    fs::write(&path, contents).map_err(|error| error.to_string())?;
+    fs::write(&path, contents).map_err(|source| DescriptionError::WriteFailed {
+        path: path.clone(),
+        source,
+    })?;
 
     Ok(path.display().to_string())
 }

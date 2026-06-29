@@ -81,10 +81,6 @@ enum RpxError {
 
     #[error(transparent)]
     #[diagnostic(transparent)]
-    Init(#[from] InitError),
-
-    #[error(transparent)]
-    #[diagnostic(transparent)]
     Repo(#[from] RepoError),
 
     #[error(transparent)]
@@ -110,10 +106,6 @@ enum RpxError {
 
 #[derive(Debug, Error, Diagnostic)]
 enum ProjectError {
-    #[error("failed to write DESCRIPTION: {details}")]
-    #[diagnostic(code(rpx::project::description_write))]
-    DescriptionWrite { details: String },
-
     #[error("failed to read rpx.lock: {details}")]
     #[diagnostic(
         code(rpx::project::lockfile_read),
@@ -124,22 +116,6 @@ enum ProjectError {
     #[error("failed to write rpx.lock: {details}")]
     #[diagnostic(code(rpx::project::lockfile_write))]
     LockfileWrite { details: String },
-}
-
-#[derive(Debug, Error, Diagnostic)]
-enum InitError {
-    #[error("DESCRIPTION already exists")]
-    #[diagnostic(
-        code(rpx::init::description_exists),
-        help(
-            "Run rpx commands from this project, or remove DESCRIPTION before initializing a new project."
-        )
-    )]
-    DescriptionAlreadyExists,
-
-    #[error("failed to initialize project: {details}")]
-    #[diagnostic(code(rpx::init::failed))]
-    Failed { details: String },
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -368,12 +344,6 @@ enum RpxWarning {
     CranArchiveUnavailable { url: String },
 }
 
-fn write_project_description(
-    project: &description::ProjectDescription,
-) -> Result<(), ProjectError> {
-    write_description(project).map_err(|details| ProjectError::DescriptionWrite { details })
-}
-
 fn read_project_lockfile() -> Result<Lockfile, ProjectError> {
     read_lockfile().map_err(|details| ProjectError::LockfileRead { details })
 }
@@ -427,13 +397,7 @@ fn run_inner() -> RpxResult<()> {
 }
 
 fn cmd_init() -> RpxResult<()> {
-    let path = init_description().map_err(|details| {
-        if details == "DESCRIPTION already exists" {
-            InitError::DescriptionAlreadyExists
-        } else {
-            InitError::Failed { details }
-        }
-    })?;
+    let path = init_description()?;
     status(format_args!("Initialized project at {path}"));
     status("Next: run `rpx add <package>` or `rpx lock`");
     Ok(())
@@ -488,7 +452,7 @@ fn cmd_add(packages: &[String], default_repo: bool, no_default_repo: bool) -> Rp
         ));
     }
 
-    write_project_description(&project)?;
+    write_description(&project)?;
     if let Some(lockfile) = lockfile {
         write_project_lockfile(&lockfile)?;
     } else {
@@ -532,7 +496,7 @@ fn cmd_repo_add(url: &str) -> RpxResult<()> {
     project
         .additional_repositories
         .push(source.base_url().to_string());
-    write_project_description(&project)?;
+    write_description(&project)?;
     status(format_args!("Added repository {}", source.base_url()));
     Ok(())
 }
@@ -615,7 +579,7 @@ fn cmd_repo_remove(url: &str, remove_credential: bool) -> RpxResult<()> {
         return Ok(());
     }
 
-    write_project_description(&project)?;
+    write_description(&project)?;
 
     if remove_credential {
         RepositorySet::new(vec![source.clone()])
@@ -665,7 +629,7 @@ fn cmd_remove(packages: &[String], default_repo: bool, no_default_repo: bool) ->
         project.description.remove_from_field("Imports", package);
         project.description.remove_from_field("Depends", package);
     }
-    write_project_description(&project)?;
+    write_description(&project)?;
 
     let installed = installed_packages_by_name();
     let mut removed = Vec::new();
