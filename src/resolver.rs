@@ -1,7 +1,7 @@
 use std::{
     cell::RefCell,
     cmp::{Ordering, Reverse},
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
     hash::{Hash, Hasher},
@@ -272,7 +272,7 @@ impl<'a> RegistryDependencyProvider<'a> {
             version: version_entry.version.clone(),
             source_url: version_entry.source_url,
             dependencies: description_dependencies(&description)?,
-            system_requirements: description.system_requirements(),
+            system_requirements: description.system_requirements().map(ToString::to_string),
         };
         self.metadata_by_package_version
             .borrow_mut()
@@ -460,25 +460,11 @@ fn description_dependencies(
 ) -> Result<Vec<PackageDependency>, ResolverError> {
     let mut dependencies = Vec::new();
 
-    dependencies.extend(relations_to_dependencies(
-        "Depends",
-        &description
-            .dependency_field("Depends")
-            .map_err(ResolverError)?,
-    )?);
-
-    dependencies.extend(relations_to_dependencies(
-        "Imports",
-        &description
-            .dependency_field("Imports")
-            .map_err(ResolverError)?,
-    )?);
-
+    dependencies.extend(relations_to_dependencies("Depends", &description.depends)?);
+    dependencies.extend(relations_to_dependencies("Imports", &description.imports)?);
     dependencies.extend(relations_to_dependencies(
         "LinkingTo",
-        &description
-            .dependency_field("LinkingTo")
-            .map_err(ResolverError)?,
+        &description.linking_to,
     )?);
 
     Ok(dependencies)
@@ -486,7 +472,7 @@ fn description_dependencies(
 
 fn relations_to_dependencies(
     kind: &str,
-    relations: &[DescriptionDependency],
+    relations: &BTreeSet<DescriptionDependency>,
 ) -> Result<Vec<PackageDependency>, ResolverError> {
     relations
         .iter()
@@ -757,14 +743,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 ("methods".to_string(), "Depends".to_string(), None, None),
-                ("tools".to_string(), "Imports".to_string(), None, None),
-                ("utils".to_string(), "Imports".to_string(), None, None),
                 (
                     "rbibutils".to_string(),
                     "Imports".to_string(),
                     Some("2.4".to_string()),
                     None,
                 ),
+                ("tools".to_string(), "Imports".to_string(), None, None),
+                ("utils".to_string(), "Imports".to_string(), None, None),
             ]
         );
     }

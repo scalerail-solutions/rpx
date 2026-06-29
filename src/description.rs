@@ -39,18 +39,16 @@ const DESCRIPTION_FIELD_ORDER: &[&str] = &[
     "LazyData",
 ];
 
-pub trait DescriptionExt {
-    fn add_to_imports(&mut self, package: &str);
-    fn add_to_imports_with_constraints(&mut self, package: &str, constraints: &[String]);
-    fn has_dependency(&self, package: &str) -> bool;
-    fn remove_from_field(&mut self, field_name: &str, package: &str);
-    fn resolution_roots(&self) -> Vec<ResolutionRoot>;
-    fn requirements(&self) -> Vec<String>;
-}
-
 #[derive(Debug, Clone)]
 pub struct RDescription {
     paragraph: Paragraph,
+    pub depends: BTreeSet<DescriptionDependency>,
+    pub imports: BTreeSet<DescriptionDependency>,
+    pub suggests: BTreeSet<DescriptionDependency>,
+    pub enhances: BTreeSet<DescriptionDependency>,
+    pub linking_to: BTreeSet<DescriptionDependency>,
+    pub additional_repositories: Vec<String>,
+    pub system_requirements: Option<String>,
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -113,74 +111,56 @@ impl std::fmt::Display for DescriptionDependency {
     }
 }
 
+impl Ord for DescriptionDependency {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        compare_dependencies(self, other)
+    }
+}
+
+impl PartialOrd for DescriptionDependency {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl std::str::FromStr for RDescription {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let paragraph = Paragraph::from_str(s).map_err(|error| error.to_string())?;
-        Ok(Self { paragraph })
+        Self::from_paragraph(paragraph)
     }
 }
 
 impl std::fmt::Display for RDescription {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.paragraph)
+        f.write_str(&format_description_for_write(self))
     }
 }
 
 impl RDescription {
-    pub fn dependency_field(&self, field_name: &str) -> Result<Vec<DescriptionDependency>, String> {
-        match self.paragraph.get(field_name) {
-            Some(contents) => parse_dependency_field(contents),
-            None => Ok(Vec::new()),
-        }
+    fn from_paragraph(paragraph: Paragraph) -> Result<Self, String> {
+        Ok(Self {
+            depends: parse_stored_dependency_field(&paragraph, "Depends")?,
+            imports: parse_stored_dependency_field(&paragraph, "Imports")?,
+            suggests: parse_stored_dependency_field(&paragraph, "Suggests")?,
+            enhances: parse_stored_dependency_field(&paragraph, "Enhances")?,
+            linking_to: parse_stored_dependency_field(&paragraph, "LinkingTo")?,
+            additional_repositories: paragraph
+                .get("Additional_repositories")
+                .map(split_repository_entries)
+                .unwrap_or_default(),
+            system_requirements: paragraph
+                .get("SystemRequirements")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string),
+            paragraph,
+        })
     }
 
-    pub fn additional_repositories(&self) -> Vec<String> {
-        self.paragraph
-            .get("Additional_repositories")
-            .map(split_repository_entries)
-            .unwrap_or_default()
-    }
-
-    pub fn set_additional_repositories(&mut self, repositories: &[String]) {
-        if repositories.is_empty() {
-            self.paragraph.remove("Additional_repositories");
-            return;
-        }
-
-        self.set_field("Additional_repositories", &repositories.join(",\n"));
-    }
-
-    pub fn system_requirements(&self) -> Option<String> {
-        self.paragraph
-            .get("SystemRequirements")
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string)
-    }
-
-    fn set_field(&mut self, field_name: &str, value: &str) {
-        self.paragraph
-            .set_with_field_order(field_name, value, DESCRIPTION_FIELD_ORDER);
-    }
-
-    fn set_dependency_field(&mut self, field_name: &str, dependencies: &[DescriptionDependency]) {
-        if dependencies.is_empty() {
-            self.paragraph.remove(field_name);
-            return;
-        }
-
-        let value = dependencies
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        self.set_field(field_name, &value);
-    }
-
-    fn field_pairs(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.paragraph.iter()
+    pub fn system_requirements(&self) -> Option<&str> {
+        self.system_requirements.as_deref()
     }
 }
 
@@ -222,111 +202,64 @@ pub fn init_description() -> Result<String, DescriptionError> {
     Ok(path.display().to_string())
 }
 
-impl DescriptionExt for RDescription {
-    fn add_to_imports(&mut self, package: &str) {
-        self.add_to_imports_with_constraints(package, &[]);
-    }
-
-    fn add_to_imports_with_constraints(&mut self, package: &str, constraints: &[String]) {
-        if self.has_dependency(package) {
-            return;
-        }
-
-        let mut imports = self
-            .dependency_field("Imports")
-            .expect("existing Imports should parse");
-
-        if constraints.is_empty()
-            || constraints
-                .iter()
-                .all(|constraint| constraint.trim() == "*")
-        {
-            imports.push(DescriptionDependency {
-                name: package.to_string(),
-                version: None,
-            });
-        } else {
-            imports.extend(
-                constraints
-                    .iter()
-                    .map(|constraint| relation_with_constraint(package, constraint))
-                    .collect::<Result<Vec<_>, _>>()
-                    .expect("constraints should parse"),
-            );
-        }
-
-        self.set_dependency_field("Imports", &imports);
-    }
-
-    fn has_dependency(&self, package: &str) -> bool {
-        ["Imports", "Depends"].into_iter().any(|field| {
-            self.dependency_field(field)
-                .map(|dependencies| dependencies.into_iter().any(|entry| entry.name == package))
-                .unwrap_or(false)
-        })
-    }
-
-    fn remove_from_field(&mut self, field_name: &str, package: &str) {
-        let filtered = self
-            .dependency_field(field_name)
-            .expect("dependency field should parse")
-            .into_iter()
-            .filter(|entry| entry.name != package)
-            .collect::<Vec<_>>();
-        self.set_dependency_field(field_name, &filtered);
-    }
-
-    fn resolution_roots(&self) -> Vec<ResolutionRoot> {
-        let mut roots = BTreeSet::new();
-
-        for relation in self
-            .dependency_field("Imports")
-            .expect("Imports should parse")
-        {
-            roots.insert(resolution_root_from_relation(&relation));
-        }
-
-        for relation in self
-            .dependency_field("Depends")
-            .expect("Depends should parse")
-        {
-            if relation.name != "R" {
-                roots.insert(resolution_root_from_relation(&relation));
-            }
-        }
-
-        roots.into_iter().collect()
-    }
-
-    fn requirements(&self) -> Vec<String> {
-        let mut requirements = BTreeSet::new();
-
-        for relation in self
-            .dependency_field("Imports")
-            .expect("Imports should parse")
-        {
-            requirements.insert(relation.name);
-        }
-
-        for relation in self
-            .dependency_field("Depends")
-            .expect("Depends should parse")
-        {
-            if relation.name != "R" {
-                requirements.insert(relation.name);
-            }
-        }
-
-        requirements.into_iter().collect()
-    }
-}
-
 fn format_description_for_write(description: &RDescription) -> String {
-    description
-        .field_pairs()
+    let paragraph = paragraph_for_write(description);
+    paragraph
+        .iter()
         .map(|(field, value)| format_description_field(field, value))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn paragraph_for_write(description: &RDescription) -> Paragraph {
+    let mut paragraph = description.paragraph.clone();
+    set_dependency_field(&mut paragraph, "Depends", &description.depends);
+    set_dependency_field(&mut paragraph, "Imports", &description.imports);
+    set_dependency_field(&mut paragraph, "Suggests", &description.suggests);
+    set_dependency_field(&mut paragraph, "Enhances", &description.enhances);
+    set_dependency_field(&mut paragraph, "LinkingTo", &description.linking_to);
+
+    if description.additional_repositories.is_empty() {
+        paragraph.remove("Additional_repositories");
+    } else {
+        paragraph.set_with_field_order(
+            "Additional_repositories",
+            &description.additional_repositories.join(",\n"),
+            DESCRIPTION_FIELD_ORDER,
+        );
+    }
+
+    paragraph
+}
+
+fn set_dependency_field(
+    paragraph: &mut Paragraph,
+    field_name: &'static str,
+    dependencies: &BTreeSet<DescriptionDependency>,
+) {
+    if dependencies.is_empty() {
+        paragraph.remove(field_name);
+        return;
+    }
+
+    let value = dependencies
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    paragraph.set_with_field_order(field_name, &value, DESCRIPTION_FIELD_ORDER);
+}
+
+fn parse_stored_dependency_field(
+    paragraph: &Paragraph,
+    field_name: &'static str,
+) -> Result<BTreeSet<DescriptionDependency>, String> {
+    match paragraph.get(field_name) {
+        Some(contents) => parse_dependency_field(contents)
+            .map(|dependencies| dependencies.into_iter().collect())
+            .map_err(|details| format!("failed to parse {field_name}: {details}")),
+        None => Ok(BTreeSet::new()),
+    }
 }
 
 fn format_description_field(field: &str, value: &str) -> String {
@@ -334,13 +267,13 @@ fn format_description_field(field: &str, value: &str) -> String {
         &["Imports", "Depends", "Suggests", "Enhances", "LinkingTo"];
 
     if MULTILINE_RELATION_FIELDS.contains(&field) {
-        let mut entries =
-            parse_dependency_field(value).expect("stored dependency field should parse");
+        let entries = parse_dependency_field(value)
+            .expect("stored dependency field should parse")
+            .into_iter()
+            .collect::<BTreeSet<_>>();
         if entries.is_empty() {
             return format!("{field}:");
         }
-
-        entries.sort_by(compare_dependencies);
 
         let mut lines = vec![format!("{field}:")];
         for (index, entry) in entries.iter().enumerate() {
@@ -401,7 +334,7 @@ fn dependency_operator_rank(entry: &DescriptionDependency) -> u8 {
     }
 }
 
-fn relation_with_constraint(
+pub fn relation_with_constraint(
     package: &str,
     constraint: &str,
 ) -> Result<DescriptionDependency, String> {
@@ -486,7 +419,7 @@ fn parse_constraint(constraint: &str) -> Result<(VersionConstraint, &str), Strin
     Err(format!("invalid dependency constraint: {constraint}"))
 }
 
-fn resolution_root_from_relation(relation: &DescriptionDependency) -> ResolutionRoot {
+pub fn resolution_root_from_relation(relation: &DescriptionDependency) -> ResolutionRoot {
     let constraint = relation.version.as_ref().map_or_else(
         || "*".to_string(),
         |(operator, version)| format!("{} {version}", relation_operator(operator)),
@@ -517,7 +450,7 @@ fn initial_description(package_name: &str) -> RDescription {
     paragraph.insert("License", "MIT");
     paragraph.insert("Author", "Your Name");
     paragraph.insert("Maintainer", "Your Name <you@example.com>");
-    RDescription { paragraph }
+    RDescription::from_paragraph(paragraph).expect("initial DESCRIPTION should parse")
 }
 
 fn package_name_from_description_path(path: &Path) -> Result<String, DescriptionError> {
@@ -582,9 +515,9 @@ fn title_from_package_name(package_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DescriptionExt, RDescription, format_description_for_write, parse_constraint,
-        relation_with_constraint, sanitize_package_name, split_repository_entries,
-        title_from_package_name,
+        DescriptionDependency, RDescription, format_description_for_write, parse_constraint,
+        relation_with_constraint, resolution_root_from_relation, sanitize_package_name,
+        split_repository_entries, title_from_package_name,
     };
     use crate::registry::ResolutionRoot;
     use r_description::VersionConstraint;
@@ -621,17 +554,19 @@ mod tests {
         )
         .expect("description should parse");
 
-        description.add_to_imports_with_constraints(
-            "dplyr",
-            &[">= 1.1.4".to_string(), "< 2.0.0".to_string()],
-        );
+        description.imports.extend([
+            relation_with_constraint("dplyr", ">= 1.1.4").unwrap(),
+            relation_with_constraint("dplyr", "< 2.0.0").unwrap(),
+        ]);
 
-        let imports = description
-            .dependency_field("Imports")
-            .expect("imports should parse");
-        assert_eq!(imports.len(), 2);
-        assert_eq!(imports[0].to_string(), "dplyr (>= 1.1.4)");
-        assert_eq!(imports[1].to_string(), "dplyr (< 2.0.0)");
+        assert_eq!(
+            description
+                .imports
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec!["dplyr (>= 1.1.4)", "dplyr (< 2.0.0)"]
+        );
     }
 
     #[test]
@@ -641,9 +576,15 @@ mod tests {
         )
         .expect("description should parse");
 
-        assert!(description.has_dependency("digest"));
-        assert!(description.has_dependency("cli"));
-        assert!(!description.has_dependency("jsonlite"));
+        let dependencies = description
+            .imports
+            .iter()
+            .chain(&description.depends)
+            .map(|dependency| dependency.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(dependencies.contains(&"digest"));
+        assert!(dependencies.contains(&"cli"));
+        assert!(!dependencies.contains(&"jsonlite"));
     }
 
     #[test]
@@ -666,27 +607,38 @@ mod tests {
 
     #[test]
     fn canonicalizes_cran_style_greater_than_constraints() {
-        let description = RDescription::from_str(
+        let mut description = RDescription::from_str(
             "Package: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\nImports: rbibutils (> 2.4)\n",
         )
         .expect("description should parse");
+        description.imports.insert(DescriptionDependency {
+            name: "digest".to_string(),
+            version: None,
+        });
 
         let formatted = format_description_for_write(&description);
 
-        assert!(formatted.contains("Imports:\n    rbibutils (> 2.4)"));
+        assert!(formatted.contains("rbibutils (> 2.4)"));
     }
 
     #[test]
     fn formats_relationship_fields_as_multiline() {
-        let description = RDescription::from_str(
+        let mut description = RDescription::from_str(
             "Package: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\nImports: cli (>= 3.6.0), digest\nDepends: R (>= 4.3), jsonlite\n",
         )
         .expect("description should parse");
+        description.imports.insert(DescriptionDependency {
+            name: "withr".to_string(),
+            version: None,
+        });
+        description
+            .depends
+            .retain(|dependency| dependency.name != "jsonlite");
 
         let formatted = format_description_for_write(&description);
 
-        assert!(formatted.contains("Imports:\n    cli (>= 3.6.0),\n    digest"));
-        assert!(formatted.contains("Depends:\n    jsonlite,\n    R (>= 4.3)"));
+        assert!(formatted.contains("Imports:\n    cli (>= 3.6.0),\n    digest,\n    withr"));
+        assert!(formatted.contains("Depends:\n    R (>= 4.3)"));
     }
 
     #[test]
@@ -696,10 +648,10 @@ mod tests {
         )
         .expect("description should parse");
 
-        description.add_to_imports_with_constraints(
-            "dplyr",
-            &[">= 1.1.4".to_string(), "< 2.0.0".to_string()],
-        );
+        description.imports.extend([
+            relation_with_constraint("dplyr", ">= 1.1.4").unwrap(),
+            relation_with_constraint("dplyr", "< 2.0.0").unwrap(),
+        ]);
 
         let formatted = format_description_for_write(&description);
 
@@ -708,15 +660,24 @@ mod tests {
 
     #[test]
     fn sorts_dependency_entries_within_each_field() {
-        let description = RDescription::from_str(
+        let mut description = RDescription::from_str(
             "Package: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\nImports: jsonlite, AzureAuth, cli\nDepends: zlib, R (>= 4.3), base\n",
         )
         .expect("description should parse");
+        description.imports.insert(DescriptionDependency {
+            name: "digest".to_string(),
+            version: None,
+        });
+        description
+            .depends
+            .retain(|dependency| dependency.name != "zlib");
 
         let formatted = format_description_for_write(&description);
 
-        assert!(formatted.contains("Imports:\n    AzureAuth,\n    cli,\n    jsonlite"));
-        assert!(formatted.contains("Depends:\n    base,\n    R (>= 4.3),\n    zlib"));
+        assert!(
+            formatted.contains("Imports:\n    AzureAuth,\n    cli,\n    digest,\n    jsonlite")
+        );
+        assert!(formatted.contains("Depends:\n    base,\n    R (>= 4.3)"));
     }
 
     #[test]
@@ -727,7 +688,11 @@ mod tests {
         .expect("description should parse");
 
         assert_eq!(
-            description.resolution_roots(),
+            description
+                .imports
+                .iter()
+                .map(resolution_root_from_relation)
+                .collect::<Vec<_>>(),
             vec![
                 ResolutionRoot {
                     name: "AzureAuth".to_string(),
@@ -747,11 +712,11 @@ mod tests {
             "Package: testpkg\nAdditional_repositories:\n    https://one.example/repo,\n    https://two.example/repo\n",
         )
         .expect("description should parse");
-        let repositories = description.additional_repositories();
+        let repositories = &description.additional_repositories;
 
         assert_eq!(
             repositories,
-            vec![
+            &vec![
                 "https://one.example/repo".to_string(),
                 "https://two.example/repo".to_string()
             ]
@@ -762,14 +727,32 @@ mod tests {
     fn formats_additional_repositories_as_multiline_field() {
         let mut description =
             RDescription::from_str("Package: testpkg\n").expect("description should parse");
-        description.set_additional_repositories(&[
+        description.additional_repositories = vec![
             "https://one.example/repo".to_string(),
             "https://two.example/repo".to_string(),
-        ]);
+        ];
 
         assert!(format_description_for_write(&description).contains(
             "Additional_repositories:\n    https://one.example/repo,\n    https://two.example/repo"
         ));
+    }
+
+    #[test]
+    fn preserves_custom_fields_when_known_fields_are_edited() {
+        let mut description = RDescription::from_str(
+            "Package: testpkg\nX-Customer-Field: keep me\nImports: digest\n",
+        )
+        .expect("description should parse");
+
+        description.imports.insert(DescriptionDependency {
+            name: "cli".to_string(),
+            version: None,
+        });
+
+        let formatted = format_description_for_write(&description);
+
+        assert!(formatted.contains("X-Customer-Field: keep me"));
+        assert!(formatted.contains("Imports:\n    cli,\n    digest"));
     }
 
     #[test]
