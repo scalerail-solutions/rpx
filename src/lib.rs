@@ -340,16 +340,6 @@ enum RpxWarning {
         help("Run `rpx sync --install-system` to install missing system dependencies first.")
     )]
     ContinuingWithoutSystemDependencies,
-
-    #[error("archive listing unavailable for CRAN-like repository {url}")]
-    #[diagnostic(
-        severity(Warning),
-        code(rpx::repository::cran_archive_unavailable),
-        help(
-            "rpx can restore locked archived package URLs, but new resolution for this repository is limited to versions listed in PACKAGES."
-        )
-    )]
-    CranArchiveUnavailable { url: String },
 }
 
 fn read_project_lockfile() -> Result<Lockfile, ProjectError> {
@@ -1312,12 +1302,6 @@ fn load_sysreq_snapshot_for_lock(
 
     warning(RpxWarning::SysreqUnavailable);
     empty_sysreq_snapshot()
-}
-
-fn warn_cran_archive_unavailable(repositories: &RepositorySet) {
-    for url in repositories.cran_archive_unavailable_repositories() {
-        warning(RpxWarning::CranArchiveUnavailable { url });
-    }
 }
 
 fn sync_from_lockfile(install_system: bool, install_only_system: bool) -> RpxResult<SyncOutcome> {

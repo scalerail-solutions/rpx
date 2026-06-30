@@ -158,10 +158,6 @@ impl RDescription {
             paragraph,
         })
     }
-
-    pub fn system_requirements(&self) -> Option<&str> {
-        self.system_requirements.as_deref()
-    }
 }
 
 pub fn read_description() -> Result<RDescription, DescriptionError> {

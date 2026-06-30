@@ -11,7 +11,7 @@ use pubgrub::{
     Dependencies, DependencyConstraints, DependencyProvider, PackageResolutionStatistics, Ranges,
     VersionSet, resolve,
 };
-use r_description::{Version, VersionConstraint};
+use r_description::{Version, VersionConstraint, lossy};
 
 use crate::{
     description::{DescriptionDependency, RDescription},
@@ -370,8 +370,8 @@ impl PackageRepository for CranLikePackageRepository {
             .records
             .into_iter()
             .filter(|record| record.package == package)
-            .map(|record| record.version.parse::<Version>().map_err(ResolverError))
-            .collect::<Result<BTreeSet<_>, _>>()?;
+            .map(|record| record.version)
+            .collect::<BTreeSet<_>>();
 
         if self.archive_support != Some(CranArchiveSupport::Unavailable) {
             versions.extend(
@@ -393,6 +393,15 @@ impl PackageRepository for CranLikePackageRepository {
         package: &str,
         version: &Version,
     ) -> Result<Option<Vec<PackageDependency>>, ResolverError> {
+        let index = fetch_cran_like_packages_index(&self.base_url).map_err(ResolverError)?;
+        if let Some(record) = index
+            .records
+            .into_iter()
+            .find(|record| record.package == package && &record.version == version)
+        {
+            return Ok(Some(package_dependencies_from_cran_like_record(record)));
+        }
+
         let version = version.to_string();
         let Some(description) = fetch_cran_like_description(&self.base_url, package, &version)
             .map_err(ResolverError)?
@@ -432,7 +441,7 @@ impl CranLikePackageRepository {
             .map_err(ResolverError)?
             .records
             .into_iter()
-            .any(|record| record.package == package && record.version == version);
+            .any(|record| record.package == package && record.version.to_string() == version);
 
         if is_current {
             return Ok(self.current_tarball_url(package, version));
@@ -472,6 +481,30 @@ fn package_dependencies_from_relations(
         .iter()
         .filter(|relation| relation.name != "R")
         .map(package_dependency_from_relation)
+        .collect()
+}
+
+fn package_dependencies_from_cran_like_record(
+    record: crate::repository::CranLikePackageRecord,
+) -> Vec<PackageDependency> {
+    let mut dependencies = Vec::new();
+
+    dependencies.extend(package_dependencies_from_lossy_relations(&record.depends));
+    dependencies.extend(package_dependencies_from_lossy_relations(&record.imports));
+    dependencies.extend(package_dependencies_from_lossy_relations(
+        &record.linking_to,
+    ));
+
+    dependencies
+}
+
+fn package_dependencies_from_lossy_relations(
+    relations: &lossy::Relations,
+) -> Vec<PackageDependency> {
+    relations
+        .iter()
+        .filter(|relation| relation.name != "R")
+        .map(package_dependency_from_lossy_relation)
         .collect()
 }
 
@@ -533,7 +566,28 @@ fn package_dependency_from_relation(relation: &DescriptionDependency) -> Package
     PackageDependency::from_relation(relation)
 }
 
+fn package_dependency_from_lossy_relation(relation: &lossy::Relation) -> PackageDependency {
+    PackageDependency {
+        package: relation.name.clone(),
+        range: r_description_range_from_lossy_relation(relation),
+    }
+}
+
 fn r_description_range_from_relation(relation: &DescriptionDependency) -> Ranges<Version> {
+    let Some((operator, version)) = relation.version.as_ref() else {
+        return Ranges::full();
+    };
+
+    match operator {
+        VersionConstraint::Equal => Ranges::singleton(version.clone()),
+        VersionConstraint::GreaterThan => Ranges::strictly_higher_than(version.clone()),
+        VersionConstraint::GreaterThanEqual => Ranges::higher_than(version.clone()),
+        VersionConstraint::LessThan => Ranges::strictly_lower_than(version.clone()),
+        VersionConstraint::LessThanEqual => Ranges::lower_than(version.clone()),
+    }
+}
+
+fn r_description_range_from_lossy_relation(relation: &lossy::Relation) -> Ranges<Version> {
     let Some((operator, version)) = relation.version.as_ref() else {
         return Ranges::full();
     };

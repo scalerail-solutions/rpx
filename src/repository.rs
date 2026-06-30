@@ -1,11 +1,12 @@
 use crate::output::try_prompt;
 use crate::registry::{
-    PackageVersionsResponse, RegistryClient, RepositoryPackageSummary, RepositoryPackagesResponse,
-    VersionSummary, is_not_found_error, is_unauthorized_error,
+    RegistryClient, RepositoryPackageSummary, RepositoryPackagesResponse, VersionSummary,
+    is_not_found_error, is_unauthorized_error,
 };
+use deb822_fast::borrowed::{BorrowedParagraph, BorrowedParser};
 use flate2::read::GzDecoder;
 use keyring::Entry;
-use r_description::Version;
+use r_description::{Version, lossy::Relations};
 use std::{
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     fs,
@@ -36,12 +37,6 @@ pub enum RepositoryKind {
     CranLike,
 }
 
-#[derive(Debug, Clone)]
-pub struct SourcedPackageVersions {
-    pub repository_url: String,
-    pub response: PackageVersionsResponse,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CranLikePackagesIndex {
     pub(crate) records: Vec<CranLikePackageRecord>,
@@ -50,7 +45,10 @@ pub(crate) struct CranLikePackagesIndex {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CranLikePackageRecord {
     pub(crate) package: String,
-    pub(crate) version: String,
+    pub(crate) version: Version,
+    pub(crate) depends: Relations,
+    pub(crate) imports: Relations,
+    pub(crate) linking_to: Relations,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,8 +86,6 @@ pub struct RepositorySet {
     prompter: Arc<dyn ApiKeyPrompter>,
     cran_current_indexes:
         Arc<std::sync::Mutex<BTreeMap<String, BTreeMap<String, Vec<VersionSummary>>>>>,
-    cran_archive_unavailable: Arc<std::sync::Mutex<BTreeSet<String>>>,
-    cran_archive_listing_support: Arc<std::sync::Mutex<BTreeMap<String, CranArchiveSupport>>>,
 }
 
 impl std::fmt::Debug for RepositorySet {
@@ -182,30 +178,12 @@ impl RepositorySet {
                 deduped.push(source);
             }
         }
-        let cran_archive_listing_support = deduped
-            .iter()
-            .filter_map(|source| {
-                source
-                    .cran_archive_support()
-                    .map(|support| (source.base_url().to_string(), support))
-            })
-            .collect::<BTreeMap<_, _>>();
-        let cran_archive_unavailable = cran_archive_listing_support
-            .iter()
-            .filter_map(|(url, support)| {
-                (*support == CranArchiveSupport::Unavailable).then_some(url.clone())
-            })
-            .collect::<BTreeSet<_>>();
 
         Self {
             sources: deduped,
             credentials,
             prompter,
             cran_current_indexes: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
-            cran_archive_unavailable: Arc::new(std::sync::Mutex::new(cran_archive_unavailable)),
-            cran_archive_listing_support: Arc::new(std::sync::Mutex::new(
-                cran_archive_listing_support,
-            )),
         }
     }
 
@@ -223,93 +201,6 @@ impl RepositorySet {
             }
             RepositoryKind::CranLike => self.fetch_cran_like_repository_packages(source),
         }
-    }
-
-    #[cfg(test)]
-    pub fn fetch_package_versions_with_retry(
-        &self,
-        package: &str,
-    ) -> Result<SourcedPackageVersions, String> {
-        for source in &self.sources {
-            let result = match source.kind() {
-                RepositoryKind::Rrepo => self.with_authorized_client(source, |client| {
-                    client.fetch_package_versions_with_retry(package)
-                }),
-                RepositoryKind::CranLike => self.fetch_cran_like_package_versions(source, package),
-            };
-
-            match result {
-                Ok(response) => {
-                    return Ok(SourcedPackageVersions {
-                        repository_url: source.base_url().to_string(),
-                        response,
-                    });
-                }
-                Err(error) if is_not_found_error(&error) => {}
-                Err(error) => return Err(error),
-            }
-        }
-
-        Err(format!(
-            "unexpected registry response (404 Not Found): package {package} not found"
-        ))
-    }
-
-    pub fn fetch_all_package_versions_with_retry(
-        &self,
-        package: &str,
-    ) -> Result<Vec<SourcedPackageVersions>, String> {
-        let mut responses = Vec::new();
-
-        for source in &self.sources {
-            let result = match source.kind() {
-                RepositoryKind::Rrepo => self.with_authorized_client(source, |client| {
-                    client.fetch_package_versions_with_retry(package)
-                }),
-                RepositoryKind::CranLike => self.fetch_cran_like_package_versions(source, package),
-            };
-
-            match result {
-                Ok(response) => responses.push(SourcedPackageVersions {
-                    repository_url: source.base_url().to_string(),
-                    response,
-                }),
-                Err(error) if is_not_found_error(&error) => {}
-                Err(error) => return Err(error),
-            }
-        }
-
-        if responses.is_empty() {
-            return Err(format!(
-                "unexpected registry response (404 Not Found): package {package} not found"
-            ));
-        }
-
-        Ok(responses)
-    }
-
-    pub fn fetch_description_with_retry(
-        &self,
-        source: &RepositorySource,
-        package: &str,
-        version: &str,
-    ) -> Result<String, String> {
-        match source.kind() {
-            RepositoryKind::Rrepo => self.with_authorized_client(source, |client| {
-                client.fetch_description_with_retry(package, version)
-            }),
-            RepositoryKind::CranLike => Self::fetch_cran_like_description(source, package, version),
-        }
-    }
-
-    pub fn fetch_description_by_url_with_retry(
-        &self,
-        repository_url: &str,
-        package: &str,
-        version: &str,
-    ) -> Result<String, String> {
-        let source = self.source_by_base_url(repository_url)?;
-        self.fetch_description_with_retry(source, package, version)
     }
 
     pub fn download_artifact_with_progress(
@@ -343,31 +234,6 @@ impl RepositorySet {
             .or_else(|| cran_like_source_from_package_url(url).map(RepositorySource::cran_like))
     }
 
-    fn source_by_base_url(&self, url: &str) -> Result<&RepositorySource, String> {
-        let normalized = normalize_repository_url(url);
-        let mut matches = self
-            .sources
-            .iter()
-            .filter(|source| source.base_url() == normalized);
-        let Some(source) = matches.next() else {
-            return Err(format!("repository not configured: {normalized}"));
-        };
-        if matches.next().is_some() {
-            return Err(format!("repository URL is ambiguous: {normalized}"));
-        }
-
-        Ok(source)
-    }
-
-    pub fn cran_archive_unavailable_repositories(&self) -> Vec<String> {
-        self.cran_archive_unavailable
-            .lock()
-            .expect("CRAN-like archive availability should lock")
-            .iter()
-            .cloned()
-            .collect()
-    }
-
     fn fetch_cran_like_repository_packages(
         &self,
         source: &RepositorySource,
@@ -399,140 +265,6 @@ impl RepositorySet {
         })
     }
 
-    fn fetch_cran_like_package_versions(
-        &self,
-        source: &RepositorySource,
-        package: &str,
-    ) -> Result<PackageVersionsResponse, String> {
-        match self.cran_archive_support(source) {
-            Some(CranArchiveSupport::Unavailable) => {
-                self.cran_versions_without_archive(source, package)
-            }
-            Some(CranArchiveSupport::Available) => {
-                self.cran_versions_with_known_archive(source, package)
-            }
-            None => self.cran_versions_with_unknown_archive(source, package),
-        }
-    }
-
-    fn cran_versions_without_archive(
-        &self,
-        source: &RepositorySource,
-        package: &str,
-    ) -> Result<PackageVersionsResponse, String> {
-        let mut by_version = BTreeMap::new();
-
-        for version in self
-            .cran_like_current_index(source)?
-            .remove(package)
-            .unwrap_or_default()
-        {
-            by_version.insert(version.version.clone(), version);
-        }
-
-        package_versions_response(package, by_version)
-    }
-
-    fn cran_versions_with_known_archive(
-        &self,
-        source: &RepositorySource,
-        package: &str,
-    ) -> Result<PackageVersionsResponse, String> {
-        let (index, archive) = std::thread::scope(|scope| {
-            let current = scope.spawn(|| self.cran_like_current_index(source));
-            let archive = scope.spawn(|| fetch_cran_like_archive_versions(source, package));
-            (
-                current
-                    .join()
-                    .expect("current index worker should not panic"),
-                archive.join().expect("archive worker should not panic"),
-            )
-        });
-        let mut by_version = versions_for_package(index?, package);
-
-        match archive {
-            Ok(CranLikePackageArchive::Available(versions)) => {
-                merge_versions(&mut by_version, versions);
-            }
-            Ok(CranLikePackageArchive::Missing) | Err(CranLikeArchiveError::Unavailable) => {}
-            Err(CranLikeArchiveError::Failed(error)) => return Err(error),
-        }
-
-        package_versions_response(package, by_version)
-    }
-
-    fn cran_versions_with_unknown_archive(
-        &self,
-        source: &RepositorySource,
-        package: &str,
-    ) -> Result<PackageVersionsResponse, String> {
-        let (index, root_archive, package_archive) = std::thread::scope(|scope| {
-            let current = scope.spawn(|| self.cran_like_current_index(source));
-            let root_archive = scope.spawn(|| fetch_cran_like_archive_listing_available(source));
-            let package_archive = scope.spawn(|| fetch_cran_like_archive_versions(source, package));
-            (
-                current
-                    .join()
-                    .expect("current index worker should not panic"),
-                root_archive
-                    .join()
-                    .expect("archive support worker should not panic"),
-                package_archive
-                    .join()
-                    .expect("archive package worker should not panic"),
-            )
-        });
-        let mut by_version = versions_for_package(index?, package);
-
-        match (&root_archive, &package_archive) {
-            (_, Ok(CranLikePackageArchive::Available(_))) => {
-                self.record_cran_archive_support(source, CranArchiveSupport::Available);
-            }
-            (Ok(CranLikeArchiveListingSupport::Unavailable), _) => {
-                self.record_cran_archive_support(source, CranArchiveSupport::Unavailable);
-            }
-            (Err(CranLikeArchiveError::Failed(error)), _)
-            | (
-                Ok(CranLikeArchiveListingSupport::Available),
-                Err(CranLikeArchiveError::Failed(error)),
-            ) => return Err(error.clone()),
-            (Ok(CranLikeArchiveListingSupport::Available), _) => {
-                self.record_cran_archive_support(source, CranArchiveSupport::Available);
-            }
-            (
-                Ok(CranLikeArchiveListingSupport::Unknown) | Err(CranLikeArchiveError::Unavailable),
-                _,
-            ) => {}
-        }
-
-        if let Ok(CranLikePackageArchive::Available(versions)) = package_archive {
-            merge_versions(&mut by_version, versions);
-        }
-
-        package_versions_response(package, by_version)
-    }
-
-    fn cran_archive_support(&self, source: &RepositorySource) -> Option<CranArchiveSupport> {
-        self.cran_archive_listing_support
-            .lock()
-            .expect("CRAN-like archive listing support should lock")
-            .get(source.base_url())
-            .copied()
-    }
-
-    fn record_cran_archive_support(&self, source: &RepositorySource, support: CranArchiveSupport) {
-        self.cran_archive_listing_support
-            .lock()
-            .expect("CRAN-like archive listing support should lock")
-            .insert(source.base_url().to_string(), support);
-        if support == CranArchiveSupport::Unavailable {
-            self.cran_archive_unavailable
-                .lock()
-                .expect("CRAN-like archive availability should lock")
-                .insert(source.base_url().to_string());
-        }
-    }
-
     fn cran_like_current_index(
         &self,
         source: &RepositorySource,
@@ -549,24 +281,6 @@ impl RepositorySet {
         let index = fetch_cran_like_current_index(source)?;
         indexes.insert(source.base_url().to_string(), index.clone());
         Ok(index)
-    }
-
-    fn fetch_cran_like_description(
-        source: &RepositorySource,
-        package: &str,
-        version: &str,
-    ) -> Result<String, String> {
-        let path = cran_like_description_cache_path(source, package, version);
-        if let Ok(description) = fs::read_to_string(&path) {
-            if description_declares_package_version(&description, package, version) {
-                return Ok(description);
-            }
-            let _ = fs::remove_file(&path);
-        }
-
-        let description = fetch_description_from_cran_like_tarballs(source, package, version)?;
-        write_text_cache(&path, &description);
-        Ok(description)
     }
 
     fn with_authorized_client<T>(
@@ -597,6 +311,24 @@ impl RepositorySet {
         self.credentials.set(source, &token)?;
         Ok(token)
     }
+}
+
+fn fetch_cran_like_package_description(
+    base_url: &str,
+    package: &str,
+    version: &str,
+) -> Result<String, String> {
+    let path = cran_like_package_description_cache_path(base_url, package, version);
+    if let Ok(description) = fs::read_to_string(&path) {
+        if description_declares_package_version(&description, package, version) {
+            return Ok(description);
+        }
+        let _ = fs::remove_file(&path);
+    }
+
+    let description = fetch_description_from_cran_like_tarballs(base_url, package, version)?;
+    write_text_cache(&path, &description);
+    Ok(description)
 }
 
 impl CredentialStore for KeyringCredentialStore {
@@ -664,6 +396,7 @@ pub fn normalize_repository_url(value: &str) -> String {
     value.trim().trim_end_matches('/').to_string()
 }
 
+#[allow(dead_code)]
 pub(crate) fn fetch_rrepo_package_list(base_url: &str) -> Result<Vec<String>, String> {
     let client = RegistryClient::new(base_url);
     let response = client.fetch_repository_packages()?;
@@ -712,28 +445,70 @@ pub(crate) fn rrepo_source_url(base_url: &str, package: &str, version: &str) -> 
 pub(crate) fn fetch_cran_like_packages_index(
     base_url: &str,
 ) -> Result<CranLikePackagesIndex, String> {
-    let body = fetch_cran_like_packages_index_body(&RepositorySource::cran_like(base_url))?;
-    let records = parse_dcf_records(&body)
+    let body = fetch_cran_like_packages_index_text(base_url)?;
+    let records = BorrowedParser::new(&body)
+        .parse_all()
+        .map_err(|error| format!("failed to parse CRAN-like PACKAGES index: {error}"))?
         .into_iter()
-        .filter_map(|record| {
-            let package = record.get("Package").filter(|value| !value.is_empty())?;
-            let version = record.get("Version").filter(|value| !value.is_empty())?;
-            Some(CranLikePackageRecord {
-                package: package.to_string(),
-                version: version.to_string(),
-            })
-        })
-        .collect();
+        .map(cran_like_package_record_from_paragraph)
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(CranLikePackagesIndex { records })
+}
+
+fn cran_like_package_record_from_paragraph(
+    paragraph: BorrowedParagraph<'_>,
+) -> Result<CranLikePackageRecord, String> {
+    let Some(package) = paragraph
+        .get_single("Package")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Err("CRAN-like PACKAGES record is missing Package".to_string());
+    };
+    let Some(version) = paragraph
+        .get_single("Version")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Err(format!(
+            "CRAN-like PACKAGES record for {package} is missing Version"
+        ));
+    };
+    let version = version
+        .parse::<Version>()
+        .map_err(|error| format!("invalid version for {package}: {error}"))?;
+
+    Ok(CranLikePackageRecord {
+        package: package.to_string(),
+        version,
+        depends: cran_like_relations_from_paragraph(&paragraph, "Depends")?,
+        imports: cran_like_relations_from_paragraph(&paragraph, "Imports")?,
+        linking_to: cran_like_relations_from_paragraph(&paragraph, "LinkingTo")?,
+    })
+}
+
+fn cran_like_relations_from_paragraph(
+    paragraph: &BorrowedParagraph<'_>,
+    field: &str,
+) -> Result<Relations, String> {
+    paragraph.get(field).map_or_else(
+        || Ok(Relations::new()),
+        |lines| {
+            lines
+                .join("\n")
+                .parse::<Relations>()
+                .map_err(|error| format!("failed to parse {field}: {error}"))
+        },
+    )
 }
 
 pub(crate) fn fetch_cran_like_archive_listing(
     base_url: &str,
     package: &str,
 ) -> Result<CranLikeArchiveListing, String> {
-    let source = RepositorySource::cran_like(base_url);
-    let url = format!("{}/src/contrib/Archive/{package}/", source.base_url());
+    let base_url = normalize_repository_url(base_url);
+    let url = format!("{base_url}/src/contrib/Archive/{package}/");
     let response = reqwest::blocking::get(&url)
         .map_err(|error| format!("failed to contact CRAN-like archive: {error}"))?;
     let status = response.status();
@@ -769,8 +544,7 @@ pub(crate) fn fetch_cran_like_description(
     package: &str,
     version: &str,
 ) -> Result<Option<String>, String> {
-    let source = RepositorySource::cran_like(base_url);
-    match RepositorySet::fetch_cran_like_description(&source, package, version) {
+    match fetch_cran_like_package_description(base_url, package, version) {
         Ok(description) => Ok(Some(description)),
         Err(error) if is_not_found_or_wrong_version(&error) => Ok(None),
         Err(error) => Err(error),
@@ -796,23 +570,19 @@ pub fn cran_like_source_from_package_url(url: &str) -> Option<String> {
 fn fetch_cran_like_current_index(
     source: &RepositorySource,
 ) -> Result<BTreeMap<String, Vec<VersionSummary>>, String> {
-    let body = fetch_cran_like_packages_index_body(source)?;
     let mut index: BTreeMap<String, Vec<VersionSummary>> = BTreeMap::new();
 
-    for record in parse_dcf_records(&body) {
-        let Some(package) = record.get("Package").filter(|value| !value.is_empty()) else {
-            continue;
-        };
-        let Some(version) = record.get("Version").filter(|value| !value.is_empty()) else {
-            continue;
-        };
-
+    for record in fetch_cran_like_packages_index(source.base_url())?.records {
         index
-            .entry(package.to_string())
+            .entry(record.package.clone())
             .or_default()
             .push(VersionSummary {
-                version: version.to_string(),
-                source_url: cran_like_current_tarball_url(source, package, version),
+                version: record.version.to_string(),
+                source_url: cran_like_package_tarball_url(
+                    source.base_url(),
+                    &record.package,
+                    &record.version.to_string(),
+                ),
             });
     }
 
@@ -823,13 +593,13 @@ fn fetch_cran_like_current_index(
     Ok(index)
 }
 
-fn fetch_cran_like_packages_index_body(source: &RepositorySource) -> Result<String, String> {
-    fetch_cran_like_packages_gz_index(source)
-        .or_else(|_| fetch_cran_like_packages_plain_index(source))
+fn fetch_cran_like_packages_index_text(base_url: &str) -> Result<String, String> {
+    fetch_cran_like_packages_gz_text(base_url).or_else(|_| fetch_cran_like_packages_text(base_url))
 }
 
-fn fetch_cran_like_packages_gz_index(source: &RepositorySource) -> Result<String, String> {
-    let url = format!("{}/src/contrib/PACKAGES.gz", source.base_url());
+fn fetch_cran_like_packages_gz_text(base_url: &str) -> Result<String, String> {
+    let base_url = normalize_repository_url(base_url);
+    let url = format!("{base_url}/src/contrib/PACKAGES.gz");
     let response = reqwest::blocking::get(&url)
         .map_err(|error| format!("failed to contact CRAN-like repository: {error}"))?;
     let status = response.status();
@@ -848,8 +618,9 @@ fn fetch_cran_like_packages_gz_index(source: &RepositorySource) -> Result<String
     Ok(body)
 }
 
-fn fetch_cran_like_packages_plain_index(source: &RepositorySource) -> Result<String, String> {
-    let url = format!("{}/src/contrib/PACKAGES", source.base_url());
+fn fetch_cran_like_packages_text(base_url: &str) -> Result<String, String> {
+    let base_url = normalize_repository_url(base_url);
+    let url = format!("{base_url}/src/contrib/PACKAGES");
     let body = reqwest::blocking::get(&url)
         .map_err(|error| format!("failed to contact CRAN-like repository: {error}"))?;
     let status = body.status();
@@ -863,7 +634,6 @@ fn fetch_cran_like_packages_plain_index(source: &RepositorySource) -> Result<Str
 
 #[derive(Debug)]
 enum CranLikeArchiveError {
-    Unavailable,
     Failed(String),
 }
 
@@ -880,16 +650,11 @@ pub(crate) enum CranArchiveSupport {
     Unavailable,
 }
 
-#[derive(Debug)]
-enum CranLikePackageArchive {
-    Available(Vec<VersionSummary>),
-    Missing,
-}
-
-fn fetch_cran_like_archive_listing_available(
-    source: &RepositorySource,
+fn detect_cran_like_archive_listing(
+    base_url: &str,
 ) -> Result<CranLikeArchiveListingSupport, CranLikeArchiveError> {
-    let url = format!("{}/src/contrib/Archive/", source.base_url());
+    let base_url = normalize_repository_url(base_url);
+    let url = format!("{base_url}/src/contrib/Archive/");
     let Ok(response) = reqwest::blocking::get(&url) else {
         return Ok(CranLikeArchiveListingSupport::Unknown);
     };
@@ -910,129 +675,41 @@ fn fetch_cran_like_archive_listing_available(
 pub(crate) fn detect_cran_like_archive_support(
     source: &RepositorySource,
 ) -> Result<Option<CranArchiveSupport>, String> {
-    match fetch_cran_like_archive_listing_available(source) {
+    match detect_cran_like_archive_listing(source.base_url()) {
         Ok(CranLikeArchiveListingSupport::Available) => Ok(Some(CranArchiveSupport::Available)),
-        Ok(CranLikeArchiveListingSupport::Unavailable) => Ok(Some(CranArchiveSupport::Unavailable)),
-        Ok(CranLikeArchiveListingSupport::Unknown) | Err(CranLikeArchiveError::Unavailable) => {
-            Ok(None)
-        }
+        Ok(CranLikeArchiveListingSupport::Unknown)
+        | Ok(CranLikeArchiveListingSupport::Unavailable) => Ok(None),
         Err(CranLikeArchiveError::Failed(error)) => Err(error),
     }
-}
-
-fn fetch_cran_like_archive_versions(
-    source: &RepositorySource,
-    package: &str,
-) -> Result<CranLikePackageArchive, CranLikeArchiveError> {
-    let url = format!("{}/src/contrib/Archive/{package}/", source.base_url());
-    let response = reqwest::blocking::get(&url).map_err(|_| CranLikeArchiveError::Unavailable)?;
-    let status = response.status();
-    if status == reqwest::StatusCode::NOT_FOUND {
-        return Ok(CranLikePackageArchive::Missing);
-    }
-    if status == reqwest::StatusCode::FORBIDDEN {
-        return Err(CranLikeArchiveError::Unavailable);
-    }
-    if !status.is_success() {
-        return Err(CranLikeArchiveError::Failed(unexpected_cran_like_response(
-            response,
-        )));
-    }
-
-    let body = response.text().map_err(|error| {
-        CranLikeArchiveError::Failed(format!("failed to read CRAN-like archive listing: {error}"))
-    })?;
-    let mut versions = tarball_file_names_from_listing(&body)
-        .into_iter()
-        .filter_map(|file_name| {
-            parse_cran_tarball_file_name(&file_name).and_then(|(name, version)| {
-                (name == package).then(|| VersionSummary {
-                    version: version.to_string(),
-                    source_url: cran_like_archive_tarball_url(source, package, version),
-                })
-            })
-        })
-        .collect::<Vec<_>>();
-    sort_version_summaries(&mut versions);
-    Ok(CranLikePackageArchive::Available(versions))
 }
 
 fn sort_version_summaries(versions: &mut [VersionSummary]) {
     versions.sort_by(|left, right| compare_r_versions(&left.version, &right.version));
 }
 
-fn versions_for_package(
-    mut index: BTreeMap<String, Vec<VersionSummary>>,
-    package: &str,
-) -> BTreeMap<String, VersionSummary> {
-    index
-        .remove(package)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|version| (version.version.clone(), version))
-        .collect()
+fn cran_like_package_tarball_url(base_url: &str, package: &str, version: &str) -> String {
+    let base_url = normalize_repository_url(base_url);
+    format!("{base_url}/src/contrib/{package}_{version}.tar.gz")
 }
 
-fn merge_versions(
-    by_version: &mut BTreeMap<String, VersionSummary>,
-    versions: Vec<VersionSummary>,
-) {
-    for version in versions {
-        by_version.entry(version.version.clone()).or_insert(version);
-    }
+fn cran_like_archived_package_tarball_url(base_url: &str, package: &str, version: &str) -> String {
+    let base_url = normalize_repository_url(base_url);
+    format!("{base_url}/src/contrib/Archive/{package}/{package}_{version}.tar.gz")
 }
 
-fn package_versions_response(
-    package: &str,
-    by_version: BTreeMap<String, VersionSummary>,
-) -> Result<PackageVersionsResponse, String> {
-    if by_version.is_empty() {
-        return Err(missing_package_error(package));
-    }
-
-    let mut versions = by_version.into_values().collect::<Vec<_>>();
-    sort_version_summaries(&mut versions);
-
-    Ok(PackageVersionsResponse {
-        package: package.to_string(),
-        versions,
-    })
-}
-
-fn cran_like_current_tarball_url(
-    source: &RepositorySource,
-    package: &str,
-    version: &str,
-) -> String {
-    format!(
-        "{}/src/contrib/{package}_{version}.tar.gz",
-        source.base_url()
-    )
-}
-
-fn cran_like_archive_tarball_url(
-    source: &RepositorySource,
-    package: &str,
-    version: &str,
-) -> String {
-    format!(
-        "{}/src/contrib/Archive/{package}/{package}_{version}.tar.gz",
-        source.base_url()
-    )
-}
-
-fn cran_like_current_description_url(source: &RepositorySource, package: &str) -> String {
-    format!("{}/web/packages/{package}/DESCRIPTION", source.base_url())
+fn cran_like_package_description_url(base_url: &str, package: &str) -> String {
+    let base_url = normalize_repository_url(base_url);
+    format!("{base_url}/web/packages/{package}/DESCRIPTION")
 }
 
 fn fetch_description_from_cran_like_tarballs(
-    source: &RepositorySource,
+    base_url: &str,
     package: &str,
     version: &str,
 ) -> Result<String, String> {
-    let current_url = cran_like_current_tarball_url(source, package, version);
-    let archive_url = cran_like_archive_tarball_url(source, package, version);
-    let direct_url = cran_like_current_description_url(source, package);
+    let current_url = cran_like_package_tarball_url(base_url, package, version);
+    let archive_url = cran_like_archived_package_tarball_url(base_url, package, version);
+    let direct_url = cran_like_package_description_url(base_url, package);
     let candidates = [
         DescriptionCandidate::direct(direct_url, package, version),
         DescriptionCandidate::tarball(current_url, package, version),
@@ -1333,14 +1010,14 @@ fn description_declares_package_version(description: &str, package: &str, versio
         && record.get("Version").is_some_and(|value| value == version)
 }
 
-fn cran_like_description_cache_path(
-    source: &RepositorySource,
+fn cran_like_package_description_cache_path(
+    base_url: &str,
     package: &str,
     version: &str,
 ) -> PathBuf {
     cache_dir_path()
         .join("cran-like")
-        .join(hash_string(source.base_url()))
+        .join(hash_string(&normalize_repository_url(base_url)))
         .join("descriptions")
         .join(package)
         .join(format!("{version}.dcf"))
@@ -1375,10 +1052,6 @@ async fn unexpected_cran_like_response_async(response: reqwest::Response) -> Str
     }
 
     format!("unexpected registry response ({status}): {body}")
-}
-
-fn missing_package_error(package: &str) -> String {
-    format!("unexpected registry response (404 Not Found): package {package} not found")
 }
 
 fn keyring_entry(source: &RepositorySource) -> Result<Entry, String> {
@@ -1756,7 +1429,7 @@ Version: 1.1.6
     fn treats_archive_listing_transport_failure_as_unknown_support() {
         let source = RepositorySource::cran_like("http://127.0.0.1:9");
 
-        let result = fetch_cran_like_archive_listing_available(&source)
+        let result = detect_cran_like_archive_listing(source.base_url())
             .expect("transport failures should not be hard archive probe errors");
 
         assert_eq!(result, CranLikeArchiveListingSupport::Unknown);
@@ -1781,7 +1454,7 @@ Version: 1.1.6
             .create();
         let source = RepositorySource::cran_like(server.url());
         write_text_cache(
-            &cran_like_description_cache_path(&source, "digest", "0.6.38"),
+            &cran_like_package_description_cache_path(source.base_url(), "digest", "0.6.38"),
             "",
         );
         let repositories = RepositorySet::with_support(
