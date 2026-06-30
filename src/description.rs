@@ -10,8 +10,6 @@ use std::{
 use thiserror::Error;
 
 use crate::project::{ProjectPathError, description_path, new_project_description_path};
-use crate::registry::ResolutionRoot;
-
 const DESCRIPTION_FIELD_ORDER: &[&str] = &[
     "Package",
     "Version",
@@ -415,18 +413,6 @@ fn parse_constraint(constraint: &str) -> Result<(VersionConstraint, &str), Strin
     Err(format!("invalid dependency constraint: {constraint}"))
 }
 
-pub fn resolution_root_from_relation(relation: &DescriptionDependency) -> ResolutionRoot {
-    let constraint = relation.version.as_ref().map_or_else(
-        || "*".to_string(),
-        |(operator, version)| format!("{} {version}", relation_operator(operator)),
-    );
-
-    ResolutionRoot {
-        name: relation.name.clone(),
-        constraint,
-    }
-}
-
 fn relation_operator(operator: &VersionConstraint) -> &'static str {
     match operator {
         VersionConstraint::LessThan => "<",
@@ -512,10 +498,9 @@ fn title_from_package_name(package_name: &str) -> String {
 mod tests {
     use super::{
         DescriptionDependency, RDescription, format_description_for_write, parse_constraint,
-        relation_with_constraint, resolution_root_from_relation, sanitize_package_name,
-        split_repository_entries, title_from_package_name,
+        relation_with_constraint, sanitize_package_name, split_repository_entries,
+        title_from_package_name,
     };
-    use crate::registry::ResolutionRoot;
     use r_description::VersionConstraint;
     use std::str::FromStr;
 
@@ -687,17 +672,18 @@ mod tests {
             description
                 .imports
                 .iter()
-                .map(resolution_root_from_relation)
+                .map(crate::resolver::PackageDependency::from_relation)
+                .map(|dependency| {
+                    (
+                        dependency.package().to_string(),
+                        dependency.min_version().map(ToString::to_string),
+                        dependency.max_version_exclusive().map(ToString::to_string),
+                    )
+                })
                 .collect::<Vec<_>>(),
             vec![
-                ResolutionRoot {
-                    name: "AzureAuth".to_string(),
-                    constraint: "< 2.0.0".to_string(),
-                },
-                ResolutionRoot {
-                    name: "httr2".to_string(),
-                    constraint: "> 1.0.0".to_string(),
-                },
+                ("AzureAuth".to_string(), None, Some("2.0.0".to_string())),
+                ("httr2".to_string(), Some("1.0.0".to_string()), None),
             ]
         );
     }

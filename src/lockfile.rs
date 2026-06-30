@@ -1,4 +1,7 @@
-use crate::project::{LOCKFILE_NAME, lockfile_path_result};
+use crate::{
+    project::{LOCKFILE_NAME, lockfile_path_result},
+    resolver::PackageDependency,
+};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs};
 
@@ -63,7 +66,20 @@ pub struct LockedSystemRequirements {
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LockedRoot {
     pub package: String,
-    pub constraint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_version_exclusive: Option<String>,
+}
+
+impl LockedRoot {
+    pub(crate) fn new(dependency: &PackageDependency) -> Self {
+        Self {
+            package: dependency.package().to_string(),
+            min_version: dependency.min_version().map(ToString::to_string),
+            max_version_exclusive: dependency.max_version_exclusive().map(ToString::to_string),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -78,6 +94,24 @@ pub struct LockedPackage {
     pub dependencies: Vec<LockedDependency>,
 }
 
+impl LockedPackage {
+    pub(crate) fn repository(
+        package: impl Into<String>,
+        version: impl Into<String>,
+        source_url: impl Into<String>,
+        dependencies: Vec<LockedDependency>,
+    ) -> Self {
+        let package = package.into();
+        Self {
+            package,
+            version: version.into(),
+            source: Some("repository".to_string()),
+            source_url: Some(source_url.into()),
+            dependencies,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LockedDependency {
     pub package: String,
@@ -86,6 +120,22 @@ pub struct LockedDependency {
     pub min_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_version_exclusive: Option<String>,
+}
+
+impl LockedDependency {
+    pub(crate) fn new(
+        package: impl Into<String>,
+        kind: impl Into<String>,
+        min_version: Option<String>,
+        max_version_exclusive: Option<String>,
+    ) -> Self {
+        Self {
+            package: package.into(),
+            kind: kind.into(),
+            min_version,
+            max_version_exclusive,
+        }
+    }
 }
 
 pub fn read_lockfile() -> Result<Lockfile, String> {
@@ -140,7 +190,8 @@ mod tests {
             },
             roots: vec![LockedRoot {
                 package: "digest".to_string(),
-                constraint: "*".to_string(),
+                min_version: None,
+                max_version_exclusive: None,
             }],
             packages: BTreeMap::from([(
                 "digest".to_string(),

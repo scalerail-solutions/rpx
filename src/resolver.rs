@@ -84,6 +84,8 @@ pub(crate) enum PackageRepositoryKind {
 #[derive(Debug, Clone)]
 pub(crate) struct PackageDependency {
     package: String,
+    min_version: Option<Version>,
+    max_version_exclusive: Option<Version>,
     range: Ranges<Version>,
 }
 
@@ -91,6 +93,8 @@ impl PackageDependency {
     pub(crate) fn from_relation(relation: &DescriptionDependency) -> Self {
         Self {
             package: relation.name.clone(),
+            min_version: dependency_min_version(relation.version.as_ref()),
+            max_version_exclusive: dependency_max_version_exclusive(relation.version.as_ref()),
             range: r_description_range_from_relation(relation),
         }
     }
@@ -99,9 +103,23 @@ impl PackageDependency {
         &self.package
     }
 
+    pub(crate) fn min_version(&self) -> Option<&Version> {
+        self.min_version.as_ref()
+    }
+
+    pub(crate) fn max_version_exclusive(&self) -> Option<&Version> {
+        self.max_version_exclusive.as_ref()
+    }
+
+    pub(crate) fn range(&self) -> Ranges<Version> {
+        self.range.clone()
+    }
+
     pub(crate) fn any(package: impl Into<String>) -> Self {
         Self {
             package: package.into(),
+            min_version: None,
+            max_version_exclusive: None,
             range: Ranges::full(),
         }
     }
@@ -569,7 +587,31 @@ fn package_dependency_from_relation(relation: &DescriptionDependency) -> Package
 fn package_dependency_from_lossy_relation(relation: &lossy::Relation) -> PackageDependency {
     PackageDependency {
         package: relation.name.clone(),
+        min_version: dependency_min_version(relation.version.as_ref()),
+        max_version_exclusive: dependency_max_version_exclusive(relation.version.as_ref()),
         range: r_description_range_from_lossy_relation(relation),
+    }
+}
+
+fn dependency_min_version(version: Option<&(VersionConstraint, Version)>) -> Option<Version> {
+    let (operator, version) = version?;
+    match operator {
+        VersionConstraint::GreaterThan
+        | VersionConstraint::GreaterThanEqual
+        | VersionConstraint::Equal => Some(version.clone()),
+        VersionConstraint::LessThan | VersionConstraint::LessThanEqual => None,
+    }
+}
+
+fn dependency_max_version_exclusive(
+    version: Option<&(VersionConstraint, Version)>,
+) -> Option<Version> {
+    let (operator, version) = version?;
+    match operator {
+        VersionConstraint::LessThan | VersionConstraint::LessThanEqual => Some(version.clone()),
+        VersionConstraint::GreaterThan
+        | VersionConstraint::GreaterThanEqual
+        | VersionConstraint::Equal => None,
     }
 }
 
@@ -765,9 +807,9 @@ impl DependencyProvider for RDependencyProvider {
                 .filter(|dependency| !is_base_package(&dependency.package))
                 .map(|dependency| {
                     (
-                        dependency.package,
+                        dependency.package().to_string(),
                         RepositoryVersionRange {
-                            range: dependency.range,
+                            range: dependency.range(),
                         },
                     )
                 })
