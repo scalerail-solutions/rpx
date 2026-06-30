@@ -1,5 +1,6 @@
 use clap::Parser;
 use miette::Diagnostic;
+use r_description::Version;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     env, fs,
@@ -56,8 +57,8 @@ use repository::{
     repository_source_from_package_url,
 };
 use resolver::{
-    PackageDependency, PackageRepository, ResolvedPackage, RrepoPackageRepository, is_base_package,
-    resolve_from_registry,
+    CranLikePackageRepository, PackageDependency, PackageRepository, PackageRepositoryKind,
+    ResolvedPackage, RrepoPackageRepository, is_base_package, resolve_from_registry,
 };
 use sysreqs::{
     SystemDependencyPlan, cached_latest_snapshot, current_host_platform,
@@ -455,23 +456,21 @@ fn cmd_add(
                 .packages
                 .iter()
                 .filter(|(name, _)| !requested_packages.contains_key(name.as_str()))
-                .map(|(name, package)| (name.clone(), package.version.clone()))
-                .collect(),
+                .map(|(name, package)| {
+                    preferred_version_from_locked_package(name, &package.version)
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()
+                .map_err(|details| LockError::ResolveFailed { details })?,
             None => BTreeMap::new(),
         };
         let roots = add_resolution_roots(&description, &requested_packages);
-        let resolved = resolve_from_registry(
-            rrepo_package_repositories(&repositories),
-            roots,
-            &preferred_versions,
-        )
-        .map_err(|error| LockError::ResolveFailed {
-            details: format!(
-                "could not resolve a compatible dependency set for {}: {error}",
-                new_packages.join(", ")
-            ),
-        })?;
-        warn_cran_archive_unavailable(&repositories);
+        let resolved = resolve_from_registry(repositories.clone(), roots, preferred_versions)
+            .map_err(|error| LockError::ResolveFailed {
+                details: format!(
+                    "could not resolve a compatible dependency set for {}: {error}",
+                    new_packages.join(", ")
+                ),
+            })?;
         let constraints = constraints_from_resolved_roots(&new_packages, &resolved)
             .map_err(|details| LockError::ResolveFailed { details })?;
 
@@ -515,7 +514,7 @@ fn cmd_add(
                 .collect(),
             &resolved,
             &sysreq_db,
-            repositories.sources(),
+            &repositories,
             None,
         ));
     }
@@ -1000,7 +999,7 @@ impl DefaultRepositoryPreference {
         self,
         description: &description::RDescription,
         lockfile: Option<&Lockfile>,
-    ) -> Result<RepositorySet, LockError> {
+    ) -> Result<Vec<Rc<dyn PackageRepository>>, LockError> {
         let default_url = default_registry_base_url();
         let use_default_repository = match self {
             Self::Enabled => true,
@@ -1035,7 +1034,20 @@ impl DefaultRepositoryPreference {
                 }
             })?);
         }
-        Ok(RepositorySet::new(sources))
+        Ok(sources
+            .into_iter()
+            .map(package_repository_from_source)
+            .collect())
+    }
+}
+
+fn package_repository_from_source(source: RepositorySource) -> Rc<dyn PackageRepository> {
+    match source.kind() {
+        RepositoryKind::Rrepo => Rc::new(RrepoPackageRepository::new(source.base_url())),
+        RepositoryKind::CranLike => Rc::new(CranLikePackageRepository::new(
+            source.base_url(),
+            source.cran_archive_support(),
+        )),
     }
 }
 
@@ -1222,16 +1234,9 @@ fn lock_from_description(
 ) -> RpxResult<LockOutcome> {
     let description = read_description()?;
     let roots = description
-        .imports
-        .iter()
-        .chain(
-            description
-                .depends
-                .iter()
-                .filter(|relation| relation.name != "R"),
-        )
-        .filter(|relation| !is_base_package(&relation.name))
-        .map(PackageDependency::from_relation)
+        .dependencies()
+        .into_iter()
+        .filter(|dependency| !is_base_package(dependency.package()))
         .collect::<Vec<_>>();
     let existing_lockfile = read_project_lockfile_optional()?;
     let repositories =
@@ -1247,30 +1252,39 @@ fn lock_from_description(
         Some(lockfile) => lockfile
             .packages
             .iter()
-            .map(|(name, package)| (name.clone(), package.version.clone()))
-            .collect(),
+            .map(|(name, package)| preferred_version_from_locked_package(name, &package.version))
+            .collect::<Result<BTreeMap<_, _>, _>>()
+            .map_err(|details| LockError::ResolveFailed { details })?,
         None => BTreeMap::new(),
     };
-    let resolved = resolve_from_registry(
-        rrepo_package_repositories(&repositories),
-        roots,
-        &preferred_versions,
-    )
-    .map_err(|details| LockError::ResolveFailed {
-        details: details.to_string(),
-    })?;
-    warn_cran_archive_unavailable(&repositories);
+    let resolved = resolve_from_registry(repositories.clone(), roots, preferred_versions).map_err(
+        |details| LockError::ResolveFailed {
+            details: details.to_string(),
+        },
+    )?;
 
     let lockfile = lockfile_from_resolution(
         lock_roots(&description),
         &resolved,
         &sysreq_db,
-        repositories.sources(),
+        &repositories,
         None,
     );
     let changed = existing_lockfile.as_ref() != Some(&lockfile);
     write_project_lockfile(&lockfile)?;
     Ok(LockOutcome { changed })
+}
+
+fn preferred_version_from_locked_package(
+    name: &str,
+    version: &str,
+) -> Result<(String, Version), String> {
+    Ok((
+        name.to_string(),
+        version
+            .parse::<Version>()
+            .map_err(|error| format!("invalid version {version}: {error}"))?,
+    ))
 }
 
 fn load_sysreq_snapshot_for_lock(
@@ -1510,7 +1524,7 @@ fn lockfile_from_resolution(
     roots: Vec<ResolutionRoot>,
     resolved: &[ResolvedPackage],
     sysreq_db: &sysreqs::SysreqDbSnapshot,
-    repositories: &[RepositorySource],
+    repositories: &[Rc<dyn PackageRepository>],
     r_version: Option<&str>,
 ) -> Lockfile {
     let required_base_packages = locked_base_packages(&roots, resolved);
@@ -1558,34 +1572,24 @@ fn lockfile_from_resolution(
     }
 }
 
-fn locked_repositories(repositories: &[RepositorySource]) -> Vec<LockedRepository> {
+fn locked_repositories(repositories: &[Rc<dyn PackageRepository>]) -> Vec<LockedRepository> {
     repositories
         .iter()
-        .map(|source| LockedRepository {
-            url: source.base_url().to_string(),
-            kind: locked_repository_kind(source.kind()),
-            cran_archive_support: source
+        .map(|repository| LockedRepository {
+            url: repository.base_url().to_string(),
+            kind: locked_repository_kind(repository.kind()),
+            cran_archive_support: repository
                 .cran_archive_support()
                 .map(locked_cran_archive_support),
         })
         .collect()
 }
 
-fn locked_repository_kind(kind: RepositoryKind) -> LockedRepositoryKind {
+fn locked_repository_kind(kind: PackageRepositoryKind) -> LockedRepositoryKind {
     match kind {
-        RepositoryKind::Rrepo => LockedRepositoryKind::Rrepo,
-        RepositoryKind::CranLike => LockedRepositoryKind::CranLike,
+        PackageRepositoryKind::Rrepo => LockedRepositoryKind::Rrepo,
+        PackageRepositoryKind::CranLike => LockedRepositoryKind::CranLike,
     }
-}
-
-fn rrepo_package_repositories(repositories: &RepositorySet) -> Vec<Rc<dyn PackageRepository>> {
-    repositories
-        .sources()
-        .iter()
-        .map(|source| {
-            Rc::new(RrepoPackageRepository::new(source.base_url())) as Rc<dyn PackageRepository>
-        })
-        .collect()
 }
 
 fn locked_cran_archive_support(support: CranArchiveSupport) -> LockedCranArchiveSupport {

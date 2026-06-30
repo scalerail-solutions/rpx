@@ -3,19 +3,25 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
+    io::Read,
+    path::Path,
     rc::Rc,
     str::FromStr,
 };
 
+use flate2::read::GzDecoder;
 use pubgrub::{
     Dependencies, DependencyConstraints, DependencyProvider, PackageResolutionStatistics, Ranges,
     VersionSet, resolve,
 };
 use r_description::{Version, VersionConstraint};
+use tar::Archive;
 
 use crate::{
     description::{DescriptionDependency, RDescription},
     registry::{RegistryClient, is_not_found_error as is_registry_not_found_error},
+    repository::{CranArchiveSupport, normalize_repository_url},
+    ui::ResolutionUi,
 };
 
 const ROOT_PACKAGE: &str = "__rpx_root__";
@@ -77,6 +83,12 @@ impl From<String> for ResolverError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PackageRepositoryKind {
+    Rrepo,
+    CranLike,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PackageDependency {
     package: String,
@@ -91,17 +103,16 @@ impl PackageDependency {
         }
     }
 
+    pub(crate) fn package(&self) -> &str {
+        &self.package
+    }
+
     pub(crate) fn any(package: impl Into<String>) -> Self {
         Self {
             package: package.into(),
             range: Ranges::full(),
         }
     }
-}
-
-#[derive(Debug, Clone)]
-struct PackageDescription {
-    dependencies: Vec<PackageDependency>,
 }
 
 #[derive(Debug, Clone)]
@@ -190,6 +201,12 @@ impl VersionSet for RepositoryVersionRange {
 pub(crate) trait PackageRepository: std::fmt::Debug {
     fn base_url(&self) -> &str;
 
+    fn kind(&self) -> PackageRepositoryKind;
+
+    fn cran_archive_support(&self) -> Option<CranArchiveSupport> {
+        None
+    }
+
     fn package_list(&self) -> Result<Vec<String>, ResolverError>;
 
     fn package_versions(&self, package: &str) -> Result<Vec<Version>, ResolverError>;
@@ -198,7 +215,7 @@ pub(crate) trait PackageRepository: std::fmt::Debug {
         &self,
         package: &str,
         version: &Version,
-    ) -> Result<Option<PackageDescription>, ResolverError>;
+    ) -> Result<Option<Vec<PackageDependency>>, ResolverError>;
 
     fn resolved_package(
         &self,
@@ -215,6 +232,10 @@ impl PackageRepository for NoopPackageRepository {
         ""
     }
 
+    fn kind(&self) -> PackageRepositoryKind {
+        PackageRepositoryKind::Rrepo
+    }
+
     fn package_list(&self) -> Result<Vec<String>, ResolverError> {
         Ok(Vec::new())
     }
@@ -227,7 +248,7 @@ impl PackageRepository for NoopPackageRepository {
         &self,
         _package: &str,
         _version: &Version,
-    ) -> Result<Option<PackageDescription>, ResolverError> {
+    ) -> Result<Option<Vec<PackageDependency>>, ResolverError> {
         Ok(None)
     }
 
@@ -256,6 +277,10 @@ impl RrepoPackageRepository {
 impl PackageRepository for RrepoPackageRepository {
     fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    fn kind(&self) -> PackageRepositoryKind {
+        PackageRepositoryKind::Rrepo
     }
 
     fn package_list(&self) -> Result<Vec<String>, ResolverError> {
@@ -288,7 +313,7 @@ impl PackageRepository for RrepoPackageRepository {
         &self,
         package: &str,
         version: &Version,
-    ) -> Result<Option<PackageDescription>, ResolverError> {
+    ) -> Result<Option<Vec<PackageDependency>>, ResolverError> {
         let client = RegistryClient::new(&self.base_url);
         let version = version.to_string();
         let description = match client.fetch_description_with_retry(package, &version) {
@@ -297,7 +322,7 @@ impl PackageRepository for RrepoPackageRepository {
             Err(error) => return Err(ResolverError(error)),
         };
         let description = RDescription::from_str(&description).map_err(ResolverError)?;
-        Ok(Some(package_description_from_r_description(&description)?))
+        Ok(Some(description.dependencies()))
     }
 
     fn resolved_package(
@@ -327,23 +352,512 @@ impl PackageRepository for RrepoPackageRepository {
     }
 }
 
-fn package_description_from_r_description(
-    description: &RDescription,
-) -> Result<PackageDescription, ResolverError> {
-    let mut dependencies = Vec::new();
+#[derive(Debug)]
+pub(crate) struct CranLikePackageRepository {
+    base_url: String,
+    archive_support: Option<CranArchiveSupport>,
+}
 
-    dependencies.extend(package_dependencies_from_relations(&description.depends)?);
-    dependencies.extend(package_dependencies_from_relations(&description.imports)?);
-    dependencies.extend(package_dependencies_from_relations(
-        &description.linking_to,
-    )?);
+impl CranLikePackageRepository {
+    pub(crate) fn new(
+        base_url: impl AsRef<str>,
+        archive_support: Option<CranArchiveSupport>,
+    ) -> Self {
+        Self {
+            base_url: normalize_repository_url(base_url.as_ref()),
+            archive_support,
+        }
+    }
+}
 
-    Ok(PackageDescription { dependencies })
+impl PackageRepository for CranLikePackageRepository {
+    fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    fn kind(&self) -> PackageRepositoryKind {
+        PackageRepositoryKind::CranLike
+    }
+
+    fn cran_archive_support(&self) -> Option<CranArchiveSupport> {
+        self.archive_support
+    }
+
+    fn package_list(&self) -> Result<Vec<String>, ResolverError> {
+        Ok(cran_like_current_index(self)?
+            .into_keys()
+            .collect::<Vec<_>>())
+    }
+
+    fn package_versions(&self, package: &str) -> Result<Vec<Version>, ResolverError> {
+        let mut versions = cran_like_current_index(self)?
+            .remove(package)
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+
+        if self.archive_support != Some(CranArchiveSupport::Unavailable) {
+            versions.extend(cran_like_archive_versions(self, package)?);
+        }
+
+        Ok(versions.into_iter().collect())
+    }
+
+    fn package_description(
+        &self,
+        package: &str,
+        version: &Version,
+    ) -> Result<Option<Vec<PackageDependency>>, ResolverError> {
+        let version = version.to_string();
+        let Some(description) = cran_like_description(self, package, &version)? else {
+            return Ok(None);
+        };
+        let description = RDescription::from_str(&description).map_err(ResolverError)?;
+        Ok(Some(description.dependencies()))
+    }
+
+    fn resolved_package(
+        &self,
+        package: &str,
+        version: &Version,
+    ) -> Result<Option<ResolvedPackage>, ResolverError> {
+        let version = version.to_string();
+        let Some(description) = cran_like_description(self, package, &version)? else {
+            return Ok(None);
+        };
+        let description = RDescription::from_str(&description).map_err(ResolverError)?;
+
+        Ok(Some(ResolvedPackage {
+            name: package.to_string(),
+            version: version.clone(),
+            source_url: cran_like_source_url(self, package, &version)?,
+            dependencies: resolved_dependencies_from_r_description(&description),
+            system_requirements: description.system_requirements,
+        }))
+    }
+}
+
+fn cran_like_current_index(
+    repository: &CranLikePackageRepository,
+) -> Result<BTreeMap<String, Vec<Version>>, ResolverError> {
+    let body = cran_like_packages_index(repository)?;
+    let mut index = BTreeMap::<String, Vec<Version>>::new();
+
+    for record in parse_dcf_records(&body) {
+        let Some(package) = record.get("Package").filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        let Some(version) = record.get("Version").filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        let version = version
+            .parse::<Version>()
+            .map_err(|error| ResolverError(format!("invalid version {version}: {error}")))?;
+        index.entry(package.to_string()).or_default().push(version);
+    }
+
+    for versions in index.values_mut() {
+        versions.sort();
+        versions.dedup();
+    }
+
+    Ok(index)
+}
+
+fn cran_like_packages_index(
+    repository: &CranLikePackageRepository,
+) -> Result<String, ResolverError> {
+    cran_like_packages_gz_index(repository).or_else(|_| cran_like_packages_plain_index(repository))
+}
+
+fn cran_like_packages_gz_index(
+    repository: &CranLikePackageRepository,
+) -> Result<String, ResolverError> {
+    let url = format!("{}/src/contrib/PACKAGES.gz", repository.base_url());
+    let response = reqwest::blocking::get(&url).map_err(|error| {
+        ResolverError(format!("failed to contact CRAN-like repository: {error}"))
+    })?;
+    if !response.status().is_success() {
+        return Err(ResolverError(unexpected_cran_like_response(response)));
+    }
+
+    let bytes = response.bytes().map_err(|error| {
+        ResolverError(format!(
+            "failed to read CRAN-like PACKAGES.gz index: {error}"
+        ))
+    })?;
+    let mut decoder = GzDecoder::new(bytes.as_ref());
+    let mut body = String::new();
+    decoder.read_to_string(&mut body).map_err(|error| {
+        ResolverError(format!(
+            "failed to decompress CRAN-like PACKAGES.gz index: {error}"
+        ))
+    })?;
+    Ok(body)
+}
+
+fn cran_like_packages_plain_index(
+    repository: &CranLikePackageRepository,
+) -> Result<String, ResolverError> {
+    let url = format!("{}/src/contrib/PACKAGES", repository.base_url());
+    let response = reqwest::blocking::get(&url).map_err(|error| {
+        ResolverError(format!("failed to contact CRAN-like repository: {error}"))
+    })?;
+    if !response.status().is_success() {
+        return Err(ResolverError(unexpected_cran_like_response(response)));
+    }
+
+    response
+        .text()
+        .map_err(|error| ResolverError(format!("failed to read CRAN-like PACKAGES index: {error}")))
+}
+
+fn cran_like_archive_versions(
+    repository: &CranLikePackageRepository,
+    package: &str,
+) -> Result<Vec<Version>, ResolverError> {
+    let url = format!("{}/src/contrib/Archive/{package}/", repository.base_url());
+    let response = reqwest::blocking::get(&url)
+        .map_err(|error| ResolverError(format!("failed to contact CRAN-like archive: {error}")))?;
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::FORBIDDEN {
+        return Ok(Vec::new());
+    }
+    if !status.is_success() {
+        return Err(ResolverError(unexpected_cran_like_response(response)));
+    }
+
+    let body = response.text().map_err(|error| {
+        ResolverError(format!("failed to read CRAN-like archive listing: {error}"))
+    })?;
+    let mut versions = tarball_file_names_from_listing(&body)
+        .into_iter()
+        .filter_map(|file_name| {
+            parse_cran_tarball_file_name(&file_name).and_then(|(name, version)| {
+                if name != package {
+                    return None;
+                }
+                version.parse::<Version>().ok()
+            })
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    versions.sort();
+    Ok(versions)
+}
+
+fn cran_like_description(
+    repository: &CranLikePackageRepository,
+    package: &str,
+    version: &str,
+) -> Result<Option<String>, ResolverError> {
+    let direct_url = cran_like_current_description_url(repository, package);
+    let current_url = cran_like_current_tarball_url(repository, package, version);
+    let archive_url = cran_like_archive_tarball_url(repository, package, version);
+    let candidates = [
+        DescriptionCandidate::Direct(direct_url),
+        DescriptionCandidate::Tarball(current_url),
+        DescriptionCandidate::Tarball(archive_url),
+    ];
+    let mut errors = Vec::new();
+
+    for candidate in candidates {
+        let result = match candidate {
+            DescriptionCandidate::Direct(url) => {
+                let result = fetch_description_from_direct_url(&url, package, version);
+                result.map_err(|error| (url, error))
+            }
+            DescriptionCandidate::Tarball(url) => {
+                let result = fetch_description_from_tarball(&url, package, version);
+                result.map_err(|error| (url, error))
+            }
+        };
+
+        match result {
+            Ok(description) => return Ok(Some(description)),
+            Err(error) => errors.push(error),
+        }
+    }
+
+    if errors
+        .iter()
+        .all(|(_, error)| is_not_found_or_wrong_version(error))
+    {
+        return Ok(None);
+    }
+
+    let error = errors
+        .into_iter()
+        .find(|(_, error)| !is_not_found_or_wrong_version(error))
+        .map_or_else(|| "DESCRIPTION not found".to_string(), |(_, error)| error);
+    Err(ResolverError(error))
+}
+
+fn cran_like_source_url(
+    repository: &CranLikePackageRepository,
+    package: &str,
+    version: &str,
+) -> Result<String, ResolverError> {
+    let current_versions = cran_like_current_index(repository)?
+        .remove(package)
+        .unwrap_or_default();
+
+    if current_versions
+        .iter()
+        .any(|current| current.to_string() == version)
+    {
+        return Ok(cran_like_current_tarball_url(repository, package, version));
+    }
+
+    Ok(cran_like_archive_tarball_url(repository, package, version))
+}
+
+enum DescriptionCandidate {
+    Direct(String),
+    Tarball(String),
+}
+
+fn fetch_description_from_direct_url(
+    url: &str,
+    package: &str,
+    version: &str,
+) -> Result<String, String> {
+    let response = reqwest::blocking::get(url)
+        .map_err(|error| format!("failed to download DESCRIPTION: {error}"))?;
+    if !response.status().is_success() {
+        return Err(unexpected_cran_like_response(response));
+    }
+
+    let description = response
+        .text()
+        .map_err(|error| format!("failed to read DESCRIPTION: {error}"))?;
+    validate_description(&description, package, version, url)?;
+    Ok(description)
+}
+
+fn fetch_description_from_tarball(
+    url: &str,
+    package: &str,
+    version: &str,
+) -> Result<String, String> {
+    let response = reqwest::blocking::get(url)
+        .map_err(|error| format!("failed to download source package for DESCRIPTION: {error}"))?;
+    if !response.status().is_success() {
+        return Err(unexpected_cran_like_response(response));
+    }
+
+    let bytes = response
+        .bytes()
+        .map_err(|error| format!("failed to read source package for DESCRIPTION: {error}"))?;
+    description_from_tarball_bytes(bytes.as_ref(), url, package, version)
+}
+
+fn description_from_tarball_bytes(
+    bytes: &[u8],
+    url: &str,
+    package: &str,
+    version: &str,
+) -> Result<String, String> {
+    let decoder = GzDecoder::new(bytes);
+    let mut archive = Archive::new(decoder);
+    let entries = archive
+        .entries()
+        .map_err(|error| format!("failed to read source package archive: {error}"))?;
+
+    for entry in entries {
+        let mut entry = entry.map_err(|error| format!("failed to read archive entry: {error}"))?;
+        let is_description = {
+            let path = entry
+                .path()
+                .map_err(|error| format!("failed to read archive entry path: {error}"))?;
+            path_is_top_level_description(&path, package)
+        };
+        if !is_description {
+            continue;
+        }
+
+        let mut description = String::new();
+        entry
+            .read_to_string(&mut description)
+            .map_err(|error| format!("failed to read DESCRIPTION from source package: {error}"))?;
+        validate_description(&description, package, version, url)?;
+        return Ok(description);
+    }
+
+    Err(format!(
+        "source package {url} does not contain {package}/DESCRIPTION"
+    ))
+}
+
+fn validate_description(
+    description: &str,
+    package: &str,
+    version: &str,
+    url: &str,
+) -> Result<(), String> {
+    if description.trim().is_empty() {
+        return Err(format!("DESCRIPTION at {url} is empty"));
+    }
+    if !description_declares_package_version(description, package, version) {
+        return Err(format!(
+            "DESCRIPTION at {url} does not describe package {package} {version}"
+        ));
+    }
+    Ok(())
+}
+
+fn path_is_top_level_description(path: &Path, package: &str) -> bool {
+    let mut components = path.components().filter_map(|component| {
+        let component = component.as_os_str().to_str()?;
+        (component != ".").then_some(component)
+    });
+
+    components.next() == Some(package)
+        && components.next() == Some("DESCRIPTION")
+        && components.next().is_none()
+}
+
+fn description_declares_package_version(description: &str, package: &str, version: &str) -> bool {
+    let Some(record) = parse_dcf_records(description).into_iter().next() else {
+        return false;
+    };
+    record.get("Package").is_some_and(|name| name == package)
+        && record.get("Version").is_some_and(|value| value == version)
+}
+
+fn cran_like_current_tarball_url(
+    repository: &CranLikePackageRepository,
+    package: &str,
+    version: &str,
+) -> String {
+    format!(
+        "{}/src/contrib/{package}_{version}.tar.gz",
+        repository.base_url()
+    )
+}
+
+fn cran_like_archive_tarball_url(
+    repository: &CranLikePackageRepository,
+    package: &str,
+    version: &str,
+) -> String {
+    format!(
+        "{}/src/contrib/Archive/{package}/{package}_{version}.tar.gz",
+        repository.base_url()
+    )
+}
+
+fn cran_like_current_description_url(
+    repository: &CranLikePackageRepository,
+    package: &str,
+) -> String {
+    format!(
+        "{}/web/packages/{package}/DESCRIPTION",
+        repository.base_url()
+    )
+}
+
+fn parse_dcf_records(input: &str) -> Vec<BTreeMap<String, String>> {
+    let mut records = Vec::new();
+    let mut record: BTreeMap<String, String> = BTreeMap::new();
+    let mut current_key: Option<String> = None;
+
+    for line in input.lines() {
+        if line.trim().is_empty() {
+            if !record.is_empty() {
+                records.push(record);
+                record = BTreeMap::new();
+                current_key = None;
+            }
+            continue;
+        }
+
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if let Some(key) = &current_key
+                && let Some(value) = record.get_mut(key)
+            {
+                value.push(' ');
+                value.push_str(line.trim());
+            }
+            continue;
+        }
+
+        let Some((key, value)) = line.split_once(':') else {
+            current_key = None;
+            continue;
+        };
+        let key = key.trim().to_string();
+        record.insert(key.clone(), value.trim().to_string());
+        current_key = Some(key);
+    }
+
+    if !record.is_empty() {
+        records.push(record);
+    }
+
+    records
+}
+
+fn tarball_file_names_from_listing(listing: &str) -> Vec<String> {
+    listing
+        .split(['"', '\'', '<', '>', ' ', '\n', '\r', '\t'])
+        .filter_map(|part| part.rsplit('/').next())
+        .filter(|part| part.ends_with(".tar.gz") && part.contains('_'))
+        .map(html_unescape_minimal)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn parse_cran_tarball_file_name(file_name: &str) -> Option<(&str, &str)> {
+    let stem = file_name.strip_suffix(".tar.gz")?;
+    let (package, version) = stem.rsplit_once('_')?;
+    if package.is_empty() || version.is_empty() {
+        return None;
+    }
+    Some((package, version))
+}
+
+fn html_unescape_minimal(value: &str) -> String {
+    value
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+}
+
+fn unexpected_cran_like_response(response: reqwest::blocking::Response) -> String {
+    let status = response.status();
+    let body = response.text().unwrap_or_default();
+    let body = body.trim();
+
+    if body.is_empty() {
+        return format!("unexpected registry response ({status})");
+    }
+
+    format!("unexpected registry response ({status}): {body}")
+}
+
+fn is_not_found_or_wrong_version(error: &str) -> bool {
+    is_registry_not_found_error(error) || error.contains("does not describe package")
+}
+
+impl RDescription {
+    pub(crate) fn dependencies(&self) -> Vec<PackageDependency> {
+        let mut dependencies = Vec::new();
+
+        dependencies.extend(package_dependencies_from_relations(&self.depends));
+        dependencies.extend(package_dependencies_from_relations(&self.imports));
+        dependencies.extend(package_dependencies_from_relations(&self.linking_to));
+
+        dependencies
+    }
 }
 
 fn package_dependencies_from_relations(
     relations: &BTreeSet<DescriptionDependency>,
-) -> Result<Vec<PackageDependency>, ResolverError> {
+) -> Vec<PackageDependency> {
     relations
         .iter()
         .filter(|relation| relation.name != "R")
@@ -405,10 +919,8 @@ fn relation_bounds(relation: &DescriptionDependency) -> (Option<String>, Option<
     }
 }
 
-fn package_dependency_from_relation(
-    relation: &DescriptionDependency,
-) -> Result<PackageDependency, ResolverError> {
-    Ok(PackageDependency::from_relation(relation))
+fn package_dependency_from_relation(relation: &DescriptionDependency) -> PackageDependency {
+    PackageDependency::from_relation(relation)
 }
 
 fn r_description_range_from_relation(relation: &DescriptionDependency) -> Ranges<Version> {
@@ -430,6 +942,7 @@ struct RDependencyProvider {
     repositories: Vec<Rc<dyn PackageRepository>>,
     root_dependencies: Vec<PackageDependency>,
     preferred_versions_by_package: BTreeMap<String, Version>,
+    ui: ResolutionUi,
 }
 
 impl RDependencyProvider {
@@ -437,12 +950,62 @@ impl RDependencyProvider {
         repositories: Vec<Rc<dyn PackageRepository>>,
         root_dependencies: Vec<PackageDependency>,
         preferred_versions_by_package: BTreeMap<String, Version>,
+        ui: ResolutionUi,
     ) -> Self {
         Self {
             repositories,
             root_dependencies,
             preferred_versions_by_package,
+            ui,
         }
+    }
+
+    fn repository_versions(&self, package: &str) -> Result<Vec<RepositoryVersion>, ResolverError> {
+        self.ui.on_version_load(package);
+        let mut versions =
+            self.repositories
+                .iter()
+                .try_fold(Vec::new(), |mut versions, repository| {
+                    versions.extend(repository.package_versions(package)?.into_iter().map(
+                        |version| RepositoryVersion {
+                            version,
+                            repository: Rc::clone(repository),
+                        },
+                    ));
+                    Ok::<_, ResolverError>(versions)
+                })?;
+        versions.sort();
+        Ok(versions)
+    }
+
+    fn repository_dependencies(
+        &self,
+        package: &str,
+        version: &RepositoryVersion,
+    ) -> Result<Option<Vec<PackageDependency>>, ResolverError> {
+        self.ui.on_description_load(package, &version.version);
+        version
+            .repository
+            .package_description(package, &version.version)
+    }
+
+    fn resolved_package(
+        &self,
+        package: &str,
+        version: &RepositoryVersion,
+    ) -> Result<Option<ResolvedPackage>, ResolverError> {
+        self.ui.on_description_load(package, &version.version);
+        version
+            .repository
+            .resolved_package(package, &version.version)
+    }
+
+    fn finish(&self, resolved_packages: usize) {
+        self.ui.finish(resolved_packages);
+    }
+
+    fn fail(&self) {
+        self.ui.fail();
     }
 }
 
@@ -460,26 +1023,15 @@ impl DependencyProvider for RDependencyProvider {
         range: &Self::VS,
         package_conflicts_counts: &PackageResolutionStatistics,
     ) -> Self::Priority {
-        let matches =
-            self.repositories
-                .iter()
-                .try_fold(Vec::new(), |mut versions, repository| {
-                    versions.extend(repository.package_versions(package)?.into_iter().map(
-                        |version| RepositoryVersion {
-                            version,
-                            repository: Rc::clone(repository),
-                        },
-                    ));
-                    Ok::<_, ResolverError>(versions)
-                })
-                .ok()
-                .map_or(usize::MAX, |mut versions| {
-                    versions.sort();
-                    versions
-                        .iter()
-                        .filter(|version| range.contains(version))
-                        .count()
-                });
+        let matches = self
+            .repository_versions(package)
+            .ok()
+            .map_or(usize::MAX, |versions| {
+                versions
+                    .iter()
+                    .filter(|version| range.contains(version))
+                    .count()
+            });
 
         (package_conflicts_counts.conflict_count(), Reverse(matches))
     }
@@ -494,19 +1046,7 @@ impl DependencyProvider for RDependencyProvider {
             return Ok(range.contains(&version).then_some(version));
         }
 
-        let mut versions =
-            self.repositories
-                .iter()
-                .try_fold(Vec::new(), |mut versions, repository| {
-                    versions.extend(repository.package_versions(package)?.into_iter().map(
-                        |version| RepositoryVersion {
-                            version,
-                            repository: Rc::clone(repository),
-                        },
-                    ));
-                    Ok::<_, ResolverError>(versions)
-                })?;
-        versions.sort();
+        let versions = self.repository_versions(package)?;
 
         if let Some(preferred_version) = self.preferred_versions_by_package.get(package)
             && let Some(version) = versions
@@ -549,18 +1089,14 @@ impl DependencyProvider for RDependencyProvider {
             ));
         }
 
-        let Some(description) = version
-            .repository
-            .package_description(package, &version.version)?
-        else {
+        let Some(dependencies) = self.repository_dependencies(package, version)? else {
             return Ok(Dependencies::Unavailable(format!(
                 "package DESCRIPTION not found for {package}@{version}"
             )));
         };
 
         Ok(Dependencies::Available(
-            description
-                .dependencies
+            dependencies
                 .into_iter()
                 .filter(|dependency| !is_base_package(&dependency.package))
                 .map(|dependency| {
@@ -591,25 +1127,18 @@ pub fn is_base_package(package: &str) -> bool {
 pub fn resolve_from_registry(
     repositories: Vec<Rc<dyn PackageRepository>>,
     roots: Vec<PackageDependency>,
-    preferred_versions_by_package: &BTreeMap<String, String>,
+    preferred_versions_by_package: BTreeMap<String, Version>,
 ) -> Result<Vec<ResolvedPackage>, String> {
     if roots.is_empty() {
         return Ok(Vec::new());
     }
 
-    let preferred_versions_by_package = preferred_versions_by_package
-        .iter()
-        .map(|(package, version)| {
-            Ok((
-                package.clone(),
-                version.parse::<Version>().map_err(|error| {
-                    ResolverError(format!("invalid version {version}: {error}"))
-                })?,
-            ))
-        })
-        .collect::<Result<BTreeMap<_, _>, ResolverError>>()
-        .map_err(|error| error.to_string())?;
-    let provider = RDependencyProvider::new(repositories, roots, preferred_versions_by_package);
+    let provider = RDependencyProvider::new(
+        repositories,
+        roots,
+        preferred_versions_by_package,
+        ResolutionUi::new(),
+    );
     let mut selected = match resolve(
         &provider,
         ROOT_PACKAGE.to_string(),
@@ -620,6 +1149,7 @@ pub fn resolve_from_registry(
             .filter(|(package, _)| package != ROOT_PACKAGE)
             .collect::<Vec<_>>(),
         Err(error) => {
+            provider.fail();
             return Err(error.to_string());
         }
     };
@@ -627,9 +1157,8 @@ pub fn resolve_from_registry(
     let mut resolved = selected
         .into_iter()
         .map(|(package, version)| {
-            version
-                .repository
-                .resolved_package(&package, &version.version)?
+            provider
+                .resolved_package(&package, &version)?
                 .ok_or_else(|| {
                     ResolverError(format!(
                         "package DESCRIPTION not found for {package}@{version}"
@@ -637,8 +1166,12 @@ pub fn resolve_from_registry(
                 })
         })
         .collect::<Result<Vec<_>, ResolverError>>()
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            provider.fail();
+            error.to_string()
+        })?;
     resolved.sort_by(|left, right| left.name.cmp(&right.name));
+    provider.finish(resolved.len());
     Ok(resolved)
 }
 
