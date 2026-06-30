@@ -5,6 +5,7 @@ use crate::registry::{
 };
 use flate2::read::GzDecoder;
 use keyring::Entry;
+use r_description::Version;
 use std::{
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     fs,
@@ -39,6 +40,29 @@ pub enum RepositoryKind {
 pub struct SourcedPackageVersions {
     pub repository_url: String,
     pub response: PackageVersionsResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CranLikePackagesIndex {
+    pub(crate) records: Vec<CranLikePackageRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CranLikePackageRecord {
+    pub(crate) package: String,
+    pub(crate) version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CranLikeArchiveListing {
+    pub(crate) records: Vec<CranLikeArchiveRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CranLikeArchiveRecord {
+    pub(crate) package: String,
+    pub(crate) version: String,
+    pub(crate) file_name: String,
 }
 
 pub trait CredentialStore: Send + Sync {
@@ -640,6 +664,123 @@ pub fn normalize_repository_url(value: &str) -> String {
     value.trim().trim_end_matches('/').to_string()
 }
 
+pub(crate) fn fetch_rrepo_package_list(base_url: &str) -> Result<Vec<String>, String> {
+    let client = RegistryClient::new(base_url);
+    let response = client.fetch_repository_packages()?;
+    Ok(response
+        .packages
+        .into_iter()
+        .map(|package| package.name)
+        .collect())
+}
+
+pub(crate) fn fetch_rrepo_package_versions(
+    base_url: &str,
+    package: &str,
+) -> Result<Vec<Version>, String> {
+    let client = RegistryClient::new(base_url);
+    let response = match client.fetch_package_versions_with_retry(package) {
+        Ok(response) => response,
+        Err(error) if is_not_found_error(&error) => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+
+    response
+        .versions
+        .into_iter()
+        .map(|summary| summary.version.parse())
+        .collect()
+}
+
+pub(crate) fn fetch_rrepo_description(
+    base_url: &str,
+    package: &str,
+    version: &str,
+) -> Result<Option<String>, String> {
+    let client = RegistryClient::new(base_url);
+    match client.fetch_description_with_retry(package, version) {
+        Ok(description) => Ok(Some(description)),
+        Err(error) if is_not_found_error(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn rrepo_source_url(base_url: &str, package: &str, version: &str) -> String {
+    format!("{base_url}/packages/{package}/versions/{version}/source")
+}
+
+pub(crate) fn fetch_cran_like_packages_index(
+    base_url: &str,
+) -> Result<CranLikePackagesIndex, String> {
+    let body = fetch_cran_like_packages_index_body(&RepositorySource::cran_like(base_url))?;
+    let records = parse_dcf_records(&body)
+        .into_iter()
+        .filter_map(|record| {
+            let package = record.get("Package").filter(|value| !value.is_empty())?;
+            let version = record.get("Version").filter(|value| !value.is_empty())?;
+            Some(CranLikePackageRecord {
+                package: package.to_string(),
+                version: version.to_string(),
+            })
+        })
+        .collect();
+
+    Ok(CranLikePackagesIndex { records })
+}
+
+pub(crate) fn fetch_cran_like_archive_listing(
+    base_url: &str,
+    package: &str,
+) -> Result<CranLikeArchiveListing, String> {
+    let source = RepositorySource::cran_like(base_url);
+    let url = format!("{}/src/contrib/Archive/{package}/", source.base_url());
+    let response = reqwest::blocking::get(&url)
+        .map_err(|error| format!("failed to contact CRAN-like archive: {error}"))?;
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::FORBIDDEN {
+        return Ok(CranLikeArchiveListing {
+            records: Vec::new(),
+        });
+    }
+    if !status.is_success() {
+        return Err(unexpected_cran_like_response(response));
+    }
+
+    let body = response
+        .text()
+        .map_err(|error| format!("failed to read CRAN-like archive listing: {error}"))?;
+    let records = tarball_file_names_from_listing(&body)
+        .into_iter()
+        .filter_map(|file_name| {
+            let (package, version) = parse_cran_tarball_file_name(&file_name)?;
+            Some(CranLikeArchiveRecord {
+                package: package.to_string(),
+                version: version.to_string(),
+                file_name,
+            })
+        })
+        .collect();
+
+    Ok(CranLikeArchiveListing { records })
+}
+
+pub(crate) fn fetch_cran_like_description(
+    base_url: &str,
+    package: &str,
+    version: &str,
+) -> Result<Option<String>, String> {
+    let source = RepositorySource::cran_like(base_url);
+    match RepositorySet::fetch_cran_like_description(&source, package, version) {
+        Ok(description) => Ok(Some(description)),
+        Err(error) if is_not_found_or_wrong_version(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn is_not_found_or_wrong_version(error: &str) -> bool {
+    is_not_found_error(error) || error.contains("does not describe package")
+}
+
 pub fn repository_source_from_package_url(url: &str) -> Option<String> {
     let marker = "/packages/";
     let index = url.find(marker)?;
@@ -655,7 +796,7 @@ pub fn cran_like_source_from_package_url(url: &str) -> Option<String> {
 fn fetch_cran_like_current_index(
     source: &RepositorySource,
 ) -> Result<BTreeMap<String, Vec<VersionSummary>>, String> {
-    let body = fetch_cran_like_packages_index(source)?;
+    let body = fetch_cran_like_packages_index_body(source)?;
     let mut index: BTreeMap<String, Vec<VersionSummary>> = BTreeMap::new();
 
     for record in parse_dcf_records(&body) {
@@ -682,7 +823,7 @@ fn fetch_cran_like_current_index(
     Ok(index)
 }
 
-fn fetch_cran_like_packages_index(source: &RepositorySource) -> Result<String, String> {
+fn fetch_cran_like_packages_index_body(source: &RepositorySource) -> Result<String, String> {
     fetch_cran_like_packages_gz_index(source)
         .or_else(|_| fetch_cran_like_packages_plain_index(source))
 }

@@ -507,6 +507,7 @@ impl ResolutionUi {
         self.update_message(&format!("loading DESCRIPTION for {package}@{version}"));
     }
 
+    #[allow(dead_code)]
     pub(crate) fn on_cache_hit(&self, detail: &str) {
         self.cache_hits.set(self.cache_hits.get() + 1);
         self.update_message(detail);
