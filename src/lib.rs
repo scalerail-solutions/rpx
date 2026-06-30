@@ -439,21 +439,42 @@ fn cmd_add(
 
     if !new_packages.is_empty() {
         let sysreq_db = load_sysreq_snapshot_for_lock(lockfile.as_ref());
-        let resolved_addition = resolve_additions_from_latest(
-            &description,
-            lockfile.as_ref(),
-            &new_packages,
-            &repositories,
-        )
-        .map_err(|details| LockError::ResolveFailed { details })?;
+        let requested_packages = new_packages
+            .iter()
+            .cloned()
+            .map(|package| (package, "*".to_string()))
+            .collect::<BTreeMap<_, _>>();
+        // Newly added packages should resolve from the latest compatible version so
+        // DESCRIPTION reflects the addition, while unrelated locked packages stay stable.
+        let preferred_versions = match &lockfile {
+            Some(lockfile) => lockfile
+                .packages
+                .iter()
+                .filter(|(name, _)| !requested_packages.contains_key(name.as_str()))
+                .map(|(name, package)| (name.clone(), package.version.clone()))
+                .collect(),
+            None => BTreeMap::new(),
+        };
+        let roots = add_resolution_roots(&description, &requested_packages);
+        let resolved =
+            resolve_from_registry(&repositories, &roots, &preferred_versions).map_err(|error| {
+                LockError::ResolveFailed {
+                    details: format!(
+                        "could not resolve a compatible dependency set for {}: {error}",
+                        new_packages.join(", ")
+                    ),
+                }
+            })?;
+        warn_cran_archive_unavailable(&repositories);
+        let constraints = constraints_from_resolved_roots(&new_packages, &resolved)
+            .map_err(|details| LockError::ResolveFailed { details })?;
 
         for package in &new_packages {
-            let constraints = resolved_addition
-                .constraints
+            let package_constraints = constraints
                 .get(package)
                 .expect("resolved addition should include constraints for each new package");
-            if constraints.is_empty()
-                || constraints
+            if package_constraints.is_empty()
+                || package_constraints
                     .iter()
                     .all(|constraint| constraint.trim() == "*")
             {
@@ -463,7 +484,7 @@ fn cmd_add(
                 });
             } else {
                 description.imports.extend(
-                    constraints
+                    package_constraints
                         .iter()
                         .map(|constraint| relation_with_constraint(package, constraint))
                         .collect::<Result<Vec<_>, _>>()
@@ -486,7 +507,7 @@ fn cmd_add(
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect(),
-            &resolved_addition.resolved,
+            &resolved,
             &sysreq_db,
             repositories.sources(),
             None,
@@ -946,12 +967,6 @@ fn print_status_group(title: &str, items: &[String]) {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct AddResolution {
-    constraints: BTreeMap<String, Vec<String>>,
-    resolved: Vec<ResolvedPackage>,
-}
-
 #[derive(Debug, Default, PartialEq, Eq)]
 struct LockOutcome {
     changed: bool,
@@ -1090,34 +1105,6 @@ enum DownloadEvent {
     },
 }
 
-fn resolve_additions_from_latest(
-    description: &description::RDescription,
-    lockfile: Option<&Lockfile>,
-    packages: &[String],
-    repositories: &RepositorySet,
-) -> Result<AddResolution, String> {
-    let new_packages = packages
-        .iter()
-        .cloned()
-        .map(|package| (package, "*".to_string()))
-        .collect::<BTreeMap<_, _>>();
-    let preferred_versions = preferred_locked_versions(lockfile, &new_packages);
-    let roots = add_resolution_roots(description, &new_packages);
-    let resolved =
-        resolve_from_registry(repositories, &roots, &preferred_versions).map_err(|error| {
-            format!(
-                "could not resolve a compatible dependency set for {}: {error}",
-                packages.join(", ")
-            )
-        })?;
-    warn_cran_archive_unavailable(repositories);
-
-    Ok(AddResolution {
-        constraints: constraints_from_resolved_roots(packages, &resolved)?,
-        resolved,
-    })
-}
-
 fn add_resolution_roots(
     description: &description::RDescription,
     new_packages: &BTreeMap<String, String>,
@@ -1150,22 +1137,6 @@ fn add_resolution_roots(
     }
 
     roots.into_iter().collect()
-}
-
-fn preferred_locked_versions(
-    lockfile: Option<&Lockfile>,
-    excluded_packages: &BTreeMap<String, String>,
-) -> BTreeMap<String, String> {
-    let Some(lockfile) = lockfile else {
-        return BTreeMap::new();
-    };
-
-    lockfile
-        .packages
-        .iter()
-        .filter(|(name, _)| !excluded_packages.contains_key(name.as_str()))
-        .map(|(name, package)| (name.clone(), package.version.clone()))
-        .collect()
 }
 
 fn semver_add_constraint(version: &str) -> Result<String, String> {
@@ -1256,16 +1227,14 @@ fn lock_from_description(
     }
     let sysreq_db = load_sysreq_snapshot_for_lock(existing_lockfile.as_ref());
 
-    if roots.is_empty() {
-        let lockfile =
-            lockfile_from_resolution(vec![], &[], &sysreq_db, repositories.sources(), None);
-        let changed = existing_lockfile.as_ref() != Some(&lockfile);
-        write_project_lockfile(&lockfile)?;
-        return Ok(LockOutcome { changed });
-    }
-
-    let preferred_versions =
-        preferred_locked_versions(existing_lockfile.as_ref(), &BTreeMap::new());
+    let preferred_versions = match &existing_lockfile {
+        Some(lockfile) => lockfile
+            .packages
+            .iter()
+            .map(|(name, package)| (name.clone(), package.version.clone()))
+            .collect(),
+        None => BTreeMap::new(),
+    };
     let resolved =
         resolve_from_registry(&repositories, &roots, &preferred_versions).map_err(|details| {
             LockError::ResolveFailed {
@@ -2711,8 +2680,8 @@ mod tests {
         binary_artifact_request, classify_repository_source, compiled_cache_key,
         constraints_from_resolved_roots, cran_like_binary_artifact_request,
         default_registry_base_url, locked_install_order, lockfile_from_resolution,
-        persisted_constraints, preferred_artifact, preferred_locked_versions, r_minor_version,
-        semver_add_constraint, should_fallback_to_source, validate_lockfile_compatibility,
+        persisted_constraints, preferred_artifact, r_minor_version, semver_add_constraint,
+        should_fallback_to_source, validate_lockfile_compatibility,
     };
     use crate::description::{RDescription, resolution_root_from_relation};
     use crate::{
@@ -3158,61 +3127,6 @@ mod tests {
                     constraint: ">= 0.6.37, < 1.0.0".to_string(),
                 },
             ]
-        );
-    }
-
-    #[test]
-    fn prefers_all_existing_locked_versions_except_new_additions() {
-        let lockfile = Lockfile {
-            version: LOCKFILE_VERSION,
-            revision: LOCKFILE_REVISION,
-            repositories: vec![],
-            r: LockedR::default(),
-            sysreqs: LockedSystemRequirements::default(),
-            roots: vec![],
-            packages: BTreeMap::from([
-                (
-                    "direct".to_string(),
-                    LockedPackage {
-                        package: "direct".to_string(),
-                        version: "1.0.0".to_string(),
-                        source: Some("registry".to_string()),
-                        source_url: None,
-                        dependencies: vec![],
-                    },
-                ),
-                (
-                    "transitive".to_string(),
-                    LockedPackage {
-                        package: "transitive".to_string(),
-                        version: "2.0.0".to_string(),
-                        source: Some("registry".to_string()),
-                        source_url: None,
-                        dependencies: vec![],
-                    },
-                ),
-                (
-                    "newpkg".to_string(),
-                    LockedPackage {
-                        package: "newpkg".to_string(),
-                        version: "3.0.0".to_string(),
-                        source: Some("registry".to_string()),
-                        source_url: None,
-                        dependencies: vec![],
-                    },
-                ),
-            ]),
-        };
-        let excluded = BTreeMap::from([("newpkg".to_string(), "*".to_string())]);
-
-        let preferred = preferred_locked_versions(Some(&lockfile), &excluded);
-
-        assert_eq!(
-            preferred,
-            BTreeMap::from([
-                ("direct".to_string(), "1.0.0".to_string()),
-                ("transitive".to_string(), "2.0.0".to_string()),
-            ])
         );
     }
 

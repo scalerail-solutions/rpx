@@ -412,6 +412,10 @@ pub fn resolve_from_registry(
     roots: &[ResolutionRoot],
     preferred_versions_by_package: &BTreeMap<String, String>,
 ) -> Result<Vec<ResolvedPackage>, String> {
+    if roots.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let preferred_versions_by_package = preferred_versions_by_package
         .iter()
         .map(|(package, version)| Ok((package.clone(), parse_version(version)?)))
