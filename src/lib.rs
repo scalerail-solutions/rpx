@@ -56,7 +56,7 @@ use repository::{
     repository_source_from_package_url,
 };
 use resolver::{
-    PackageRepository, ResolvedPackage, RrepoPackageRepository, is_base_package,
+    PackageDependency, PackageRepository, ResolvedPackage, RrepoPackageRepository, is_base_package,
     resolve_from_registry,
 };
 use sysreqs::{
@@ -462,7 +462,7 @@ fn cmd_add(
         let roots = add_resolution_roots(&description, &requested_packages);
         let resolved = resolve_from_registry(
             rrepo_package_repositories(&repositories),
-            &roots,
+            roots,
             &preferred_versions,
         )
         .map_err(|error| LockError::ResolveFailed {
@@ -1114,10 +1114,34 @@ enum DownloadEvent {
 fn add_resolution_roots(
     description: &description::RDescription,
     new_packages: &BTreeMap<String, String>,
-) -> Vec<ResolutionRoot> {
-    let mut roots = BTreeSet::new();
+) -> Vec<PackageDependency> {
+    let mut roots = BTreeMap::new();
 
-    for root in description
+    for relation in description.imports.iter().chain(
+        description
+            .depends
+            .iter()
+            .filter(|relation| relation.name != "R"),
+    ) {
+        if new_packages.contains_key(&relation.name) {
+            continue;
+        }
+
+        roots.insert(
+            relation.name.clone(),
+            PackageDependency::from_relation(relation),
+        );
+    }
+
+    for name in new_packages.keys() {
+        roots.insert(name.clone(), PackageDependency::any(name.clone()));
+    }
+
+    roots.into_values().collect()
+}
+
+fn lock_roots(description: &description::RDescription) -> Vec<ResolutionRoot> {
+    description
         .imports
         .iter()
         .chain(
@@ -1127,22 +1151,9 @@ fn add_resolution_roots(
                 .filter(|relation| relation.name != "R"),
         )
         .map(resolution_root_from_relation)
-    {
-        if new_packages.contains_key(&root.name) {
-            continue;
-        }
-
-        roots.insert(root);
-    }
-
-    for (name, constraint) in new_packages {
-        roots.insert(ResolutionRoot {
-            name: name.clone(),
-            constraint: constraint.clone(),
-        });
-    }
-
-    roots.into_iter().collect()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn semver_add_constraint(version: &str) -> Result<String, String> {
@@ -1219,9 +1230,8 @@ fn lock_from_description(
                 .iter()
                 .filter(|relation| relation.name != "R"),
         )
-        .map(resolution_root_from_relation)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
+        .filter(|relation| !is_base_package(&relation.name))
+        .map(PackageDependency::from_relation)
         .collect::<Vec<_>>();
     let existing_lockfile = read_project_lockfile_optional()?;
     let repositories =
@@ -1243,7 +1253,7 @@ fn lock_from_description(
     };
     let resolved = resolve_from_registry(
         rrepo_package_repositories(&repositories),
-        &roots,
+        roots,
         &preferred_versions,
     )
     .map_err(|details| LockError::ResolveFailed {
@@ -1251,8 +1261,13 @@ fn lock_from_description(
     })?;
     warn_cran_archive_unavailable(&repositories);
 
-    let lockfile =
-        lockfile_from_resolution(roots, &resolved, &sysreq_db, repositories.sources(), None);
+    let lockfile = lockfile_from_resolution(
+        lock_roots(&description),
+        &resolved,
+        &sysreq_db,
+        repositories.sources(),
+        None,
+    );
     let changed = existing_lockfile.as_ref() != Some(&lockfile);
     write_project_lockfile(&lockfile)?;
     Ok(LockOutcome { changed })

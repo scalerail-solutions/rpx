@@ -15,7 +15,7 @@ use r_description::{Version, VersionConstraint};
 
 use crate::{
     description::{DescriptionDependency, RDescription},
-    registry::{RegistryClient, ResolutionRoot, is_not_found_error as is_registry_not_found_error},
+    registry::{RegistryClient, is_not_found_error as is_registry_not_found_error},
 };
 
 const ROOT_PACKAGE: &str = "__rpx_root__";
@@ -61,7 +61,7 @@ struct VersionCandidate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ResolverError(String);
+pub(crate) struct ResolverError(String);
 
 impl fmt::Display for ResolverError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -78,9 +78,25 @@ impl From<String> for ResolverError {
 }
 
 #[derive(Debug, Clone)]
-struct PackageDependency {
+pub(crate) struct PackageDependency {
     package: String,
     range: Ranges<Version>,
+}
+
+impl PackageDependency {
+    pub(crate) fn from_relation(relation: &DescriptionDependency) -> Self {
+        Self {
+            package: relation.name.clone(),
+            range: r_description_range_from_relation(relation),
+        }
+    }
+
+    pub(crate) fn any(package: impl Into<String>) -> Self {
+        Self {
+            package: package.into(),
+            range: Ranges::full(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +199,12 @@ pub(crate) trait PackageRepository: std::fmt::Debug {
         package: &str,
         version: &Version,
     ) -> Result<Option<PackageDescription>, ResolverError>;
+
+    fn resolved_package(
+        &self,
+        package: &str,
+        version: &Version,
+    ) -> Result<Option<ResolvedPackage>, ResolverError>;
 }
 
 #[derive(Debug, Default)]
@@ -206,6 +228,14 @@ impl PackageRepository for NoopPackageRepository {
         _package: &str,
         _version: &Version,
     ) -> Result<Option<PackageDescription>, ResolverError> {
+        Ok(None)
+    }
+
+    fn resolved_package(
+        &self,
+        _package: &str,
+        _version: &Version,
+    ) -> Result<Option<ResolvedPackage>, ResolverError> {
         Ok(None)
     }
 }
@@ -269,6 +299,32 @@ impl PackageRepository for RrepoPackageRepository {
         let description = RDescription::from_str(&description).map_err(ResolverError)?;
         Ok(Some(package_description_from_r_description(&description)?))
     }
+
+    fn resolved_package(
+        &self,
+        package: &str,
+        version: &Version,
+    ) -> Result<Option<ResolvedPackage>, ResolverError> {
+        let client = RegistryClient::new(&self.base_url);
+        let version = version.to_string();
+        let description = match client.fetch_description_with_retry(package, &version) {
+            Ok(description) => description,
+            Err(error) if is_registry_not_found_error(&error) => return Ok(None),
+            Err(error) => return Err(ResolverError(error)),
+        };
+        let description = RDescription::from_str(&description).map_err(ResolverError)?;
+
+        Ok(Some(ResolvedPackage {
+            name: package.to_string(),
+            version: version.clone(),
+            source_url: format!(
+                "{}/packages/{package}/versions/{version}/source",
+                self.base_url
+            ),
+            dependencies: resolved_dependencies_from_r_description(&description),
+            system_requirements: description.system_requirements,
+        }))
+    }
 }
 
 fn package_description_from_r_description(
@@ -295,13 +351,64 @@ fn package_dependencies_from_relations(
         .collect()
 }
 
+fn resolved_dependencies_from_r_description(description: &RDescription) -> Vec<ResolvedDependency> {
+    let mut dependencies = Vec::new();
+
+    dependencies.extend(resolved_dependencies_from_relations(
+        "Depends",
+        &description.depends,
+    ));
+    dependencies.extend(resolved_dependencies_from_relations(
+        "Imports",
+        &description.imports,
+    ));
+    dependencies.extend(resolved_dependencies_from_relations(
+        "LinkingTo",
+        &description.linking_to,
+    ));
+
+    dependencies
+}
+
+fn resolved_dependencies_from_relations(
+    kind: &str,
+    relations: &BTreeSet<DescriptionDependency>,
+) -> Vec<ResolvedDependency> {
+    relations
+        .iter()
+        .filter(|relation| relation.name != "R")
+        .map(|relation| {
+            let (min_version, max_version_exclusive) = relation_bounds(relation);
+            ResolvedDependency {
+                package: relation.name.clone(),
+                kind: kind.to_string(),
+                min_version,
+                max_version_exclusive,
+            }
+        })
+        .collect()
+}
+
+fn relation_bounds(relation: &DescriptionDependency) -> (Option<String>, Option<String>) {
+    let Some((operator, version)) = relation.version.as_ref() else {
+        return (None, None);
+    };
+
+    match operator {
+        VersionConstraint::GreaterThan | VersionConstraint::GreaterThanEqual => {
+            (Some(version.to_string()), None)
+        }
+        VersionConstraint::LessThan | VersionConstraint::LessThanEqual => {
+            (None, Some(version.to_string()))
+        }
+        VersionConstraint::Equal => (Some(version.to_string()), None),
+    }
+}
+
 fn package_dependency_from_relation(
     relation: &DescriptionDependency,
 ) -> Result<PackageDependency, ResolverError> {
-    Ok(PackageDependency {
-        package: relation.name.clone(),
-        range: r_description_range_from_relation(relation),
-    })
+    Ok(PackageDependency::from_relation(relation))
 }
 
 fn r_description_range_from_relation(relation: &DescriptionDependency) -> Ranges<Version> {
@@ -483,7 +590,7 @@ pub fn is_base_package(package: &str) -> bool {
 
 pub fn resolve_from_registry(
     repositories: Vec<Rc<dyn PackageRepository>>,
-    roots: &[ResolutionRoot],
+    roots: Vec<PackageDependency>,
     preferred_versions_by_package: &BTreeMap<String, String>,
 ) -> Result<Vec<ResolvedPackage>, String> {
     if roots.is_empty() {
@@ -502,19 +609,7 @@ pub fn resolve_from_registry(
         })
         .collect::<Result<BTreeMap<_, _>, ResolverError>>()
         .map_err(|error| error.to_string())?;
-    let root_dependencies = roots
-        .iter()
-        .filter(|root| !is_base_package(&root.name))
-        .map(|root| PackageDependency {
-            package: root.name.clone(),
-            range: Ranges::full(),
-        })
-        .collect();
-    let provider = RDependencyProvider::new(
-        repositories,
-        root_dependencies,
-        preferred_versions_by_package,
-    );
+    let provider = RDependencyProvider::new(repositories, roots, preferred_versions_by_package);
     let mut selected = match resolve(
         &provider,
         ROOT_PACKAGE.to_string(),
@@ -531,14 +626,18 @@ pub fn resolve_from_registry(
     selected.sort_by(|left, right| left.0.cmp(&right.0));
     let mut resolved = selected
         .into_iter()
-        .map(|(package, version)| ResolvedPackage {
-            name: package,
-            version: version.version.to_string(),
-            source_url: String::new(),
-            dependencies: Vec::new(),
-            system_requirements: None,
+        .map(|(package, version)| {
+            version
+                .repository
+                .resolved_package(&package, &version.version)?
+                .ok_or_else(|| {
+                    ResolverError(format!(
+                        "package DESCRIPTION not found for {package}@{version}"
+                    ))
+                })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, ResolverError>>()
+        .map_err(|error| error.to_string())?;
     resolved.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(resolved)
 }
