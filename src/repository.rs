@@ -37,7 +37,7 @@ pub enum RepositoryKind {
 
 #[derive(Debug, Clone)]
 pub struct SourcedPackageVersions {
-    pub source: RepositorySource,
+    pub repository_url: String,
     pub response: PackageVersionsResponse,
 }
 
@@ -217,7 +217,7 @@ impl RepositorySet {
             match result {
                 Ok(response) => {
                     return Ok(SourcedPackageVersions {
-                        source: source.clone(),
+                        repository_url: source.base_url().to_string(),
                         response,
                     });
                 }
@@ -247,7 +247,7 @@ impl RepositorySet {
 
             match result {
                 Ok(response) => responses.push(SourcedPackageVersions {
-                    source: source.clone(),
+                    repository_url: source.base_url().to_string(),
                     response,
                 }),
                 Err(error) if is_not_found_error(&error) => {}
@@ -276,6 +276,16 @@ impl RepositorySet {
             }),
             RepositoryKind::CranLike => Self::fetch_cran_like_description(source, package, version),
         }
+    }
+
+    pub fn fetch_description_by_url_with_retry(
+        &self,
+        repository_url: &str,
+        package: &str,
+        version: &str,
+    ) -> Result<String, String> {
+        let source = self.source_by_base_url(repository_url)?;
+        self.fetch_description_with_retry(source, package, version)
     }
 
     pub fn download_artifact_with_progress(
@@ -307,6 +317,22 @@ impl RepositorySet {
             .cloned()
             .or_else(|| repository_source_from_package_url(url).map(RepositorySource::new))
             .or_else(|| cran_like_source_from_package_url(url).map(RepositorySource::cran_like))
+    }
+
+    fn source_by_base_url(&self, url: &str) -> Result<&RepositorySource, String> {
+        let normalized = normalize_repository_url(url);
+        let mut matches = self
+            .sources
+            .iter()
+            .filter(|source| source.base_url() == normalized);
+        let Some(source) = matches.next() else {
+            return Err(format!("repository not configured: {normalized}"));
+        };
+        if matches.next().is_some() {
+            return Err(format!("repository URL is ambiguous: {normalized}"));
+        }
+
+        Ok(source)
     }
 
     pub fn cran_archive_unavailable_repositories(&self) -> Vec<String> {
@@ -1391,7 +1417,7 @@ mod tests {
 
         default_mock.assert();
         additional_mock.assert();
-        assert_eq!(result.source.base_url(), default_server.url());
+        assert_eq!(result.repository_url, default_server.url());
         assert_eq!(result.response.versions[0].version, "0.6.37");
     }
 
@@ -1443,7 +1469,7 @@ Version: 1.1.6
         current_mock.assert();
         archive_mock.assert();
         package_archive_mock.assert();
-        assert_eq!(result.source.kind(), RepositoryKind::CranLike);
+        assert_eq!(result.repository_url, source.base_url());
         assert_eq!(
             result
                 .response
