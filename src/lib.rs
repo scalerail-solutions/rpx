@@ -6,6 +6,7 @@ use std::{
     hash::{Hash, Hasher},
     io::IsTerminal,
     path::{Path, PathBuf},
+    rc::Rc,
     sync::{Arc, Mutex, mpsc},
     thread,
     time::{SystemTime, UNIX_EPOCH},
@@ -54,7 +55,10 @@ use repository::{
     cran_like_source_from_package_url, detect_cran_like_archive_support, normalize_repository_url,
     repository_source_from_package_url,
 };
-use resolver::{ResolvedPackage, is_base_package, resolve_from_registry};
+use resolver::{
+    PackageRepository, ResolvedPackage, RrepoPackageRepository, is_base_package,
+    resolve_from_registry,
+};
 use sysreqs::{
     SystemDependencyPlan, cached_latest_snapshot, current_host_platform,
     empty_snapshot as empty_sysreq_snapshot, install as install_system_dependencies,
@@ -456,15 +460,17 @@ fn cmd_add(
             None => BTreeMap::new(),
         };
         let roots = add_resolution_roots(&description, &requested_packages);
-        let resolved =
-            resolve_from_registry(&repositories, &roots, &preferred_versions).map_err(|error| {
-                LockError::ResolveFailed {
-                    details: format!(
-                        "could not resolve a compatible dependency set for {}: {error}",
-                        new_packages.join(", ")
-                    ),
-                }
-            })?;
+        let resolved = resolve_from_registry(
+            rrepo_package_repositories(&repositories),
+            &roots,
+            &preferred_versions,
+        )
+        .map_err(|error| LockError::ResolveFailed {
+            details: format!(
+                "could not resolve a compatible dependency set for {}: {error}",
+                new_packages.join(", ")
+            ),
+        })?;
         warn_cran_archive_unavailable(&repositories);
         let constraints = constraints_from_resolved_roots(&new_packages, &resolved)
             .map_err(|details| LockError::ResolveFailed { details })?;
@@ -1235,12 +1241,14 @@ fn lock_from_description(
             .collect(),
         None => BTreeMap::new(),
     };
-    let resolved =
-        resolve_from_registry(&repositories, &roots, &preferred_versions).map_err(|details| {
-            LockError::ResolveFailed {
-                details: details.to_string(),
-            }
-        })?;
+    let resolved = resolve_from_registry(
+        rrepo_package_repositories(&repositories),
+        &roots,
+        &preferred_versions,
+    )
+    .map_err(|details| LockError::ResolveFailed {
+        details: details.to_string(),
+    })?;
     warn_cran_archive_unavailable(&repositories);
 
     let lockfile =
@@ -1553,6 +1561,16 @@ fn locked_repository_kind(kind: RepositoryKind) -> LockedRepositoryKind {
         RepositoryKind::Rrepo => LockedRepositoryKind::Rrepo,
         RepositoryKind::CranLike => LockedRepositoryKind::CranLike,
     }
+}
+
+fn rrepo_package_repositories(repositories: &RepositorySet) -> Vec<Rc<dyn PackageRepository>> {
+    repositories
+        .sources()
+        .iter()
+        .map(|source| {
+            Rc::new(RrepoPackageRepository::new(source.base_url())) as Rc<dyn PackageRepository>
+        })
+        .collect()
 }
 
 fn locked_cran_archive_support(support: CranArchiveSupport) -> LockedCranArchiveSupport {
