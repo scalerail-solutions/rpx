@@ -10,15 +10,17 @@ categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 clap = { version = "4.6.0", features = ["derive"] }
+bytes = "1"
 deb822-fast = "0.2.3"
 directories = "6.0.0"
 flate2 = "1.1.5"
+futures-core = "0.3"
 indicatif = "0.18.4"
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "linux-native", "windows-native"] }
 miette = { version = "7.6.0", features = ["fancy"] }
 pubgrub = "0.3.0"
 regex = "1.12.2"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
 rpassword = "7.3.1"
 r-description = "0.3.7"
 serde = { version = "1.0", features = ["derive"] }

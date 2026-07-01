@@ -14,6 +14,7 @@ use thiserror::Error;
 
 mod cli;
 mod description;
+mod http;
 mod lockfile;
 mod output;
 mod project;
