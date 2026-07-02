@@ -430,7 +430,7 @@ pub async fn rrepo_macos_binary(
     artifact_response(client, url).await
 }
 
-pub async fn cran_packages_gz(
+async fn cran_packages_gz(
     client: &reqwest::Client,
     base_url: &reqwest::Url,
 ) -> Result<CranPackagesIndex, HttpError> {
@@ -476,7 +476,7 @@ pub async fn cran_packages_gz(
         .map_err(|details| HttpError::PackagesParseFailed { url, details })
 }
 
-pub async fn cran_packages(
+async fn cran_packages_uncompressed(
     client: &reqwest::Client,
     base_url: &reqwest::Url,
 ) -> Result<CranPackagesIndex, HttpError> {
@@ -511,6 +511,16 @@ pub async fn cran_packages(
 
     CranPackagesIndex::from_str(&body)
         .map_err(|details| HttpError::PackagesParseFailed { url, details })
+}
+
+pub async fn cran_packages(
+    client: &reqwest::Client,
+    base_url: &reqwest::Url,
+) -> Result<CranPackagesIndex, HttpError> {
+    match cran_packages_gz(client, base_url).await {
+        Ok(index) => Ok(index),
+        Err(_) => cran_packages_uncompressed(client, base_url).await,
+    }
 }
 
 pub async fn cran_archive_root(

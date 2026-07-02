@@ -329,8 +329,9 @@ fn dependency_operator_rank(entry: &DescriptionDependency) -> u8 {
         Some(VersionConstraint::GreaterThanEqual) => 1,
         Some(VersionConstraint::GreaterThan) => 2,
         Some(VersionConstraint::Equal) => 3,
-        Some(VersionConstraint::LessThanEqual) => 4,
-        Some(VersionConstraint::LessThan) => 5,
+        Some(VersionConstraint::NotEqual) => 4,
+        Some(VersionConstraint::LessThanEqual) => 5,
+        Some(VersionConstraint::LessThan) => 6,
     }
 }
 
@@ -401,10 +402,8 @@ fn parse_constraint(constraint: &str) -> Result<(VersionConstraint, &str), Strin
     for (prefix, operator) in [
         (">=", VersionConstraint::GreaterThanEqual),
         ("<=", VersionConstraint::LessThanEqual),
-        ("<<", VersionConstraint::LessThan),
-        (">>", VersionConstraint::GreaterThan),
         ("==", VersionConstraint::Equal),
-        ("=", VersionConstraint::Equal),
+        ("!=", VersionConstraint::NotEqual),
         ("<", VersionConstraint::LessThan),
         (">", VersionConstraint::GreaterThan),
     ] {
@@ -437,7 +436,8 @@ fn relation_operator(operator: &VersionConstraint) -> &'static str {
         VersionConstraint::GreaterThan => ">",
         VersionConstraint::LessThanEqual => "<=",
         VersionConstraint::GreaterThanEqual => ">=",
-        VersionConstraint::Equal => "=",
+        VersionConstraint::Equal => "==",
+        VersionConstraint::NotEqual => "!=",
     }
 }
 
@@ -594,8 +594,8 @@ mod tests {
             (VersionConstraint::LessThan, "2.0.0")
         );
         assert_eq!(
-            parse_constraint("<< 2.0.0").unwrap(),
-            (VersionConstraint::LessThan, "2.0.0")
+            parse_constraint("!= 2.0.0").unwrap(),
+            (VersionConstraint::NotEqual, "2.0.0")
         );
         assert_eq!(
             relation_with_constraint("dplyr", "< 2.0.0")
@@ -683,7 +683,7 @@ mod tests {
     #[test]
     fn normalizes_strict_relation_operators_for_resolution_roots() {
         let description = RDescription::from_str(
-            "Package: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\nImports: AzureAuth (<< 2.0.0), httr2 (>> 1.0.0)\n",
+            "Package: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\nImports: AzureAuth (< 2.0.0), httr2 (> 1.0.0)\n",
         )
         .expect("description should parse");
 

@@ -153,45 +153,6 @@ impl RegistryClient {
         }
     }
 
-    pub fn fetch_repository_packages(&self) -> Result<RepositoryPackagesResponse, String> {
-        let response = self
-            .request(reqwest::Method::GET, format!("{}/packages", self.base_url))
-            .send()
-            .map_err(|error| format!("failed to contact registry: {error}"))?;
-
-        decode_json_response(response, "failed to decode repository packages response")
-    }
-
-    #[cfg(test)]
-    fn fetch_package_versions(&self, package: &str) -> Result<PackageVersionsResponse, String> {
-        if let Some(response) = read_json_cache_fresh(
-            &self.package_versions_cache_path(package),
-            self.version_cache_ttl,
-        ) {
-            return Ok(response);
-        }
-
-        if self.missing_package_cache_path(package).exists() {
-            return Err(missing_package_error(package));
-        }
-
-        match self.fetch_package_versions_once(package) {
-            Err(error) if is_not_found_error(&error) => {
-                write_missing_package_cache(&self.missing_package_cache_path(package));
-                Err(missing_package_error(package))
-            }
-            Err(error) => Err(error),
-            Ok(PackageVersionsEnvelope::Complete(response)) => {
-                let _ = fs::remove_file(self.missing_package_cache_path(package));
-                write_json_cache(&self.package_versions_cache_path(package), &response);
-                Ok(response)
-            }
-            Ok(PackageVersionsEnvelope::Ingesting(_)) => {
-                Err("registry is still hydrating dependencies; wait a bit and retry".to_string())
-            }
-        }
-    }
-
     pub fn fetch_package_versions_with_retry(
         &self,
         package: &str,
@@ -582,27 +543,6 @@ mod tests {
     }
 
     #[test]
-    fn fetches_all_package_versions() {
-        let mut server = Server::new();
-        let mock = server
-            .mock("GET", "/packages/dplyr/versions")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(sample_package_versions_body())
-            .create();
-
-        let client = RegistryClient::new(server.url());
-        let response = client
-            .fetch_package_versions("dplyr")
-            .expect("package versions fetch should succeed");
-
-        mock.assert();
-        assert_eq!(response.package, "dplyr");
-        assert_eq!(response.versions.len(), 2);
-        assert_eq!(response.versions[1].version, "1.1.3");
-    }
-
-    #[test]
     fn polls_until_package_versions_are_ready() {
         let mut server = Server::new();
         let _first = server
@@ -898,30 +838,5 @@ mod tests {
     fn clear_cached_artifact(package: &str, version: &str, file_name: &str) {
         let path = artifact_cache_path(package, version, file_name);
         let _ = fs::remove_file(&path);
-    }
-
-    #[test]
-    fn sends_bearer_auth_when_token_is_configured() {
-        let mut server = Server::new();
-        let mock = server
-            .mock("GET", "/packages")
-            .match_header("authorization", "Bearer secret-token")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(
-                r#"{
-  "repositorySlug": "test",
-  "packages": []
-}"#,
-            )
-            .create();
-
-        let client = RegistryClient::with_token(server.url(), Some("secret-token".to_string()));
-        let response = client
-            .fetch_repository_packages()
-            .expect("repository listing should succeed");
-
-        mock.assert();
-        assert_eq!(response.repository_slug, "test");
     }
 }

@@ -6,7 +6,7 @@ use std::{
     hash::{Hash, Hasher},
     io::IsTerminal,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Mutex, OnceLock, mpsc},
     thread,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -52,7 +52,7 @@ use registry::{
 };
 use repository::{
     CranArchiveSupport, RepositoryKind, RepositorySet, RepositorySource,
-    cran_like_source_from_package_url, detect_cran_like_archive_support, normalize_repository_url,
+    cran_like_source_from_package_url, normalize_repository_url,
     repository_source_from_package_url,
 };
 use resolver::{ResolvedPackage, is_base_package, resolve_from_registry};
@@ -70,6 +70,7 @@ use ui::{InstallKind, SyncUi, SystemDepsUi};
 const DOWNLOAD_WORKERS: usize = 8;
 const INSTALL_WORKERS: usize = 8;
 const MAX_SOURCE_BUILDS: usize = 4;
+static REPOSITORY_CLASSIFIER_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 type RpxResult<T> = Result<T, RpxError>;
 
@@ -539,10 +540,11 @@ fn cmd_repo(command: RepoCommands) -> RpxResult<()> {
 
 fn cmd_repo_add(url: &str) -> RpxResult<()> {
     let mut description = read_description()?;
-    let source = detect_repository_source(url).map_err(|details| RepoError::Add {
+    let repository_type = classify_repository_type(url).map_err(|details| RepoError::Add {
         url: normalize_repository_url(url),
         details,
     })?;
+    let source = repository_source_from_type(url, repository_type);
 
     let mut additional_repositories = description.additional_repositories.clone();
     if additional_repositories
@@ -563,33 +565,67 @@ fn cmd_repo_add(url: &str) -> RpxResult<()> {
     Ok(())
 }
 
-fn detect_repository_source(url: &str) -> Result<RepositorySource, String> {
-    classify_repository_source(url)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepositoryType {
+    Rrepo,
+    CranLike {
+        archive_support: Option<CranArchiveSupport>,
+    },
 }
 
-fn classify_repository_source(url: &str) -> Result<RepositorySource, String> {
-    let rrepo = RepositorySource::new(url);
-    let rrepo_set = RepositorySet::new(vec![rrepo.clone()]);
-    match rrepo_set.fetch_repository_packages(&rrepo) {
-        Ok(_) => Ok(rrepo),
-        Err(rrepo_error) => {
-            let cran_like = RepositorySource::cran_like(url);
-            let cran_like_set = RepositorySet::new(vec![cran_like.clone()]);
-            match cran_like_set.fetch_repository_packages(&cran_like) {
-                Ok(_) => {
-                    let archive_support = detect_cran_like_archive_support(&cran_like)?;
-                    Ok(match archive_support {
-                        Some(archive_support) => {
-                            RepositorySource::cran_like_with_archive_support(url, archive_support)
-                        }
-                        None => RepositorySource::cran_like(url),
-                    })
-                }
-                Err(cran_error) => Err(format!(
-                    "not an rrepo API ({rrepo_error}) or CRAN-like repository ({cran_error})"
-                )),
-            }
+fn classify_repository_type(url: &str) -> Result<RepositoryType, String> {
+    REPOSITORY_CLASSIFIER_RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Runtime::new().expect("repository classifier runtime should start")
+        })
+        .block_on(classify_repository_type_async(url))
+}
+
+async fn classify_repository_type_async(url: &str) -> Result<RepositoryType, String> {
+    let normalized_url = normalize_repository_url(url);
+    let base_url = reqwest::Url::parse(&normalized_url)
+        .map_err(|error| format!("invalid repository URL {normalized_url}: {error}"))?;
+    let client = reqwest::Client::new();
+
+    match http::rrepo_repository_packages(&client, &base_url).await {
+        Ok(_) => Ok(RepositoryType::Rrepo),
+        Err(rrepo_error) => match http::cran_packages(&client, &base_url).await {
+            Ok(_) => Ok(RepositoryType::CranLike {
+                archive_support: classify_cran_like_archive_support(&client, &base_url).await?,
+            }),
+            Err(cran_error) => Err(format!(
+                "not an rrepo API ({rrepo_error}) or CRAN-like repository ({cran_error})"
+            )),
+        },
+    }
+}
+
+async fn classify_cran_like_archive_support(
+    client: &reqwest::Client,
+    base_url: &reqwest::Url,
+) -> Result<Option<CranArchiveSupport>, String> {
+    match http::cran_archive_root(client, base_url).await {
+        Ok(_) => Ok(Some(CranArchiveSupport::Available)),
+        Err(http::HttpError::UnexpectedStatus { status, .. })
+            if status == reqwest::StatusCode::NOT_FOUND
+                || status == reqwest::StatusCode::FORBIDDEN =>
+        {
+            Ok(Some(CranArchiveSupport::Unavailable))
         }
+        Err(http::HttpError::RequestFailed { .. }) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn repository_source_from_type(url: &str, repository_type: RepositoryType) -> RepositorySource {
+    match repository_type {
+        RepositoryType::Rrepo => RepositorySource::new(url),
+        RepositoryType::CranLike { archive_support } => match archive_support {
+            Some(archive_support) => {
+                RepositorySource::cran_like_with_archive_support(url, archive_support)
+            }
+            None => RepositorySource::cran_like(url),
+        },
     }
 }
 
@@ -1021,14 +1057,14 @@ impl DefaultRepositoryPreference {
                 continue;
             }
 
-            sources.push(classify_repository_source(url).map_err(|details| {
-                LockError::ResolveFailed {
+            let repository_type =
+                classify_repository_type(url).map_err(|details| LockError::ResolveFailed {
                     details: format!(
                         "failed to classify configured repository {}: {details}",
                         normalize_repository_url(url)
                     ),
-                }
-            })?);
+                })?;
+            sources.push(repository_source_from_type(url, repository_type));
         }
         Ok(RepositorySet::new(sources))
     }
@@ -2677,9 +2713,9 @@ fn read_log_tail(path: &Path, max_lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DefaultRepositoryPreference, LockfileCompatibilityError, add_resolution_roots,
-        binary_artifact_request, classify_repository_source, compiled_cache_key,
-        constraints_from_resolved_roots, cran_like_binary_artifact_request,
+        DefaultRepositoryPreference, LockfileCompatibilityError, RepositoryType,
+        add_resolution_roots, binary_artifact_request, classify_repository_type,
+        compiled_cache_key, constraints_from_resolved_roots, cran_like_binary_artifact_request,
         default_registry_base_url, locked_install_order, lockfile_from_resolution,
         persisted_constraints, preferred_artifact, r_minor_version, semver_add_constraint,
         should_fallback_to_source, validate_lockfile_compatibility,
@@ -2707,7 +2743,7 @@ mod tests {
     #[test]
     fn builds_resolution_roots_from_description_constraints() {
         let description = RDescription::from_str(
-            "Package: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\nImports: cli (>= 3.6.0), digest\nDepends: R (>= 4.2), jsonlite (= 1.8.9)\n",
+            "Package: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\nImports: cli (>= 3.6.0), digest\nDepends: R (>= 4.2), jsonlite (== 1.8.9)\n",
         )
         .expect("description should parse");
 
@@ -2734,7 +2770,7 @@ mod tests {
                 },
                 ResolutionRoot {
                     name: "jsonlite".to_string(),
-                    constraint: "= 1.8.9".to_string(),
+                    constraint: "== 1.8.9".to_string(),
                 },
             ]
         );
@@ -2943,9 +2979,10 @@ mod tests {
             .expect(1)
             .create();
 
-        let source = classify_repository_source(&server.url()).expect("rrepo should classify");
+        let repository_type =
+            classify_repository_type(&server.url()).expect("rrepo should classify");
 
-        assert_eq!(source.kind(), RepositoryKind::Rrepo);
+        assert_eq!(repository_type, RepositoryType::Rrepo);
         packages_mock.assert();
     }
 
@@ -2975,12 +3012,14 @@ mod tests {
             .expect(1)
             .create();
 
-        let source = classify_repository_source(&server.url()).expect("CRAN-like should classify");
+        let repository_type =
+            classify_repository_type(&server.url()).expect("CRAN-like should classify");
 
-        assert_eq!(source.kind(), RepositoryKind::CranLike);
         assert_eq!(
-            source.cran_archive_support(),
-            Some(CranArchiveSupport::Unavailable)
+            repository_type,
+            RepositoryType::CranLike {
+                archive_support: Some(CranArchiveSupport::Unavailable)
+            }
         );
         rrepo_mock.assert();
         gz_mock.assert();

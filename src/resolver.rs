@@ -514,6 +514,7 @@ fn relation_bounds(relation: &DescriptionDependency) -> (Option<String>, Option<
             (None, Some(version.to_string()))
         }
         VersionConstraint::Equal => (Some(version.to_string()), None),
+        VersionConstraint::NotEqual => (None, None),
     }
 }
 
@@ -529,6 +530,11 @@ fn range_from_relation(relation: &DescriptionDependency) -> Result<VersionRange,
         VersionConstraint::GreaterThanEqual => VersionRange::higher_than(version.clone()),
         VersionConstraint::LessThan => VersionRange::strictly_lower_than(version.clone()),
         VersionConstraint::LessThanEqual => VersionRange::lower_than(version.clone()),
+        VersionConstraint::NotEqual => {
+            return Err(ResolverError(
+                "not-equal dependency constraints are not supported".to_string(),
+            ));
+        }
     })
 }
 
@@ -559,6 +565,11 @@ fn range_from_constraint_part(constraint: &str) -> Result<VersionRange, Resolver
         ParsedConstraint::Gte => VersionRange::higher_than(version),
         ParsedConstraint::Lt => VersionRange::strictly_lower_than(version),
         ParsedConstraint::Lte => VersionRange::lower_than(version),
+        ParsedConstraint::Ne => {
+            return Err(ResolverError(
+                "not-equal dependency constraints are not supported".to_string(),
+            ));
+        }
     })
 }
 
@@ -566,12 +577,10 @@ fn parse_constraint_part(constraint: &str) -> (ParsedConstraint, &str) {
     for (prefix, operator) in [
         (">=", ParsedConstraint::Gte),
         ("<=", ParsedConstraint::Lte),
-        (">>", ParsedConstraint::Gt),
-        ("<<", ParsedConstraint::Lt),
         ("==", ParsedConstraint::Eq),
+        ("!=", ParsedConstraint::Ne),
         (">", ParsedConstraint::Gt),
         ("<", ParsedConstraint::Lt),
-        ("=", ParsedConstraint::Eq),
     ] {
         if let Some(version) = constraint.strip_prefix(prefix) {
             return (operator, version.trim());
@@ -602,6 +611,7 @@ enum ParsedConstraint {
     Gte,
     Lt,
     Lte,
+    Ne,
 }
 
 #[cfg(test)]
