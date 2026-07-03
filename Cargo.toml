@@ -15,23 +15,26 @@ deb822-fast = "0.2.3"
 directories = "6.0.0"
 flate2 = "1.1.5"
 futures-core = "0.3"
+futures-util = "0.3"
 indicatif = "0.18.4"
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "linux-native", "windows-native"] }
 miette = { version = "7.6.0", features = ["fancy"] }
 moka = { version = "0.12", features = ["future"] }
 pubgrub = "0.3.0"
 regex = "1.12.2"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls", "stream"] }
+reqwest-middleware = "0.5"
+reqwest-tracing = "0.7"
 rpassword = "7.3.1"
 r-description = { version = "0.3.8", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tar = "0.4.44"
 thiserror = "2.0.17"
-tokio = { version = "1.51.1", features = ["rt-multi-thread"] }
+tokio = { version = "1.51.1", features = ["rt-multi-thread", "process", "fs", "io-util"] }
 tracing = "0.1.41"
 tracing-indicatif = "0.3.13"
-tracing-subscriber = "0.3.19"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 [dev-dependencies]
 mockito = "1.7.0"
 testcontainers = { version = "0.27.2", features = ["blocking"] }

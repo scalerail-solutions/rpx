@@ -69,17 +69,6 @@ pub fn artifact_cache_path(package: &str, version: &str, file_name: &str) -> Pat
     path
 }
 
-pub fn compiled_cache_package_path(cache_key: &str, package: &str) -> PathBuf {
-    let path = project_dirs()
-        .cache_dir()
-        .join("builds")
-        .join(cache_key)
-        .join("library")
-        .join(package);
-    ensure_parent_dir(&path);
-    path
-}
-
 pub fn build_temp_library_path(package: &str, unique: &str) -> PathBuf {
     let path = project_dirs()
         .cache_dir()

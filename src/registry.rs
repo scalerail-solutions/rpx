@@ -1,11 +1,10 @@
-use crate::project::{artifact_cache_path, cache_dir_path};
+use crate::project::cache_dir_path;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::hash_map::DefaultHasher,
     fs,
     hash::{Hash, Hasher},
-    io::{Read, Write},
     path::{Path, PathBuf},
     thread,
     time::Duration,
@@ -94,25 +93,6 @@ pub struct RegistryClient {
     client: reqwest::blocking::Client,
     poll_config: PollConfig,
     version_cache_ttl: Duration,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ArtifactKind {
-    Source,
-    Binary,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ArtifactRequest {
-    pub kind: ArtifactKind,
-    pub url: String,
-    pub cache_file_name: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DownloadProgress {
-    ContentLength(u64),
-    Advanced(u64),
 }
 
 impl Default for RegistryClient {
@@ -278,64 +258,6 @@ impl RegistryClient {
             .join(format!("{version}.dcf"))
     }
 
-    pub fn download_artifact_with_progress(
-        &self,
-        package: &str,
-        version: &str,
-        artifact: &ArtifactRequest,
-        mut on_progress: impl FnMut(DownloadProgress),
-    ) -> Result<DownloadedArtifact, String> {
-        let path = artifact_cache_path(package, version, &artifact.cache_file_name);
-        if path.exists() {
-            return Ok(DownloadedArtifact { path });
-        }
-
-        let artifact_label = match artifact.kind {
-            ArtifactKind::Source => "source artifact",
-            ArtifactKind::Binary => "binary artifact",
-        };
-        let response = self
-            .request(reqwest::Method::GET, &artifact.url)
-            .send()
-            .map_err(|error| format!("failed to download {artifact_label}: {error}"))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().unwrap_or_default();
-            let body = body.trim();
-
-            if body.is_empty() {
-                return Err(format!("artifact download failed ({status})"));
-            }
-
-            return Err(format!("artifact download failed ({status}): {body}"));
-        }
-
-        if let Some(length) = response.content_length() {
-            on_progress(DownloadProgress::ContentLength(length));
-        }
-
-        let mut file = fs::File::create(&path)
-            .map_err(|error| format!("failed to write {artifact_label}: {error}"))?;
-        let mut response = response;
-        let mut buffer = [0_u8; 16 * 1024];
-
-        loop {
-            let read = response
-                .read(&mut buffer)
-                .map_err(|error| format!("failed to read {artifact_label}: {error}"))?;
-            if read == 0 {
-                break;
-            }
-
-            file.write_all(&buffer[..read])
-                .map_err(|error| format!("failed to write {artifact_label}: {error}"))?;
-            on_progress(DownloadProgress::Advanced(read as u64));
-        }
-
-        Ok(DownloadedArtifact { path })
-    }
-
     fn request(
         &self,
         method: reqwest::Method,
@@ -490,21 +412,9 @@ fn missing_package_error(package: &str) -> String {
     format!("unexpected registry response (404 Not Found): package {package} not found")
 }
 
-#[derive(Debug)]
-pub struct DownloadedArtifact {
-    path: PathBuf,
-}
-
-impl DownloadedArtifact {
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::project::artifact_cache_path;
     use mockito::Server;
 
     fn sample_ingesting_body() -> &'static str {
@@ -732,111 +642,5 @@ mod tests {
 
         second.assert();
         assert!(response.contains("Version: 1.1.4"));
-    }
-
-    #[test]
-    fn downloads_source_artifact_to_a_local_file() {
-        clear_cached_artifact("digest", "0.6.37", "digest_0.6.37_download.tar.gz");
-
-        let mut server = Server::new();
-        let mock = server
-            .mock("GET", "/packages/digest/versions/0.6.37/source")
-            .with_status(200)
-            .with_header("content-type", "application/gzip")
-            .with_body("fake-tarball")
-            .create();
-
-        let client = RegistryClient::new(server.url());
-        let artifact = client
-            .download_artifact_with_progress(
-                "digest",
-                "0.6.37",
-                &ArtifactRequest {
-                    kind: ArtifactKind::Source,
-                    url: format!("{}/packages/digest/versions/0.6.37/source", server.url()),
-                    cache_file_name: "digest_0.6.37_download.tar.gz".to_string(),
-                },
-                |_| {},
-            )
-            .expect("download should succeed");
-
-        mock.assert();
-        let contents = fs::read(artifact.path()).expect("artifact should exist");
-        assert_eq!(contents, b"fake-tarball");
-        clear_cached_artifact("digest", "0.6.37", "digest_0.6.37_download.tar.gz");
-    }
-
-    #[test]
-    fn surfaces_source_artifact_download_errors() {
-        clear_cached_artifact("digest", "0.6.37", "digest_0.6.37_error.tar.gz");
-
-        let mut server = Server::new();
-        let mock = server
-            .mock("GET", "/packages/digest/versions/0.6.37/source")
-            .with_status(500)
-            .with_body("tarball missing")
-            .create();
-
-        let client = RegistryClient::new(server.url());
-        let error = client
-            .download_artifact_with_progress(
-                "digest",
-                "0.6.37",
-                &ArtifactRequest {
-                    kind: ArtifactKind::Source,
-                    url: format!("{}/packages/digest/versions/0.6.37/source", server.url()),
-                    cache_file_name: "digest_0.6.37_error.tar.gz".to_string(),
-                },
-                |_| {},
-            )
-            .expect_err("download should fail");
-
-        mock.assert();
-        assert!(
-            error.contains("artifact download failed (500 Internal Server Error): tarball missing")
-        );
-    }
-
-    #[test]
-    fn downloads_binary_artifact_to_a_local_file() {
-        clear_cached_artifact("digest", "0.6.37", "digest_0.6.37.zip");
-
-        let mut server = Server::new();
-        let mock = server
-            .mock(
-                "GET",
-                "/packages/digest/versions/0.6.37/binaries/windows/4.5",
-            )
-            .with_status(200)
-            .with_header("content-type", "application/zip")
-            .with_body("fake-zip")
-            .create();
-
-        let client = RegistryClient::new(server.url());
-        let artifact = client
-            .download_artifact_with_progress(
-                "digest",
-                "0.6.37",
-                &ArtifactRequest {
-                    kind: ArtifactKind::Binary,
-                    url: format!(
-                        "{}/packages/digest/versions/0.6.37/binaries/windows/4.5",
-                        server.url()
-                    ),
-                    cache_file_name: "digest_0.6.37.zip".to_string(),
-                },
-                |_| {},
-            )
-            .expect("download should succeed");
-
-        mock.assert();
-        let contents = fs::read(artifact.path()).expect("artifact should exist");
-        assert_eq!(contents, b"fake-zip");
-        clear_cached_artifact("digest", "0.6.37", "digest_0.6.37.zip");
-    }
-
-    fn clear_cached_artifact(package: &str, version: &str, file_name: &str) {
-        let path = artifact_cache_path(package, version, file_name);
-        let _ = fs::remove_file(&path);
     }
 }

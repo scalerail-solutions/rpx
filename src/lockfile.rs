@@ -66,7 +66,7 @@ pub struct LockedRoot {
     pub constraint: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 pub struct LockedPackage {
     pub package: String,
     pub version: String,
@@ -78,7 +78,7 @@ pub struct LockedPackage {
     pub dependencies: Vec<LockedDependency>,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 pub struct LockedDependency {
     pub package: String,
     pub kind: String,

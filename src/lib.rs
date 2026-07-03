@@ -1,17 +1,30 @@
 use clap::Parser;
+use futures_util::StreamExt;
 use miette::Diagnostic;
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     env, fs,
-    hash::{Hash, Hasher},
     io::IsTerminal,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, mpsc},
-    thread,
+    sync::OnceLock,
     time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
+use tokio::process::Command;
+use tracing::Instrument;
+use tracing_indicatif::{
+    filter::{IndicatifFilter, hide_indicatif_span_fields},
+    span_ext::IndicatifSpanExt,
+    style::ProgressStyle,
+};
+use tracing_subscriber::{
+    EnvFilter,
+    fmt::format::DefaultFields,
+    layer::{Layer, SubscriberExt},
+    util::SubscriberInitExt,
+};
 
+mod cache;
 mod cli;
 mod description;
 mod http;
@@ -38,22 +51,13 @@ use lockfile::{
 };
 use output::{blank_note_line, blank_status_line, note, prompt, status, warning};
 use project::{
-    build_temp_library_path, cache_dir_path, compiled_cache_package_path, project_library_path,
+    artifact_cache_path, build_temp_library_path, cache_dir_path, project_library_path,
     project_library_root_path,
 };
-use r::{
-    InstallFailure, RuntimeInfo, base_packages, install_local_package, installed_packages,
-    installed_packages_by_name, project_command, remove_installed_package_dir,
-    remove_installed_packages, runtime_info,
-};
-use registry::{
-    ArtifactKind, ArtifactRequest, DEFAULT_REGISTRY_BASE_URL, DownloadProgress, DownloadedArtifact,
-    ResolutionRoot,
-};
+use r::{InstallFailure, base_packages, install_local_package, installed_packages, runtime_info};
+use registry::{DEFAULT_REGISTRY_BASE_URL, ResolutionRoot};
 use repository::{
-    CranArchiveSupport, RepositoryKind, RepositorySet, RepositorySource,
-    cran_like_source_from_package_url, normalize_repository_url,
-    repository_source_from_package_url,
+    CranArchiveSupport, RepositoryKind, RepositorySet, RepositorySource, normalize_repository_url,
 };
 use resolver::{ResolvedPackage, is_base_package, resolve_from_registry};
 use sysreqs::{
@@ -65,11 +69,15 @@ use sysreqs::{
     refresh_preview_command as system_metadata_refresh_preview,
     resolve_plan as resolve_system_plan,
 };
-use ui::{InstallKind, SyncUi, SystemDepsUi};
+use ui::SystemDepsUi;
 
-const DOWNLOAD_WORKERS: usize = 8;
-const INSTALL_WORKERS: usize = 8;
-const MAX_SOURCE_BUILDS: usize = 4;
+use crate::{
+    cache::CompiledPackageCacheKey,
+    lockfile::LockedPackage,
+    r::{RVirtualEnv, installed_packages_async, r_version_async, remove_packages_from_venv},
+};
+use tokio::io::AsyncWriteExt;
+
 static REPOSITORY_CLASSIFIER_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 type RpxResult<T> = Result<T, RpxError>;
@@ -222,52 +230,9 @@ enum SyncError {
     #[diagnostic(code(rpx::sync::system_dependencies_failed))]
     SystemDependenciesFailed { details: String },
 
-    #[error("failed to restore cached package {package}@{version}: {details}")]
-    #[diagnostic(code(rpx::sync::restore_cached_package_failed))]
-    RestoreCachedPackageFailed {
-        package: String,
-        version: String,
-        details: String,
-    },
-
     #[error("failed to prepare source artifacts: {details}")]
     #[diagnostic(code(rpx::sync::download_failed))]
     DownloadArtifactsFailed { details: String },
-
-    #[error("no installable packages remain after dependency resolution: {packages}")]
-    #[diagnostic(
-        code(rpx::sync::install_order_blocked),
-        help("This indicates a bug in dependency resolution or lockfile dependency metadata.")
-    )]
-    NoInstallablePackages { packages: String },
-
-    #[error("failed to cache built package {package}@{version}: {details}")]
-    #[diagnostic(code(rpx::sync::cache_built_package_failed))]
-    CacheBuiltPackageFailed {
-        package: String,
-        version: String,
-        details: String,
-    },
-
-    #[error("project library did not match rpx.lock after sync")]
-    #[diagnostic(code(rpx::sync::post_sync_verification_failed))]
-    PostSyncVerificationFailed,
-
-    #[error(
-        "failed to install {package}@{version}\nexit status: {exit_status}\nsummary: {summary}\nlog: {log_path}{recent_output}"
-    )]
-    #[diagnostic(
-        code(rpx::sync::install_failed),
-        help("Review the install log for the full build output.")
-    )]
-    InstallFailed {
-        package: String,
-        version: String,
-        exit_status: String,
-        summary: String,
-        log_path: String,
-        recent_output: String,
-    },
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -371,6 +336,40 @@ pub fn run() -> miette::Result<()> {
     Ok(())
 }
 
+fn init_tracing() {
+    let indicatif_layer = tracing_indicatif::IndicatifLayer::new()
+        .with_span_field_formatter(hide_indicatif_span_fields(DefaultFields::new()))
+        .with_progress_style(progress_spinner_style())
+        .with_max_progress_bars(
+            10,
+            Some(
+                ProgressStyle::with_template("...and {pending_progress_bars} more packages")
+                    .expect("progress footer style should be valid"),
+            ),
+        );
+    let filter = EnvFilter::new("warn,reqwest_tracing=info,rpx=info");
+    let fmt_layer =
+        tracing_subscriber::fmt::layer().with_writer(indicatif_layer.get_stderr_writer());
+
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt_layer)
+        .with(indicatif_layer.with_filter(IndicatifFilter::new(false)))
+        .try_init();
+}
+
+fn progress_spinner_style() -> ProgressStyle {
+    ProgressStyle::with_template("{span_child_prefix}{spinner} {msg}")
+        .expect("progress spinner style should be valid")
+}
+
+fn progress_bar_style() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "{span_child_prefix}{spinner} {msg} [{bar:24.cyan/blue}] {bytes}/{total_bytes}",
+    )
+    .expect("progress bar style should be valid")
+}
+
 fn run_inner() -> RpxResult<()> {
     let cli = Cli::parse();
 
@@ -392,7 +391,11 @@ fn run_inner() -> RpxResult<()> {
             &packages,
             DefaultRepositoryPreference::from_flags(default_repo, no_default_repo),
         ),
-        Commands::Run { command } => cmd_run(&command),
+        Commands::Run { command } => REPOSITORY_CLASSIFIER_RUNTIME
+            .get_or_init(|| {
+                tokio::runtime::Runtime::new().expect("repository classifier runtime should start")
+            })
+            .block_on(cmd_run(&command)),
         Commands::Lock {
             default_repo,
             no_default_repo,
@@ -585,7 +588,7 @@ async fn classify_repository_type_async(url: &str) -> Result<RepositoryType, Str
     let normalized_url = normalize_repository_url(url);
     let base_url = reqwest::Url::parse(&normalized_url)
         .map_err(|error| format!("invalid repository URL {normalized_url}: {error}"))?;
-    let client = reqwest::Client::new();
+    let client = http::client();
 
     match http::rrepo_repository_packages(&client, &base_url).await {
         Ok(_) => Ok(RepositoryType::Rrepo),
@@ -601,7 +604,7 @@ async fn classify_repository_type_async(url: &str) -> Result<RepositoryType, Str
 }
 
 async fn classify_cran_like_archive_support(
-    client: &reqwest::Client,
+    client: &http::HttpClient,
     base_url: &reqwest::Url,
 ) -> Result<Option<CranArchiveSupport>, String> {
     match http::cran_archive_root(client, base_url).await {
@@ -738,46 +741,21 @@ fn cmd_remove(
     }
     write_description(&description)?;
 
-    let installed = installed_packages_by_name();
-    let mut removed = Vec::new();
-    let mut missing = Vec::new();
-    for package in packages {
-        if installed.contains_key(package) {
-            removed.push(package.clone());
-        } else {
-            missing.push(package.clone());
-            remove_installed_package_dir(package);
-        }
-    }
-
-    if !removed.is_empty() {
-        remove_installed_packages(&removed);
-    }
-
     let _ = lock_from_description(repository_preference)?;
     let _ = sync_from_lockfile(false, false)?;
 
-    if !removed.is_empty() {
-        status(format_args!("Removed {}", removed.join(", ")));
-    }
-    if !missing.is_empty() {
-        status(format_args!(
-            "{} {} already missing from the project library",
-            missing.join(", "),
-            if missing.len() == 1 { "is" } else { "are" }
-        ));
-    }
     Ok(())
 }
 
-fn cmd_run(command: &[String]) -> RpxResult<()> {
+async fn cmd_run(command: &[String]) -> RpxResult<()> {
     let (program, args) = command
         .split_first()
         .expect("run command requires at least one argument");
 
-    let status = project_command(program)
+    let status = Command::with_venv(program)
         .args(args)
         .status()
+        .await
         .map_err(|source| RunError::CommandFailed {
             program: program.clone(),
             source,
@@ -1082,66 +1060,6 @@ enum LockfileCompatibilityError {
     Newer,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PendingInstall {
-    name: String,
-    version: String,
-    artifact: ArtifactRequest,
-    binary_fallback_artifacts: Vec<ArtifactRequest>,
-    fallback_artifact: Option<ArtifactRequest>,
-    install_kind: InstallKind,
-    install_type: String,
-    dependencies: BTreeSet<String>,
-    cache_key: String,
-    cache_path: PathBuf,
-}
-
-#[derive(Debug)]
-struct CompletedBuild {
-    package: PendingInstall,
-    temp_library: PathBuf,
-}
-
-#[derive(Debug)]
-struct DownloadedInstall {
-    artifact: DownloadedArtifact,
-    install_kind: InstallKind,
-    install_type: String,
-}
-
-#[derive(Debug)]
-enum InstallEvent {
-    Finished {
-        package: PendingInstall,
-        result: Result<CompletedBuild, InstallFailure>,
-    },
-}
-
-#[derive(Debug)]
-enum DownloadEvent {
-    Started {
-        name: String,
-        version: String,
-        kind: ArtifactKind,
-    },
-    ContentLength {
-        name: String,
-        length: u64,
-    },
-    Advanced {
-        name: String,
-        bytes: u64,
-    },
-    FallbackToSource {
-        name: String,
-        version: String,
-    },
-    Finished {
-        package: Box<PendingInstall>,
-        result: Result<DownloadedInstall, String>,
-    },
-}
-
 fn add_resolution_roots(
     description: &description::RDescription,
     new_packages: &BTreeMap<String, String>,
@@ -1357,137 +1275,30 @@ fn sync_from_lockfile(install_system: bool, install_only_system: bool) -> RpxRes
         return Err(SyncError::LockfileOlder.into());
     }
 
-    let installed = installed_packages_by_name();
-    let runtime = runtime_info();
-    let repositories = repositories_for_sync(&lockfile);
     let mut outcome = SyncOutcome::default();
-    let ui = SyncUi::new();
-    let mut satisfied = installed
-        .iter()
-        .filter_map(|(name, installed_package)| {
-            lockfile
-                .packages
-                .get(name)
-                .filter(|locked_package| locked_package.version == installed_package.version)
-                .map(|_| name.clone())
+
+    let extra_packages = installed_packages()
+        .into_iter()
+        .filter_map(|p| match lockfile.packages.get(&p.package) {
+            Some(locked) if locked.version == p.version => None,
+            _ => Some(p.package),
         })
-        .collect::<BTreeSet<_>>();
-
-    let mut pending = collect_pending_installs(&lockfile, &installed, &runtime, &repositories);
-
-    let cached_names = pending
-        .values()
-        .filter(|package| package.cache_path.exists())
-        .map(|package| package.name.clone())
         .collect::<Vec<_>>();
 
-    ui.start_restores(cached_names.len());
-    for name in cached_names {
-        let package = pending
-            .remove(&name)
-            .expect("cached package should still be pending");
-        restore_cached_package(&package, &project_library_path()).map_err(|details| {
-            SyncError::RestoreCachedPackageFailed {
-                package: package.name.clone(),
-                version: package.version.clone(),
-                details,
-            }
-        })?;
-        satisfied.insert(package.name.clone());
-        outcome.installed += 1;
-        ui.finish_restore(&package.name, &package.version);
-    }
-    ui.finish_restores();
+    outcome.removed = extra_packages.len();
+    let _ = remove_packages_from_venv(&extra_packages);
 
-    let download_order = pending.values().cloned().collect::<Vec<_>>();
-    ui.start_downloads(download_order.len());
-    let downloaded = download_artifacts_in_parallel(&repositories, &download_order, &ui)
+    init_tracing();
+
+    REPOSITORY_CLASSIFIER_RUNTIME
+        .get_or_init(|| tokio::runtime::Runtime::new().expect("install runtime should start"))
+        .block_on(install_locked_packages(
+            lockfile.packages.values().cloned().collect::<Vec<_>>(),
+            lockfile.repositories.iter().cloned().collect::<Vec<_>>(),
+        ))
         .map_err(|details| SyncError::DownloadArtifactsFailed { details })?;
-    ui.finish_downloads();
 
-    let project_library = project_library_path();
-    let binary_installs = downloaded
-        .values()
-        .filter(|download| download.install_kind == InstallKind::Binary)
-        .count();
-    let source_builds = downloaded.len().saturating_sub(binary_installs);
-    ui.start_installs(binary_installs, source_builds);
-    install_downloaded_packages_in_parallel(
-        &mut pending,
-        &mut satisfied,
-        &downloaded,
-        &project_library,
-        &ui,
-        &mut outcome,
-    )?;
-    ui.finish_installs();
-
-    let locked_names = locked_package_names(&lockfile);
-    let extras = installed_packages_by_name()
-        .into_keys()
-        .filter(|name| !locked_names.contains(name))
-        .collect::<Vec<_>>();
-    outcome.removed = extras.len();
-    ui.start_removals(extras.len());
-    remove_installed_packages(&extras);
-    ui.finish_removals();
-
-    let final_state = installed_packages_by_name();
-    let missing = locked_names
-        .iter()
-        .filter(|name| !final_state.contains_key(*name))
-        .cloned()
-        .collect::<Vec<_>>();
-    let extras = final_state
-        .keys()
-        .filter(|name| !locked_names.contains(*name))
-        .cloned()
-        .collect::<Vec<_>>();
-    let version_mismatches = lockfile
-        .packages
-        .iter()
-        .filter(|(name, _)| !is_base_package(name))
-        .filter_map(|(name, package)| {
-            final_state
-                .get(name)
-                .filter(|installed_package| installed_package.version != package.version)
-                .map(|installed_package| {
-                    format!(
-                        "{name} ({}, expected {})",
-                        installed_package.version, package.version
-                    )
-                })
-        })
-        .collect::<Vec<_>>();
-
-    if missing.is_empty() && extras.is_empty() && version_mismatches.is_empty() {
-        ui.finish();
-        return Ok(outcome);
-    }
-
-    if !missing.is_empty() {
-        note(format_args!(
-            "missing from library after sync: {}",
-            missing.join(", ")
-        ));
-    }
-
-    if !extras.is_empty() {
-        note(format_args!(
-            "extra in library after sync: {}",
-            extras.join(", ")
-        ));
-    }
-
-    if !version_mismatches.is_empty() {
-        note(format_args!(
-            "version mismatch after sync: {}",
-            version_mismatches.join(", ")
-        ));
-    }
-
-    ui.finish();
-    Err(SyncError::PostSyncVerificationFailed.into())
+    return Ok(outcome);
 }
 
 pub(crate) fn exit_with_status(code: Option<i32>) {
@@ -1501,23 +1312,6 @@ fn default_registry_base_url() -> String {
         .unwrap_or_else(|_| DEFAULT_REGISTRY_BASE_URL.to_string())
         .trim_end_matches('/')
         .to_string()
-}
-
-fn repositories_for_sync(lockfile: &Lockfile) -> RepositorySet {
-    let mut sources = lockfile
-        .repositories
-        .iter()
-        .map(repository_source_from_locked)
-        .collect::<Vec<_>>();
-    sources.extend(lockfile.packages.values().filter_map(|package| {
-        let source_url = package.source_url.as_deref()?;
-        repository_source_from_package_url(source_url)
-            .map(RepositorySource::new)
-            .or_else(|| {
-                cran_like_source_from_package_url(source_url).map(RepositorySource::cran_like)
-            })
-    }));
-    RepositorySet::new(sources)
 }
 
 fn lockfile_from_resolution(
@@ -1952,654 +1746,407 @@ fn validate_runtime_for_sync(lockfile: &Lockfile) -> RpxResult<()> {
     .into())
 }
 
-fn preferred_artifact(
-    repositories: &RepositorySet,
-    source: &RepositorySource,
-    package: &str,
-    version: &str,
-    source_url: &str,
-    runtime: &RuntimeInfo,
-) -> (
-    ArtifactRequest,
-    Vec<ArtifactRequest>,
-    Option<ArtifactRequest>,
-    InstallKind,
-    String,
-) {
-    let source_artifact = ArtifactRequest {
-        kind: ArtifactKind::Source,
-        url: source_url.to_string(),
-        cache_file_name: source_cache_file_name(package, version),
-    };
-
-    let mut binary_candidates =
-        binary_artifact_candidates(repositories, source, package, version, runtime);
-    let Some(binary) = binary_candidates.first().cloned() else {
-        return (
-            source_artifact,
-            vec![],
-            None,
-            InstallKind::Source,
-            "source".to_string(),
-        );
-    };
-    binary_candidates.remove(0);
-
-    (
-        binary,
-        binary_candidates,
-        Some(source_artifact),
-        InstallKind::Binary,
-        runtime.pkg_type.clone(),
-    )
-}
-
-fn package_source_url(source: &RepositorySource, package: &str, version: &str) -> String {
-    match source.kind() {
-        RepositoryKind::Rrepo => format!(
-            "{}/packages/{package}/versions/{version}/source",
-            source.base_url().trim_end_matches('/')
-        ),
-        RepositoryKind::CranLike => format!(
-            "{}/src/contrib/{package}_{version}.tar.gz",
-            source.base_url().trim_end_matches('/')
-        ),
-    }
-}
-
-fn binary_artifact_candidates(
-    repositories: &RepositorySet,
-    locked_source: &RepositorySource,
-    package: &str,
-    version: &str,
-    runtime: &RuntimeInfo,
-) -> Vec<ArtifactRequest> {
-    let sources = std::iter::once(locked_source)
-        .chain(
-            repositories
-                .sources()
-                .iter()
-                .filter(|source| *source != locked_source),
-        )
-        .collect::<Vec<_>>();
-    let mut seen = BTreeSet::new();
-    let mut artifacts = Vec::new();
-
-    for source in sources {
-        let Some(artifact) = binary_artifact_request_for_source(source, package, version, runtime)
-        else {
-            continue;
-        };
-        if seen.insert(artifact.url.clone()) {
-            artifacts.push(artifact);
-        }
-    }
-
-    artifacts
-}
-
-fn binary_artifact_request_for_source(
-    source: &RepositorySource,
-    package: &str,
-    version: &str,
-    runtime: &RuntimeInfo,
-) -> Option<ArtifactRequest> {
-    match source.kind() {
-        RepositoryKind::Rrepo => {
-            binary_artifact_request(source.base_url(), package, version, runtime)
-        }
-        RepositoryKind::CranLike => {
-            cran_like_binary_artifact_request(source.base_url(), package, version, runtime)
-        }
-    }
-}
-
-fn binary_artifact_request(
-    registry: &str,
-    package: &str,
-    version: &str,
-    runtime: &RuntimeInfo,
-) -> Option<ArtifactRequest> {
-    if runtime.pkg_type == "win.binary" {
-        return Some(ArtifactRequest {
-            kind: ArtifactKind::Binary,
-            url: format!(
-                "{}/packages/{package}/versions/{version}/binaries/windows/{}",
-                registry.trim_end_matches('/'),
-                r_minor_version(&runtime.version)?
-            ),
-            cache_file_name: windows_binary_cache_file_name(package, version),
-        });
-    }
-
-    let target = runtime.pkg_type.strip_prefix("mac.binary.")?;
-    Some(ArtifactRequest {
-        kind: ArtifactKind::Binary,
-        url: format!(
-            "{}/packages/{package}/versions/{version}/binaries/macos/{target}/{}",
-            registry.trim_end_matches('/'),
-            r_minor_version(&runtime.version)?
-        ),
-        cache_file_name: macos_binary_cache_file_name(package, version),
-    })
-}
-
-fn cran_like_binary_artifact_request(
-    registry: &str,
-    package: &str,
-    version: &str,
-    runtime: &RuntimeInfo,
-) -> Option<ArtifactRequest> {
-    if runtime.pkg_type == "win.binary" {
-        return Some(ArtifactRequest {
-            kind: ArtifactKind::Binary,
-            url: format!(
-                "{}/bin/windows/contrib/{}/{package}_{version}.zip",
-                registry.trim_end_matches('/'),
-                r_minor_version(&runtime.version)?
-            ),
-            cache_file_name: windows_binary_cache_file_name(package, version),
-        });
-    }
-
-    let target = runtime.pkg_type.strip_prefix("mac.binary.")?;
-    Some(ArtifactRequest {
-        kind: ArtifactKind::Binary,
-        url: format!(
-            "{}/bin/macosx/{target}/contrib/{}/{package}_{version}.tgz",
-            registry.trim_end_matches('/'),
-            r_minor_version(&runtime.version)?
-        ),
-        cache_file_name: macos_binary_cache_file_name(package, version),
-    })
-}
-
-fn source_cache_file_name(package: &str, version: &str) -> String {
-    format!("{package}_{version}.tar.gz")
-}
-
-fn windows_binary_cache_file_name(package: &str, version: &str) -> String {
-    format!("{package}_{version}.zip")
-}
-
-fn macos_binary_cache_file_name(package: &str, version: &str) -> String {
-    format!("{package}_{version}.tgz")
-}
-
 fn r_minor_version(version: &str) -> Option<String> {
     let mut parts = version.split('.');
     Some(format!("{}.{}", parts.next()?, parts.next()?))
 }
 
-fn should_fallback_to_source(error: &str) -> bool {
-    error.contains("artifact download failed (404 ")
-        || error.contains("artifact download failed (502 ")
-}
-
-fn collect_pending_installs(
-    lockfile: &Lockfile,
-    installed: &BTreeMap<String, r::InstalledPackage>,
-    runtime: &RuntimeInfo,
-    repositories: &RepositorySet,
-) -> BTreeMap<String, PendingInstall> {
-    lockfile
-        .packages
-        .iter()
-        .filter(|(name, _)| !is_base_package(name))
-        .filter_map(|(name, package)| match installed.get(name) {
-            Some(installed_package) if installed_package.version == package.version => None,
-            _ => {
-                let source_url = package.source_url.clone().or_else(|| {
-                    repositories
-                        .sources()
-                        .first()
-                        .map(|source| package_source_url(source, name, &package.version))
-                })?;
-                let source = repositories
-                    .source_for_url(&source_url)
-                    .or_else(|| repositories.sources().first().cloned())?;
-                let (
-                    artifact,
-                    binary_fallback_artifacts,
-                    fallback_artifact,
-                    install_kind,
-                    install_type,
-                ) = preferred_artifact(
-                    repositories,
-                    &source,
-                    name,
-                    &package.version,
-                    &source_url,
-                    runtime,
-                );
-                let dependencies = package
-                    .dependencies
-                    .iter()
-                    .filter(|dependency| lockfile.packages.contains_key(&dependency.package))
-                    .map(|dependency| dependency.package.clone())
-                    .collect::<BTreeSet<_>>();
-                let cache_key = compiled_cache_key(name, &package.version, runtime);
-                let cache_path = compiled_cache_package_path(&cache_key, name);
-
-                Some((
-                    name.clone(),
-                    PendingInstall {
-                        name: name.clone(),
-                        version: package.version.clone(),
-                        artifact,
-                        binary_fallback_artifacts,
-                        fallback_artifact,
-                        install_kind,
-                        install_type,
-                        dependencies,
-                        cache_key,
-                        cache_path,
-                    },
-                ))
-            }
-        })
-        .collect()
-}
-
-fn compiled_cache_key(package: &str, version: &str, runtime: &RuntimeInfo) -> String {
-    let input = format!(
-        "{package}\n{version}\n{}\n{}\n{}",
-        runtime.version, runtime.platform, runtime.pkg_type
+async fn install_locked_packages(
+    packages: Vec<LockedPackage>,
+    repositories: Vec<LockedRepository>,
+) -> Result<(), String> {
+    let total_packages = packages.len() as u64;
+    let sync_span = tracing::info_span!(
+        "sync_packages",
+        total = total_packages,
+        completed = 0_u64,
+        running = 0_u64,
+        pending = total_packages,
+        stage = tracing::field::Empty,
+        indicatif.pb_show = true,
     );
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    input.hash(&mut hasher);
-    format!("{}-{}-{:016x}", package, version, hasher.finish())
-}
+    sync_span.pb_set_style(&progress_spinner_style());
+    sync_span.pb_set_message(&format!("sync packages 0/{total_packages}"));
+    sync_span.pb_set_length(total_packages);
+    sync_span.pb_start();
 
-fn restore_cached_package(package: &PendingInstall, target_library: &Path) -> Result<(), String> {
-    copy_package_into_library(&package.cache_path, target_library)
-}
+    let locked_names = packages
+        .iter()
+        .map(|p| p.package.clone())
+        .collect::<BTreeSet<_>>();
+    let mut installed_packages = installed_packages_async()
+        .await
+        .into_iter()
+        .map(|p| p.package)
+        .collect::<BTreeSet<_>>();
 
-fn download_artifacts_in_parallel(
-    repositories: &RepositorySet,
-    packages: &[PendingInstall],
-    ui: &SyncUi,
-) -> Result<BTreeMap<String, DownloadedInstall>, String> {
-    if packages.is_empty() {
-        return Ok(BTreeMap::new());
-    }
+    let mut pending_packages = packages
+        .into_iter()
+        .filter(|p| !installed_packages.contains(&p.package))
+        .collect::<Vec<_>>();
+    sync_span.record("pending", pending_packages.len() as u64);
 
-    let queue = Arc::new(Mutex::new(VecDeque::from(packages.to_vec())));
-    let (sender, receiver) = mpsc::channel();
+    let mut running = tokio::task::JoinSet::new();
+    let mut completed = total_packages.saturating_sub(pending_packages.len() as u64);
+    sync_span.record("completed", completed);
+    sync_span.pb_set_position(completed);
+    sync_span.pb_set_message(&format!("sync packages {completed}/{total_packages}"));
 
-    for _ in 0..DOWNLOAD_WORKERS.min(packages.len()) {
-        let queue = Arc::clone(&queue);
-        let sender = sender.clone();
-        let repositories = repositories.clone();
-        thread::spawn(move || {
-            loop {
-                let Some(package) = queue
-                    .lock()
-                    .expect("download queue should lock")
-                    .pop_front()
-                else {
-                    break;
-                };
-
-                let mut result = download_artifact_candidate(
-                    &repositories,
-                    &sender,
-                    &package,
-                    &package.artifact,
-                    package.install_kind,
-                    package.install_type.clone(),
-                );
-                let mut source_fallback_allowed = result
-                    .as_ref()
-                    .err()
-                    .is_none_or(|error| should_fallback_to_source(error));
-                let mut first_non_fallback_error = result
-                    .as_ref()
-                    .err()
-                    .filter(|error| !should_fallback_to_source(error))
-                    .cloned();
-
-                for artifact in &package.binary_fallback_artifacts {
-                    if result.is_ok() {
-                        break;
-                    }
-                    result = download_artifact_candidate(
-                        &repositories,
-                        &sender,
-                        &package,
-                        artifact,
-                        InstallKind::Binary,
-                        package.install_type.clone(),
-                    );
-                    if let Err(error) = &result
-                        && !should_fallback_to_source(error)
-                    {
-                        source_fallback_allowed = false;
-                        if first_non_fallback_error.is_none() {
-                            first_non_fallback_error = Some(error.clone());
-                        }
-                    }
-                }
-
-                let result = result.or_else(|error| {
-                    if !source_fallback_allowed {
-                        return Err(first_non_fallback_error.unwrap_or(error));
-                    }
-                    let Some(fallback) = &package.fallback_artifact else {
-                        return Err(error);
-                    };
-                    let _ = sender.send(DownloadEvent::FallbackToSource {
-                        name: package.name.clone(),
-                        version: package.version.clone(),
-                    });
-                    download_artifact_candidate(
-                        &repositories,
-                        &sender,
-                        &package,
-                        fallback,
-                        InstallKind::Source,
-                        "source".to_string(),
-                    )
-                });
-                let _ = sender.send(DownloadEvent::Finished {
-                    package: Box::new(package),
-                    result,
-                });
-            }
-        });
-    }
-    drop(sender);
-
-    let mut downloaded = BTreeMap::new();
-    let mut finished = 0;
-    while finished < packages.len() {
-        match receiver
-            .recv()
-            .expect("download worker should return a result")
-        {
-            DownloadEvent::Started {
-                name,
-                version,
-                kind,
-            } => ui.start_download(&name, &version, kind),
-            DownloadEvent::ContentLength { name, length } => ui.set_download_length(&name, length),
-            DownloadEvent::Advanced { name, bytes } => ui.advance_download(&name, bytes),
-            DownloadEvent::FallbackToSource { name, version } => {
-                ui.fallback_to_source(&name, &version);
-            }
-            DownloadEvent::Finished { package, result } => {
-                finished += 1;
-                let artifact = result
-                    .map_err(|error| format!("{}@{}: {error}", package.name, package.version))?;
-                ui.finish_download(&package.name, &package.version, artifact.install_kind);
-                downloaded.insert(package.name.clone(), artifact);
-            }
-        }
-    }
-
-    Ok(downloaded)
-}
-
-fn download_artifact_candidate(
-    repositories: &RepositorySet,
-    sender: &mpsc::Sender<DownloadEvent>,
-    package: &PendingInstall,
-    artifact: &ArtifactRequest,
-    install_kind: InstallKind,
-    install_type: String,
-) -> Result<DownloadedInstall, String> {
-    let _ = sender.send(DownloadEvent::Started {
-        name: package.name.clone(),
-        version: package.version.clone(),
-        kind: artifact.kind,
-    });
-
-    let progress_sender = sender.clone();
-    let progress_name = package.name.clone();
-    repositories
-        .source_for_url(&artifact.url)
-        .ok_or_else(|| {
-            format!(
-                "could not determine repository source for {}@{}",
-                package.name, package.version
-            )
-        })
-        .and_then(|source| {
-            repositories.download_artifact_with_progress(
-                &source,
-                &package.name,
-                &package.version,
-                artifact,
-                move |progress| match progress {
-                    DownloadProgress::ContentLength(length) => {
-                        let _ = progress_sender.send(DownloadEvent::ContentLength {
-                            name: progress_name.clone(),
-                            length,
-                        });
-                    }
-                    DownloadProgress::Advanced(bytes) => {
-                        let _ = progress_sender.send(DownloadEvent::Advanced {
-                            name: progress_name.clone(),
-                            bytes,
-                        });
-                    }
-                },
-            )
-        })
-        .map(|artifact| DownloadedInstall {
-            artifact,
-            install_kind,
-            install_type,
-        })
-}
-
-fn ready_install_names(
-    pending: &BTreeMap<String, PendingInstall>,
-    satisfied: &BTreeSet<String>,
-) -> Vec<String> {
-    pending
-        .values()
-        .filter(|package| {
-            package
-                .dependencies
-                .iter()
-                .all(|dependency| satisfied.contains(dependency))
-        })
-        .map(|package| package.name.clone())
-        .collect()
-}
-
-fn install_downloaded_packages_in_parallel(
-    pending: &mut BTreeMap<String, PendingInstall>,
-    satisfied: &mut BTreeSet<String>,
-    artifacts: &BTreeMap<String, DownloadedInstall>,
-    project_library: &Path,
-    ui: &SyncUi,
-    outcome: &mut SyncOutcome,
-) -> RpxResult<()> {
-    let (sender, receiver) = mpsc::channel();
-    let mut active_installs = 0;
-    let mut active_source_builds = 0;
-
-    while !pending.is_empty() || active_installs > 0 {
-        let ready_names = ready_install_names(pending, satisfied);
-        let mut dispatched = Vec::new();
-
-        for name in ready_names {
-            if active_installs >= INSTALL_WORKERS {
+    loop {
+        while running.len() < 8 {
+            let Some(new) = pending_packages.iter().position(|p| {
+                p.dependencies
+                    .iter()
+                    .filter(|dep| locked_names.contains(&dep.package))
+                    .all(|dep| installed_packages.contains(&dep.package))
+            }) else {
                 break;
-            }
+            };
 
-            let install_kind = effective_install_kind(artifacts, &name);
-            if install_kind == InstallKind::Source && active_source_builds >= MAX_SOURCE_BUILDS {
-                continue;
-            }
+            let package = pending_packages.remove(new);
 
-            let package = pending
-                .remove(&name)
-                .expect("ready package should still be pending");
-            spawn_install_worker(package.clone(), artifacts, project_library, &sender);
-            active_installs += 1;
-            if install_kind == InstallKind::Source {
-                active_source_builds += 1;
-            }
-            dispatched.push((package.name, package.version, install_kind));
+            let source_url = package
+                .source_url
+                .as_deref()
+                .ok_or_else(|| format!("{} is missing source_url", package.package))?;
+
+            let repository = repositories
+                .iter()
+                .find(|repo| source_url.starts_with(&repo.url))
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "package {} source URL does not match any locked repository: {}",
+                        package.package, source_url
+                    )
+                })?;
+
+            running
+                .spawn(install_locked_package(package, repository).instrument(sync_span.clone()));
+            sync_span.record("running", running.len() as u64);
+            sync_span.record("pending", pending_packages.len() as u64);
         }
 
-        if !dispatched.is_empty() {
-            ui.start_install_batch(dispatched);
+        if pending_packages.is_empty() && running.is_empty() {
+            sync_span.record("stage", "done");
+            sync_span.pb_set_finish_message(&format!("sync packages {completed}/{total_packages}"));
+            return Ok(());
         }
 
-        if active_installs == 0 {
-            let blocked = pending.keys().cloned().collect::<Vec<_>>();
-            return Err(SyncError::NoInstallablePackages {
-                packages: blocked.join(", "),
-            }
-            .into());
+        if running.is_empty() {
+            let blocked = pending_packages
+                .iter()
+                .map(|p| p.package.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            return Err(format!(
+                "no installable packages remain; blocked packages: {blocked}"
+            ));
         }
 
-        match receiver
-            .recv()
-            .expect("install worker should return a result")
-        {
-            InstallEvent::Finished { package, result } => {
-                active_installs -= 1;
-                let install_kind = effective_install_kind(artifacts, &package.name);
-                if install_kind == InstallKind::Source {
-                    active_source_builds -= 1;
-                }
+        let result = running
+            .join_next()
+            .await
+            .expect("running install task should exist")
+            .map_err(|error| format!("install task failed to join: {error}"))?;
 
-                match result {
-                    Ok(completed) => {
-                        finalize_built_package(&completed, project_library).map_err(|details| {
-                            SyncError::CacheBuiltPackageFailed {
-                                package: completed.package.name.clone(),
-                                version: completed.package.version.clone(),
-                                details,
-                            }
-                        })?;
-                        satisfied.insert(completed.package.name.clone());
-                        outcome.installed += 1;
-                        ui.finish_install(
-                            &completed.package.name,
-                            &completed.package.version,
-                            install_kind,
-                        );
-                    }
-                    Err(error) => {
-                        ui.fail_install(&package.name, &package.version);
-                        return Err(install_failure_diagnostic(
-                            &package.name,
-                            &package.version,
-                            &error,
-                        )
-                        .into());
-                    }
-                }
-            }
-        }
+        installed_packages.insert(result?);
+        completed += 1;
+        sync_span.record("completed", completed);
+        sync_span.record("running", running.len() as u64);
+        sync_span.record("pending", pending_packages.len() as u64);
+        sync_span.pb_set_position(completed);
+        sync_span.pb_set_message(&format!("sync packages {completed}/{total_packages}"));
     }
-    Ok(())
 }
 
-fn spawn_install_worker(
-    package: PendingInstall,
-    artifacts: &BTreeMap<String, DownloadedInstall>,
-    dependency_library: &Path,
-    sender: &mpsc::Sender<InstallEvent>,
-) {
-    let sender = sender.clone();
-    let downloaded = artifacts
-        .get(&package.name)
-        .expect("artifact should exist for pending package");
-    let artifact_path = downloaded.artifact.path().to_path_buf();
-    let install_type = downloaded.install_type.clone();
-    let dependency_library = dependency_library.to_path_buf();
+async fn install_locked_package(
+    package: LockedPackage,
+    repository: LockedRepository,
+) -> Result<String, String> {
+    let span = tracing::info_span!(
+        "install_package",
+        package = %package.package,
+        version = %package.version,
+        repository = %repository.url,
+        stage = tracing::field::Empty,
+        artifact_kind = tracing::field::Empty,
+        bytes = tracing::field::Empty,
+        total_bytes = tracing::field::Empty,
+        indicatif.pb_show = true,
+    );
+    span.pb_set_style(&progress_spinner_style());
+    span.pb_set_message(&package_stage_message(
+        &package.package,
+        &package.version,
+        "queued",
+    ));
+    span.pb_start();
 
-    thread::spawn(move || {
-        let temp_library = build_temp_library_path(&package.name, &unique_build_token());
-        let package_for_success = package.clone();
-        let result = install_local_package(
-            &artifact_path,
-            &package.name,
+    install_locked_package_inner(package, repository, span.clone())
+        .instrument(span)
+        .await
+}
+
+async fn install_locked_package_inner(
+    package: LockedPackage,
+    repository: LockedRepository,
+    span: tracing::Span,
+) -> Result<String, String> {
+    let project_library = project_library_path();
+    record_package_stage(&span, &package, "checking R version");
+    let r_version = r_version_async().await?;
+    let r_minor = r_minor_version(&r_version)
+        .ok_or_else(|| format!("failed to parse R minor version from {r_version}"))?;
+    let key = CompiledPackageCacheKey::new(&package.package, &package.version, &r_version);
+    record_package_stage(&span, &package, "checking cache");
+    if cache::exists(&key).await {
+        record_package_stage(&span, &package, "restoring from cache");
+        cache::restore(&key, &project_library).await?;
+        record_package_stage(&span, &package, "restored from cache");
+        return Ok(package.package);
+    }
+
+    let base_url = reqwest::Url::parse(&repository.url)
+        .map_err(|error| format!("invalid repository URL {}: {error}", repository.url))?;
+    let client = http::traced_client();
+
+    record_package_stage(&span, &package, "downloading binary");
+    let binary = match (std::env::consts::OS, repository.kind) {
+        ("windows", LockedRepositoryKind::Rrepo) => http::rrepo_windows_binary(
+            &client,
+            &base_url,
+            &package.package,
             &package.version,
-            &install_type,
-            &temp_library,
-            &[dependency_library],
+            &r_minor,
         )
-        .map(|()| CompletedBuild {
-            package: package_for_success,
-            temp_library,
-        });
-        let _ = sender.send(InstallEvent::Finished { package, result });
-    });
-}
+        .await
+        .map(|response| (response, "zip", "win.binary".to_string()))
+        .map_err(|error| error.to_string()),
+        ("windows", LockedRepositoryKind::CranLike) => http::cran_windows_binary(
+            &client,
+            &base_url,
+            &r_minor,
+            &package.package,
+            &package.version,
+        )
+        .await
+        .map(|response| (response, "zip", "win.binary".to_string()))
+        .map_err(|error| error.to_string()),
+        ("macos", LockedRepositoryKind::Rrepo) => {
+            let target = macos_binary_target()?;
+            http::rrepo_macos_binary(
+                &client,
+                &base_url,
+                &package.package,
+                &package.version,
+                &target,
+                &r_minor,
+            )
+            .await
+            .map(|response| (response, "tgz", format!("mac.binary.{target}")))
+            .map_err(|error| error.to_string())
+        }
+        ("macos", LockedRepositoryKind::CranLike) => {
+            let target = macos_binary_target()?;
+            http::cran_macos_binary(
+                &client,
+                &base_url,
+                &target,
+                &r_minor,
+                &package.package,
+                &package.version,
+            )
+            .await
+            .map(|response| (response, "tgz", format!("mac.binary.{target}")))
+            .map_err(|error| error.to_string())
+        }
+        _ => Err(format!(
+            "binary artifacts are not supported on {}-{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )),
+    };
 
-fn effective_install_kind(
-    artifacts: &BTreeMap<String, DownloadedInstall>,
-    package_name: &str,
-) -> InstallKind {
-    artifacts
-        .get(package_name)
-        .expect("artifact should exist for pending package")
-        .install_kind
-}
+    let (response, extension, install_type) = match binary {
+        Ok(binary) => {
+            span.record("artifact_kind", binary.2.as_str());
+            binary
+        }
+        Err(error) => {
+            tracing::debug!(package = %package.package, version = %package.version, error = %error, "binary artifact unavailable; falling back to source");
+            record_package_stage(&span, &package, "falling back to source");
+            record_package_stage(&span, &package, "downloading source");
+            let response = match repository.kind {
+                LockedRepositoryKind::Rrepo => {
+                    http::rrepo_source_artifact(
+                        &client,
+                        &base_url,
+                        &package.package,
+                        &package.version,
+                    )
+                    .await
+                }
+                LockedRepositoryKind::CranLike => {
+                    let source_url = package
+                        .source_url
+                        .as_deref()
+                        .ok_or_else(|| format!("{} is missing source_url", package.package))?;
 
-fn finalize_built_package(completed: &CompletedBuild, target_library: &Path) -> Result<(), String> {
-    let built_package_path = completed.temp_library.join(&completed.package.name);
-    if !built_package_path.exists() {
-        return Err(format!(
-            "built package directory is missing: {}",
-            built_package_path.display()
-        ));
+                    if source_url.contains("/src/contrib/Archive/") {
+                        http::cran_archive_source_tarball(
+                            &client,
+                            &base_url,
+                            &package.package,
+                            &package.version,
+                        )
+                        .await
+                    } else {
+                        http::cran_current_source_tarball(
+                            &client,
+                            &base_url,
+                            &package.package,
+                            &package.version,
+                        )
+                        .await
+                    }
+                }
+            }
+            .map_err(|error| error.to_string())?;
+
+            span.record("artifact_kind", "source");
+            (response, "tar.gz", "source".to_string())
+        }
+    };
+
+    let artifact_path = write_artifact_response(&package, extension, response, &span).await?;
+    record_package_stage(&span, &package, "installing");
+    let temp_library = build_temp_library_path(&package.package, &unique_build_token());
+    let install_package = package.package.clone();
+    let install_version = package.version.clone();
+    let install_type_for_task = install_type.clone();
+    let artifact_path_for_task = artifact_path.clone();
+    let temp_library_for_task = temp_library.clone();
+
+    tokio::task::spawn_blocking(move || {
+        install_local_package(
+            &artifact_path_for_task,
+            &install_package,
+            &install_version,
+            &install_type_for_task,
+            &temp_library_for_task,
+        )
+    })
+    .await
+    .map_err(|error| format!("failed to join install task: {error}"))?
+    .map_err(|failure| install_failure_message(&package.package, &package.version, &failure))?;
+
+    let built_package_path = temp_library.join(&package.package);
+    record_package_stage(&span, &package, "storing cache");
+    cache::store(&key, &built_package_path).await?;
+    record_package_stage(&span, &package, "restoring project library");
+    cache::restore(&key, &project_library).await?;
+
+    record_package_stage(&span, &package, "cleaning up");
+    if let Some(temp_root) = temp_library.parent() {
+        tokio::fs::remove_dir_all(temp_root)
+            .await
+            .map_err(|error| format!("failed to clean temporary build directory: {error}"))?;
     }
 
-    copy_package_dir(&built_package_path, &completed.package.cache_path)?;
-    copy_package_into_library(&completed.package.cache_path, target_library)?;
-    fs::remove_dir_all(
-        completed
-            .temp_library
-            .parent()
-            .expect("temporary build library should have a parent"),
-    )
-    .map_err(|error| format!("failed to clean temporary build directory: {error}"))?;
-    Ok(())
+    record_package_stage(&span, &package, "done");
+    Ok(package.package)
 }
 
-fn copy_package_into_library(package_path: &Path, target_library: &Path) -> Result<(), String> {
-    let package_name = package_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| format!("invalid package path: {}", package_path.display()))?;
-    copy_package_dir(package_path, &target_library.join(package_name))
+fn record_package_stage(span: &tracing::Span, package: &LockedPackage, stage: &'static str) {
+    span.record("stage", stage);
+    span.pb_set_style(&progress_spinner_style());
+    span.pb_set_message(&package_stage_message(
+        &package.package,
+        &package.version,
+        stage,
+    ));
+    span.pb_tick();
 }
 
-fn copy_package_dir(source: &Path, destination: &Path) -> Result<(), String> {
-    if destination.exists() {
-        fs::remove_dir_all(destination)
-            .map_err(|error| format!("failed to replace package directory: {error}"))?;
+fn package_stage_message(package: &str, version: &str, stage: &str) -> String {
+    format!("{package} {version} {stage}")
+}
+
+async fn write_artifact_response(
+    package: &LockedPackage,
+    extension: &str,
+    response: http::ArtifactResponse,
+    span: &tracing::Span,
+) -> Result<PathBuf, String> {
+    let file_name = format!("{}_{}.{}", package.package, package.version, extension);
+    let path = artifact_cache_path(&package.package, &package.version, &file_name);
+
+    if path.exists() {
+        if let Ok(metadata) = path.metadata() {
+            span.record("bytes", metadata.len());
+            span.record("total_bytes", metadata.len());
+            span.pb_set_style(&progress_bar_style());
+            span.pb_set_length(metadata.len());
+            span.pb_set_position(metadata.len());
+            span.pb_set_message(&package_stage_message(
+                &package.package,
+                &package.version,
+                "using cached artifact",
+            ));
+        }
+        return Ok(path);
     }
-    fs::create_dir_all(destination)
-        .map_err(|error| format!("failed to create package directory: {error}"))?;
 
-    for entry in fs::read_dir(source)
-        .map_err(|error| format!("failed to read package directory: {error}"))?
-    {
-        let entry = entry.map_err(|error| format!("failed to read package entry: {error}"))?;
-        let source_path = entry.path();
-        let destination_path = destination.join(entry.file_name());
-        let file_type = entry
-            .file_type()
-            .map_err(|error| format!("failed to inspect package entry: {error}"))?;
-        if file_type.is_dir() {
-            copy_package_dir(&source_path, &destination_path)?;
+    let content_length = response.content_length;
+    if let Some(total) = content_length {
+        span.record("total_bytes", total);
+        span.pb_set_style(&progress_bar_style());
+        span.pb_set_length(total);
+        span.pb_set_position(0);
+    }
+
+    let mut file = tokio::fs::File::create(&path)
+        .await
+        .map_err(|error| format!("failed to create artifact file {}: {error}", path.display()))?;
+    let mut stream = response.stream;
+    let mut written = 0_u64;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| format!("failed to read artifact response: {error}"))?;
+        let chunk_len = chunk.len() as u64;
+        file.write_all(&chunk).await.map_err(|error| {
+            format!("failed to write artifact file {}: {error}", path.display())
+        })?;
+        written += chunk_len;
+        span.record("bytes", written);
+        if content_length.is_some() {
+            span.pb_inc(chunk_len);
         } else {
-            fs::copy(&source_path, &destination_path)
-                .map_err(|error| format!("failed to copy package file: {error}"))?;
+            span.pb_tick();
         }
     }
 
-    Ok(())
+    Ok(path)
+}
+
+fn macos_binary_target() -> Result<String, String> {
+    match std::env::consts::ARCH {
+        "aarch64" => Ok("big-sur-arm64".to_string()),
+        "x86_64" => Ok("big-sur-x86_64".to_string()),
+        arch => Err(format!(
+            "unsupported macOS architecture for binary packages: {arch}"
+        )),
+    }
+}
+
+fn install_failure_message(package: &str, version: &str, failure: &InstallFailure) -> String {
+    format!(
+        "failed to install {package}@{version}: {} (log: {})",
+        failure.summary,
+        failure.log_path.display()
+    )
 }
 
 fn unique_build_token() -> String {
@@ -2679,46 +2226,13 @@ fn locked_install_order(lockfile: &Lockfile) -> Result<Vec<String>, String> {
     Ok(ordered)
 }
 
-fn install_failure_diagnostic(name: &str, version: &str, failure: &InstallFailure) -> SyncError {
-    let log_tail = read_log_tail(&failure.log_path, 80);
-    let recent_output = if log_tail.is_empty() {
-        String::new()
-    } else {
-        format!("\nrecent build output:\n{log_tail}")
-    };
-
-    SyncError::InstallFailed {
-        package: name.to_string(),
-        version: version.to_string(),
-        exit_status: failure.exit_code.map_or_else(
-            || "terminated by signal".to_string(),
-            |code| code.to_string(),
-        ),
-        summary: failure.summary.clone(),
-        log_path: failure.log_path.display().to_string(),
-        recent_output,
-    }
-}
-
-fn read_log_tail(path: &Path, max_lines: usize) -> String {
-    let Ok(contents) = std::fs::read_to_string(path) else {
-        return String::new();
-    };
-
-    let lines = contents.lines().collect::<Vec<_>>();
-    let start = lines.len().saturating_sub(max_lines);
-    lines[start..].join("\n")
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         DefaultRepositoryPreference, LockfileCompatibilityError, RepositoryType,
-        add_resolution_roots, binary_artifact_request, classify_repository_type,
-        compiled_cache_key, constraints_from_resolved_roots, cran_like_binary_artifact_request,
+        add_resolution_roots, classify_repository_type, constraints_from_resolved_roots,
         default_registry_base_url, locked_install_order, lockfile_from_resolution,
-        persisted_constraints, preferred_artifact, r_minor_version, semver_add_constraint,
-        should_fallback_to_source, validate_lockfile_compatibility,
+        persisted_constraints, semver_add_constraint, validate_lockfile_compatibility,
     };
     use crate::description::{RDescription, resolution_root_from_relation};
     use crate::{
@@ -2726,9 +2240,8 @@ mod tests {
             LOCKFILE_REVISION, LOCKFILE_VERSION, LockedDependency, LockedPackage, LockedR,
             LockedRepository, LockedRepositoryKind, LockedSystemRequirements, Lockfile,
         },
-        r::RuntimeInfo,
         registry::ResolutionRoot,
-        repository::{CranArchiveSupport, RepositoryKind, RepositorySet, RepositorySource},
+        repository::{CranArchiveSupport, RepositoryKind, RepositorySource},
         resolver::{ResolvedDependency, ResolvedPackage},
         sysreqs::SysreqDbSnapshot,
     };
@@ -3309,236 +2822,6 @@ mod tests {
 
         let error = locked_install_order(&lockfile).expect_err("cycle should fail");
         assert!(error.contains("cyclic or unresolved lockfile dependencies"));
-    }
-
-    #[test]
-    fn derives_windows_binary_artifact_url_from_runtime() {
-        let runtime = RuntimeInfo {
-            version: "4.5.2".to_string(),
-            platform: "x86_64-w64-mingw32".to_string(),
-            pkg_type: "win.binary".to_string(),
-        };
-
-        let artifact =
-            binary_artifact_request("https://api.rrepo.org", "digest", "0.6.37", &runtime)
-                .expect("windows binary should be supported");
-
-        assert_eq!(
-            artifact.url,
-            "https://api.rrepo.org/packages/digest/versions/0.6.37/binaries/windows/4.5"
-        );
-        assert_eq!(artifact.cache_file_name, "digest_0.6.37.zip");
-    }
-
-    #[test]
-    fn derives_binary_artifact_url_from_path_based_repository() {
-        let runtime = RuntimeInfo {
-            version: "4.5.2".to_string(),
-            platform: "x86_64-w64-mingw32".to_string(),
-            pkg_type: "win.binary".to_string(),
-        };
-
-        let artifact = binary_artifact_request(
-            "https://upstream.rrepo.dev/cran",
-            "digest",
-            "0.6.37",
-            &runtime,
-        )
-        .expect("path-based repository binaries should be attempted");
-
-        assert_eq!(
-            artifact.url,
-            "https://upstream.rrepo.dev/cran/packages/digest/versions/0.6.37/binaries/windows/4.5"
-        );
-    }
-
-    #[test]
-    fn derives_macos_binary_artifact_url_from_runtime() {
-        let runtime = RuntimeInfo {
-            version: "4.5.2".to_string(),
-            platform: "aarch64-apple-darwin20".to_string(),
-            pkg_type: "mac.binary.big-sur-arm64".to_string(),
-        };
-
-        let artifact =
-            binary_artifact_request("https://api.rrepo.org", "jsonlite", "2.0.0", &runtime)
-                .expect("macOS binary should be supported");
-
-        assert_eq!(
-            artifact.url,
-            "https://api.rrepo.org/packages/jsonlite/versions/2.0.0/binaries/macos/big-sur-arm64/4.5"
-        );
-        assert_eq!(artifact.cache_file_name, "jsonlite_2.0.0.tgz");
-    }
-
-    #[test]
-    fn skips_binary_artifacts_when_runtime_pkg_type_is_not_binary() {
-        let runtime = RuntimeInfo {
-            version: "4.5.2".to_string(),
-            platform: "aarch64-apple-darwin20".to_string(),
-            pkg_type: "source".to_string(),
-        };
-
-        assert!(
-            binary_artifact_request("https://api.rrepo.org", "digest", "0.6.37", &runtime)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn derives_windows_cran_like_binary_artifact_url_from_runtime() {
-        let runtime = RuntimeInfo {
-            version: "4.5.2".to_string(),
-            platform: "x86_64-w64-mingw32".to_string(),
-            pkg_type: "win.binary".to_string(),
-        };
-
-        let artifact =
-            cran_like_binary_artifact_request("https://cran.example", "digest", "0.6.38", &runtime)
-                .expect("windows CRAN-like binary should be supported");
-
-        assert_eq!(
-            artifact.url,
-            "https://cran.example/bin/windows/contrib/4.5/digest_0.6.38.zip"
-        );
-        assert_eq!(artifact.cache_file_name, "digest_0.6.38.zip");
-    }
-
-    #[test]
-    fn derives_macos_cran_like_binary_artifact_url_from_runtime() {
-        let runtime = RuntimeInfo {
-            version: "4.5.2".to_string(),
-            platform: "aarch64-apple-darwin20".to_string(),
-            pkg_type: "mac.binary.big-sur-arm64".to_string(),
-        };
-
-        let artifact = cran_like_binary_artifact_request(
-            "https://cran.example",
-            "jsonlite",
-            "2.0.0",
-            &runtime,
-        )
-        .expect("macOS CRAN-like binary should be supported");
-
-        assert_eq!(
-            artifact.url,
-            "https://cran.example/bin/macosx/big-sur-arm64/contrib/4.5/jsonlite_2.0.0.tgz"
-        );
-        assert_eq!(artifact.cache_file_name, "jsonlite_2.0.0.tgz");
-    }
-
-    #[test]
-    fn prefers_cran_like_binary_artifacts_with_locked_source_fallback() {
-        let runtime = RuntimeInfo {
-            version: "4.5.2".to_string(),
-            platform: "x86_64-w64-mingw32".to_string(),
-            pkg_type: "win.binary".to_string(),
-        };
-        let source = RepositorySource::cran_like("https://cran.example");
-        let repositories = RepositorySet::new(vec![source.clone()]);
-        let (artifact, binary_fallbacks, fallback, install_kind, install_type) = preferred_artifact(
-            &repositories,
-            &source,
-            "digest",
-            "0.6.38",
-            "https://cran.example/src/contrib/digest_0.6.38.tar.gz",
-            &runtime,
-        );
-
-        assert_eq!(
-            artifact.url,
-            "https://cran.example/bin/windows/contrib/4.5/digest_0.6.38.zip"
-        );
-        assert!(binary_fallbacks.is_empty());
-        assert_eq!(
-            fallback.expect("source fallback should exist").url,
-            "https://cran.example/src/contrib/digest_0.6.38.tar.gz"
-        );
-        assert_eq!(install_kind, crate::ui::InstallKind::Binary);
-        assert_eq!(install_type, "win.binary");
-    }
-
-    #[test]
-    fn tries_locked_repository_binary_before_other_repository_binaries() {
-        let runtime = RuntimeInfo {
-            version: "4.5.2".to_string(),
-            platform: "x86_64-w64-mingw32".to_string(),
-            pkg_type: "win.binary".to_string(),
-        };
-        let default = RepositorySource::new("https://default.example/cran");
-        let locked = RepositorySource::cran_like("https://cran.example");
-        let other = RepositorySource::cran_like("https://mirror.example");
-        let repositories = RepositorySet::new(vec![default.clone(), locked.clone(), other]);
-        let (artifact, binary_fallbacks, fallback, install_kind, _) = preferred_artifact(
-            &repositories,
-            &locked,
-            "digest",
-            "0.6.38",
-            "https://cran.example/src/contrib/digest_0.6.38.tar.gz",
-            &runtime,
-        );
-
-        assert_eq!(
-            artifact.url,
-            "https://cran.example/bin/windows/contrib/4.5/digest_0.6.38.zip"
-        );
-        assert_eq!(
-            binary_fallbacks
-                .iter()
-                .map(|artifact| artifact.url.as_str())
-                .collect::<Vec<_>>(),
-            vec![
-                "https://default.example/cran/packages/digest/versions/0.6.38/binaries/windows/4.5",
-                "https://mirror.example/bin/windows/contrib/4.5/digest_0.6.38.zip",
-            ]
-        );
-        assert_eq!(
-            fallback.expect("source fallback should exist").url,
-            "https://cran.example/src/contrib/digest_0.6.38.tar.gz"
-        );
-        assert_eq!(install_kind, crate::ui::InstallKind::Binary);
-    }
-
-    #[test]
-    fn extracts_r_minor_version_for_binary_urls() {
-        assert_eq!(r_minor_version("4.5.2"), Some("4.5".to_string()));
-        assert_eq!(r_minor_version("4.4"), Some("4.4".to_string()));
-        assert_eq!(r_minor_version("4"), None);
-    }
-
-    #[test]
-    fn source_fallback_statuses_are_limited_to_missing_or_upstream_binary_errors() {
-        assert!(should_fallback_to_source(
-            "artifact download failed (404 Not Found): missing"
-        ));
-        assert!(should_fallback_to_source(
-            "artifact download failed (502 Bad Gateway): upstream failed"
-        ));
-        assert!(!should_fallback_to_source(
-            "artifact download failed (403 Forbidden): forbidden"
-        ));
-        assert!(!should_fallback_to_source(
-            "failed to read binary artifact: corrupt body"
-        ));
-    }
-
-    #[test]
-    fn compiled_cache_key_changes_with_package_install_type() {
-        let source_runtime = RuntimeInfo {
-            version: "4.5.2".to_string(),
-            platform: "aarch64-apple-darwin20".to_string(),
-            pkg_type: "source".to_string(),
-        };
-        let binary_runtime = RuntimeInfo {
-            version: "4.5.2".to_string(),
-            platform: "aarch64-apple-darwin20".to_string(),
-            pkg_type: "mac.binary.big-sur-arm64".to_string(),
-        };
-
-        assert_ne!(
-            compiled_cache_key("jsonlite", "2.0.0", &source_runtime),
-            compiled_cache_key("jsonlite", "2.0.0", &binary_runtime)
-        );
     }
 
     fn empty_sysreq_db() -> SysreqDbSnapshot {

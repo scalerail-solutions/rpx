@@ -2,10 +2,24 @@
 
 use flate2::read::GzDecoder;
 use miette::Diagnostic;
+use reqwest_middleware::ClientBuilder;
+use reqwest_tracing::TracingMiddleware;
 use std::io::{Cursor, Read};
 use std::pin::Pin;
 use std::str::FromStr;
 use thiserror::Error;
+
+pub type HttpClient = reqwest_middleware::ClientWithMiddleware;
+
+pub fn client() -> HttpClient {
+    ClientBuilder::new(reqwest::Client::new()).build()
+}
+
+pub fn traced_client() -> HttpClient {
+    ClientBuilder::new(reqwest::Client::new())
+        .with(TracingMiddleware::default())
+        .build()
+}
 
 pub struct ArtifactResponse {
     pub content_length: Option<u64>,
@@ -148,7 +162,7 @@ pub enum HttpError {
     RequestFailed {
         url: reqwest::Url,
         #[source]
-        source: reqwest::Error,
+        source: reqwest_middleware::Error,
     },
 
     #[error("unexpected response from {url}: {status}")]
@@ -254,7 +268,7 @@ fn parse_packages_relations_field(
 }
 
 async fn artifact_response(
-    client: &reqwest::Client,
+    client: &HttpClient,
     url: reqwest::Url,
 ) -> Result<ArtifactResponse, HttpError> {
     let response =
@@ -280,7 +294,7 @@ async fn artifact_response(
 }
 
 pub async fn rrepo_repository_packages(
-    client: &reqwest::Client,
+    client: &HttpClient,
     base_url: &reqwest::Url,
 ) -> Result<RrepoPackagesResponse, HttpError> {
     let mut url = base_url.clone();
@@ -311,7 +325,7 @@ pub async fn rrepo_repository_packages(
 }
 
 pub async fn rrepo_package_versions(
-    client: &reqwest::Client,
+    client: &HttpClient,
     base_url: &reqwest::Url,
     package: &str,
 ) -> Result<RrepoPackageVersionsResponse, HttpError> {
@@ -343,7 +357,7 @@ pub async fn rrepo_package_versions(
 }
 
 pub async fn rrepo_package_description(
-    client: &reqwest::Client,
+    client: &HttpClient,
     base_url: &reqwest::Url,
     package: &str,
     version: &str,
@@ -382,7 +396,7 @@ pub async fn rrepo_package_description(
 }
 
 pub async fn rrepo_source_artifact(
-    client: &reqwest::Client,
+    client: &HttpClient,
     base_url: &reqwest::Url,
     package: &str,
     version: &str,
@@ -396,7 +410,7 @@ pub async fn rrepo_source_artifact(
 }
 
 pub async fn rrepo_windows_binary(
-    client: &reqwest::Client,
+    client: &HttpClient,
     base_url: &reqwest::Url,
     package: &str,
     version: &str,
@@ -413,7 +427,7 @@ pub async fn rrepo_windows_binary(
 }
 
 pub async fn rrepo_macos_binary(
-    client: &reqwest::Client,
+    client: &HttpClient,
     base_url: &reqwest::Url,
     package: &str,
     version: &str,
@@ -431,7 +445,7 @@ pub async fn rrepo_macos_binary(
 }
 
 async fn cran_packages_gz(
-    client: &reqwest::Client,
+    client: &HttpClient,
     base_url: &reqwest::Url,
 ) -> Result<CranPackagesIndex, HttpError> {
     let mut url = base_url.clone();
@@ -477,7 +491,7 @@ async fn cran_packages_gz(
 }
 
 async fn cran_packages_uncompressed(
-    client: &reqwest::Client,
+    client: &HttpClient,
     base_url: &reqwest::Url,
 ) -> Result<CranPackagesIndex, HttpError> {
     let mut url = base_url.clone();
@@ -514,7 +528,7 @@ async fn cran_packages_uncompressed(
 }
 
 pub async fn cran_packages(
-    client: &reqwest::Client,
+    client: &HttpClient,
     base_url: &reqwest::Url,
 ) -> Result<CranPackagesIndex, HttpError> {
     match cran_packages_gz(client, base_url).await {
@@ -524,7 +538,7 @@ pub async fn cran_packages(
 }
 
 pub async fn cran_archive_root(
-    client: &reqwest::Client,
+    client: &HttpClient,
     base_url: &reqwest::Url,
 ) -> Result<CranArchiveRootListing, HttpError> {
     let mut url = base_url.clone();
@@ -561,7 +575,7 @@ pub async fn cran_archive_root(
 }
 
 pub async fn cran_package_archive_listing(
-    client: &reqwest::Client,
+    client: &HttpClient,
     base_url: &reqwest::Url,
     package: &str,
 ) -> Result<Option<CranPackageArchiveListing>, HttpError> {
@@ -603,7 +617,7 @@ pub async fn cran_package_archive_listing(
 }
 
 pub async fn cran_current_source_tarball(
-    client: &reqwest::Client,
+    client: &HttpClient,
     base_url: &reqwest::Url,
     package: &str,
     version: &str,
@@ -618,7 +632,7 @@ pub async fn cran_current_source_tarball(
 }
 
 pub async fn cran_archive_source_tarball(
-    client: &reqwest::Client,
+    client: &HttpClient,
     base_url: &reqwest::Url,
     package: &str,
     version: &str,
@@ -633,7 +647,7 @@ pub async fn cran_archive_source_tarball(
 }
 
 pub async fn cran_latest_package_description(
-    client: &reqwest::Client,
+    client: &HttpClient,
     base_url: &reqwest::Url,
     package: &str,
 ) -> Result<r_description::lossy::RDescription, HttpError> {
@@ -671,7 +685,7 @@ pub async fn cran_latest_package_description(
 }
 
 pub async fn cran_windows_binary(
-    client: &reqwest::Client,
+    client: &HttpClient,
     base_url: &reqwest::Url,
     r_minor: &str,
     package: &str,
@@ -687,7 +701,7 @@ pub async fn cran_windows_binary(
 }
 
 pub async fn cran_macos_binary(
-    client: &reqwest::Client,
+    client: &HttpClient,
     base_url: &reqwest::Url,
     target: &str,
     r_minor: &str,

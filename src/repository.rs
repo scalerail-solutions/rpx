@@ -116,25 +116,6 @@ impl RepositorySource {
     pub(crate) fn cran_archive_support(&self) -> Option<CranArchiveSupport> {
         self.cran_archive_support
     }
-
-    pub fn matches_source_url(&self, url: &str) -> bool {
-        if !url.starts_with(self.base_url()) {
-            return false;
-        }
-
-        match self.kind {
-            RepositoryKind::Rrepo => {
-                !url.contains("/src/contrib/")
-                    && !url.contains("/bin/windows/")
-                    && !url.contains("/bin/macosx/")
-            }
-            RepositoryKind::CranLike => {
-                url.contains("/src/contrib/")
-                    || url.contains("/bin/windows/")
-                    || url.contains("/bin/macosx/")
-            }
-        }
-    }
 }
 
 impl RepositorySet {
@@ -277,35 +258,12 @@ impl RepositorySet {
         }
     }
 
-    pub fn download_artifact_with_progress(
-        &self,
-        source: &RepositorySource,
-        package: &str,
-        version: &str,
-        artifact: &crate::registry::ArtifactRequest,
-        mut on_progress: impl FnMut(crate::registry::DownloadProgress),
-    ) -> Result<crate::registry::DownloadedArtifact, String> {
-        self.with_authorized_client(source, |client| {
-            client.download_artifact_with_progress(package, version, artifact, &mut on_progress)
-        })
-    }
-
     pub fn has_stored_credential(&self, source: &RepositorySource) -> Result<bool, String> {
         Ok(self.credentials.get(source)?.is_some())
     }
 
     pub fn remove_api_key(&self, source: &RepositorySource) -> Result<(), String> {
         self.credentials.delete(source)
-    }
-
-    pub fn source_for_url(&self, url: &str) -> Option<RepositorySource> {
-        self.sources
-            .iter()
-            .filter(|source| source.matches_source_url(url))
-            .max_by_key(|source| source.base_url().len())
-            .cloned()
-            .or_else(|| repository_source_from_package_url(url).map(RepositorySource::new))
-            .or_else(|| cran_like_source_from_package_url(url).map(RepositorySource::cran_like))
     }
 
     pub fn cran_archive_unavailable_repositories(&self) -> Vec<String> {
@@ -328,7 +286,7 @@ impl RepositorySet {
                 source.base_url()
             )
         })?;
-        let client = reqwest::Client::new();
+        let client = crate::http::client();
         let mut by_version = BTreeMap::new();
 
         match self.cran_archive_support(source) {
@@ -488,7 +446,7 @@ impl RepositorySet {
             .try_get_with(key.clone(), async move {
                 let base_url = reqwest::Url::parse(&key)
                     .map_err(|error| format!("invalid CRAN-like repository URL {key}: {error}"))?;
-                let client = reqwest::Client::new();
+                let client = crate::http::client();
 
                 let index = crate::http::cran_packages(&client, &base_url)
                     .await
@@ -613,18 +571,6 @@ impl ApiKeyPrompter for TerminalApiKeyPrompter {
 
 pub fn normalize_repository_url(value: &str) -> String {
     value.trim().trim_end_matches('/').to_string()
-}
-
-pub fn repository_source_from_package_url(url: &str) -> Option<String> {
-    let marker = "/packages/";
-    let index = url.find(marker)?;
-    Some(normalize_repository_url(&url[..index]))
-}
-
-pub fn cran_like_source_from_package_url(url: &str) -> Option<String> {
-    let marker = "/src/contrib/";
-    let index = url.find(marker)?;
-    Some(normalize_repository_url(&url[..index]))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1046,55 +992,11 @@ mod tests {
     }
 
     #[test]
-    fn derives_repository_source_from_package_url() {
-        assert_eq!(
-            repository_source_from_package_url(
-                "https://scalerail.rrepo.dev/test/packages/rpxsmoke/versions/0.0.1/source"
-            )
-            .as_deref(),
-            Some("https://scalerail.rrepo.dev/test")
-        );
-    }
-
-    #[test]
-    fn derives_cran_like_repository_source_from_package_url() {
-        assert_eq!(
-            cran_like_source_from_package_url(
-                "https://cran.example/src/contrib/Archive/digest/digest_0.6.37.tar.gz"
-            )
-            .as_deref(),
-            Some("https://cran.example")
-        );
-    }
-
-    #[test]
     fn normalizes_repository_urls() {
         assert_eq!(
             normalize_repository_url(" https://scalerail.rrepo.dev/test/ "),
             "https://scalerail.rrepo.dev/test"
         );
-    }
-
-    #[test]
-    fn prefers_explicit_source_match_for_package_url_lookup() {
-        let repositories = RepositorySet::with_support(
-            vec![
-                RepositorySource::new("https://api.rrepo.org"),
-                RepositorySource::new("https://scalerail.rrepo.dev/test"),
-            ],
-            Arc::new(MemoryCredentialStore::default()),
-            Arc::new(StaticPrompter {
-                token: "secret".to_string(),
-            }),
-        );
-
-        let source = repositories
-            .source_for_url(
-                "https://scalerail.rrepo.dev/test/packages/rpxsmoke/versions/0.0.1/source",
-            )
-            .expect("source should be derived");
-
-        assert_eq!(source.base_url(), "https://scalerail.rrepo.dev/test");
     }
 
     #[test]
