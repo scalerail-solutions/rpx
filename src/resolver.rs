@@ -1,11 +1,4 @@
-use std::{
-    cmp::Reverse,
-    collections::{BTreeMap, BTreeSet},
-    error::Error,
-    fmt,
-    str::FromStr,
-    sync::Arc,
-};
+use std::{cmp::Reverse, collections::BTreeMap, error::Error, fmt, str::FromStr, sync::Arc};
 
 use pubgrub::{
     Dependencies, DependencyConstraints, DependencyProvider, PackageResolutionStatistics, Ranges,
@@ -15,9 +8,8 @@ use r_description::{Version, VersionConstraint};
 
 use crate::{
     default_repository,
-    description::{DescriptionDependency, RDescription},
     http,
-    repository::{PackageRepository, RepositorySource, RepositoryType},
+    repository::{PackageRepository, RepositoryType},
 };
 
 const ROOT_PACKAGE: &str = "__rpx_root__";
@@ -37,46 +29,6 @@ const BASE_PACKAGES: &[&str] = &[
     "tools",
     "utils",
 ];
-type VersionRange = Ranges<Version>;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedPackage {
-    pub name: String,
-    pub version: String,
-    pub source_url: String,
-    pub dependencies: Vec<ResolvedDependency>,
-    pub system_requirements: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedDependency {
-    pub package: String,
-    pub kind: String,
-    pub min_version: Option<String>,
-    pub max_version_exclusive: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct PackageDependency {
-    range: VersionRange,
-    resolved: ResolvedDependency,
-}
-
-#[derive(Debug, Clone)]
-struct PackageMetadata {
-    version: String,
-    source_url: String,
-    dependencies: Vec<PackageDependency>,
-    system_requirements: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct VersionCandidate {
-    version: String,
-    source_url: String,
-    source: RepositorySource,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolverError(String);
 
@@ -106,13 +58,6 @@ impl PackageVersion {
             version,
             repository,
         }
-    }
-
-    pub fn parse(version: &str, repository: Arc<PackageRepository>) -> Result<Self, String> {
-        Ok(Self::new(
-            parse_version(version).map_err(|error| error.to_string())?,
-            repository,
-        ))
     }
 
     pub fn version(&self) -> &Version {
@@ -409,102 +354,6 @@ pub fn package_range(
     parse_package_constraint_range(repository, constraint).map_err(|error| error.to_string())
 }
 
-fn description_dependencies(
-    description: &RDescription,
-) -> Result<Vec<PackageDependency>, ResolverError> {
-    let mut dependencies = Vec::new();
-
-    dependencies.extend(relations_to_dependencies("Depends", &description.depends)?);
-    dependencies.extend(relations_to_dependencies("Imports", &description.imports)?);
-    dependencies.extend(relations_to_dependencies(
-        "LinkingTo",
-        &description.linking_to,
-    )?);
-
-    Ok(dependencies)
-}
-
-fn relations_to_dependencies(
-    kind: &str,
-    relations: &BTreeSet<DescriptionDependency>,
-) -> Result<Vec<PackageDependency>, ResolverError> {
-    relations
-        .iter()
-        .filter(|relation| relation.name != "R")
-        .map(|relation| relation_dependency(kind, relation))
-        .collect()
-}
-
-fn relation_dependency(
-    kind: &str,
-    relation: &DescriptionDependency,
-) -> Result<PackageDependency, ResolverError> {
-    let (min_version, max_version_exclusive) = relation_bounds(relation);
-    Ok(PackageDependency {
-        range: range_from_relation(relation)?,
-        resolved: ResolvedDependency {
-            package: relation.name.clone(),
-            kind: kind.to_string(),
-            min_version,
-            max_version_exclusive,
-        },
-    })
-}
-
-fn relation_bounds(relation: &DescriptionDependency) -> (Option<String>, Option<String>) {
-    let Some((operator, version)) = relation.version.as_ref() else {
-        return (None, None);
-    };
-
-    match operator {
-        VersionConstraint::GreaterThan | VersionConstraint::GreaterThanEqual => {
-            (Some(version.to_string()), None)
-        }
-        VersionConstraint::LessThan | VersionConstraint::LessThanEqual => {
-            (None, Some(version.to_string()))
-        }
-        VersionConstraint::Equal => (Some(version.to_string()), None),
-        VersionConstraint::NotEqual => (None, None),
-    }
-}
-
-fn range_from_relation(relation: &DescriptionDependency) -> Result<VersionRange, ResolverError> {
-    let Some((operator, version)) = relation.version.as_ref() else {
-        return Ok(VersionRange::full());
-    };
-    let version = parse_version(&version.to_string())?;
-
-    Ok(match operator {
-        VersionConstraint::Equal => VersionRange::singleton(version.clone()),
-        VersionConstraint::GreaterThan => VersionRange::strictly_higher_than(version.clone()),
-        VersionConstraint::GreaterThanEqual => VersionRange::higher_than(version.clone()),
-        VersionConstraint::LessThan => VersionRange::strictly_lower_than(version.clone()),
-        VersionConstraint::LessThanEqual => VersionRange::lower_than(version.clone()),
-        VersionConstraint::NotEqual => {
-            return Err(ResolverError(
-                "not-equal dependency constraints are not supported".to_string(),
-            ));
-        }
-    })
-}
-
-fn parse_constraint_range(constraint: &str) -> Result<VersionRange, ResolverError> {
-    let constraint = constraint.trim();
-    if constraint.is_empty() || constraint == "*" {
-        return Ok(VersionRange::full());
-    }
-
-    constraint
-        .trim_start_matches('(')
-        .trim_end_matches(')')
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .try_fold(VersionRange::full(), |range, part| {
-            Ok(range.intersection(&range_from_constraint_part(part)?))
-        })
-}
-
 fn parse_package_constraint_range(
     repository: Arc<PackageRepository>,
     constraint: &str,
@@ -549,24 +398,6 @@ fn package_range_from_constraint_part(
     })
 }
 
-fn range_from_constraint_part(constraint: &str) -> Result<VersionRange, ResolverError> {
-    let (operator, version) = parse_constraint_part(constraint);
-    let version = parse_version(version)?;
-
-    Ok(match operator {
-        ParsedConstraint::Eq => VersionRange::singleton(version),
-        ParsedConstraint::Gt => VersionRange::strictly_higher_than(version),
-        ParsedConstraint::Gte => VersionRange::higher_than(version),
-        ParsedConstraint::Lt => VersionRange::strictly_lower_than(version),
-        ParsedConstraint::Lte => VersionRange::lower_than(version),
-        ParsedConstraint::Ne => {
-            return Err(ResolverError(
-                "not-equal dependency constraints are not supported".to_string(),
-            ));
-        }
-    })
-}
-
 fn parse_constraint_part(constraint: &str) -> (ParsedConstraint, &str) {
     for (prefix, operator) in [
         (">=", ParsedConstraint::Gte),
@@ -588,10 +419,6 @@ fn parse_version(version: &str) -> Result<Version, ResolverError> {
     version
         .parse::<Version>()
         .map_err(|error| ResolverError(format!("invalid version {version}: {error}")))
-}
-
-fn is_not_found_error(error: &str) -> bool {
-    error.starts_with("unexpected registry response (404")
 }
 
 #[derive(Debug, Clone, Copy)]

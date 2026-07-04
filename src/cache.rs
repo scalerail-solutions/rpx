@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::project::cache_dir_path;
 use std::{
     collections::hash_map::DefaultHasher,

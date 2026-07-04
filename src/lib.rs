@@ -32,7 +32,6 @@ mod lockfile;
 mod output;
 mod project;
 mod r;
-mod r_version;
 mod registry;
 mod repository;
 mod resolver;
@@ -45,9 +44,8 @@ use description::{
     resolution_root_from_relation, write_description,
 };
 use lockfile::{
-    LOCKFILE_REVISION, LOCKFILE_VERSION, LockedR, LockedRepository,
-    LockedRepositoryKind, LockedSystemRequirements, Lockfile, read_lockfile,
-    read_lockfile_optional, write_lockfile,
+    LOCKFILE_REVISION, LOCKFILE_VERSION, LockedR, LockedRepository, LockedRepositoryKind,
+    LockedSystemRequirements, Lockfile, read_lockfile, read_lockfile_optional, write_lockfile,
 };
 use output::{blank_note_line, blank_status_line, note, prompt, status, warning};
 use project::{
@@ -58,7 +56,7 @@ use pubgrub::Ranges;
 use r::{InstallFailure, base_packages, install_local_package, installed_packages, runtime_info};
 use registry::{DEFAULT_REGISTRY_BASE_URL, ResolutionRoot};
 use repository::{RepositoryKind, RepositorySet, RepositorySource, normalize_repository_url};
-use resolver::{ResolvedPackage, is_base_package, resolve_from_registry};
+use resolver::{is_base_package, resolve_from_registry};
 use sysreqs::{
     SystemDependencyPlan, cached_latest_snapshot, current_host_platform,
     empty_snapshot as empty_sysreq_snapshot, install as install_system_dependencies,
@@ -303,16 +301,6 @@ enum RpxWarning {
         help("Run `rpx sync --install-system` to install missing system dependencies first.")
     )]
     ContinuingWithoutSystemDependencies,
-
-    #[error("archive listing unavailable for CRAN-like repository {url}")]
-    #[diagnostic(
-        severity(Warning),
-        code(rpx::repository::cran_archive_unavailable),
-        help(
-            "rpx can restore locked archived package URLs, but new resolution for this repository is limited to versions listed in PACKAGES."
-        )
-    )]
-    CranArchiveUnavailable { url: String },
 }
 
 fn read_project_lockfile() -> Result<Lockfile, ProjectError> {
@@ -513,27 +501,6 @@ async fn cmd_repo_add(url: &str) -> RpxResult<()> {
         new_repo.base_url().to_string()
     ));
     Ok(())
-}
-
-fn classify_repository_type(url: &str) -> Result<RepositoryType, String> {
-    REPOSITORY_CLASSIFIER_RUNTIME
-        .get_or_init(|| {
-            tokio::runtime::Runtime::new().expect("repository classifier runtime should start")
-        })
-        .block_on(async move {
-            PackageRepository::from_url(&http::client(), url)
-                .await
-                .map(|r| r.repo_type())
-        })
-}
-
-fn repository_source_from_type(url: &str, repository_type: RepositoryType) -> RepositorySource {
-    match repository_type {
-        RepositoryType::Rrepo => RepositorySource::new(url),
-        RepositoryType::Cran { archives } => {
-            RepositorySource::cran_like_with_archive_support(url, archives)
-        }
-    }
 }
 
 fn repository_source_from_lockfile(lockfile: &Lockfile, url: &str) -> Option<RepositorySource> {
@@ -750,13 +717,13 @@ fn cmd_status() -> RpxResult<()> {
     let installed = installed_packages();
     let installed_names = installed
         .iter()
-        .map(|package| package.package.clone())
-        .collect::<BTreeSet<_>>();
+        .map(|package| &package.package)
+        .collect::<BTreeSet<&String>>();
     let installed_versions = installed
         .iter()
         .map(|package| (package.package.clone(), package.version.clone()))
         .collect::<std::collections::BTreeMap<_, _>>();
-    let locked_names = locked_package_names(&lockfile);
+    let locked_names = lockfile.packages.keys().collect::<BTreeSet<&String>>();
     let runtime_status = runtime_status(&lockfile);
     let system_plan = if host_supports_system_sync() {
         system_plan_from_lockfile(&lockfile).ok()
@@ -847,8 +814,9 @@ fn cmd_status() -> RpxResult<()> {
         "Packages locked but no longer in DESCRIPTION:",
         &extra_in_lockfile,
     );
-    print_status_group("Packages locked but not installed:", &missing_from_library);
-    print_status_group("Packages installed but not locked:", &extra_in_library);
+    // TODO: get it back when infrerence is back lol
+    // print_status_group("Packages locked but not installed:", &missing_from_library);
+    // print_status_group("Packages installed but not locked:", &extra_in_library);
     print_status_group(
         "Installed versions that differ from rpx.lock:",
         &version_mismatches,
@@ -980,48 +948,6 @@ impl DefaultRepositoryPreference {
 
         Ok(repos)
     }
-
-    fn repositories(
-        self,
-        description: &description::RDescription,
-        lockfile: Option<&Lockfile>,
-    ) -> Result<RepositorySet, LockError> {
-        let default_url = default_registry_base_url();
-        let use_default_repository = match self {
-            Self::Enabled => true,
-            Self::Disabled => false,
-            Self::FromLockfileOrDefault => lockfile.is_none_or(|lockfile| {
-                let default_url = normalize_repository_url(&default_url);
-                lockfile
-                    .repositories
-                    .iter()
-                    .any(|repository| repository.url == default_url)
-            }),
-        };
-
-        let mut sources = Vec::new();
-        if use_default_repository {
-            sources.push(RepositorySource::new(default_url));
-        }
-        for url in &description.additional_repositories {
-            if let Some(source) =
-                lockfile.and_then(|lockfile| repository_source_from_lockfile(lockfile, url))
-            {
-                sources.push(source);
-                continue;
-            }
-
-            let repository_type =
-                classify_repository_type(url).map_err(|details| LockError::ResolveFailed {
-                    details: format!(
-                        "failed to classify configured repository {}: {details}",
-                        normalize_repository_url(url)
-                    ),
-                })?;
-            sources.push(repository_source_from_type(url, repository_type));
-        }
-        Ok(RepositorySet::new(sources))
-    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1034,40 +960,6 @@ struct SyncOutcome {
 enum LockfileCompatibilityError {
     Older,
     Newer,
-}
-
-fn add_resolution_roots(
-    description: &description::RDescription,
-    new_packages: &BTreeMap<String, String>,
-) -> Vec<ResolutionRoot> {
-    let mut roots = BTreeSet::new();
-
-    for root in description
-        .imports
-        .iter()
-        .chain(
-            description
-                .depends
-                .iter()
-                .filter(|relation| relation.name != "R"),
-        )
-        .map(resolution_root_from_relation)
-    {
-        if new_packages.contains_key(&root.name) {
-            continue;
-        }
-
-        roots.insert(root);
-    }
-
-    for (name, constraint) in new_packages {
-        roots.insert(ResolutionRoot {
-            name: name.clone(),
-            constraint: constraint.clone(),
-        });
-    }
-
-    roots.into_iter().collect()
 }
 
 fn matching_lockfile_for_description<'a>(
@@ -1230,33 +1122,6 @@ fn persisted_constraints(constraint: &str) -> Vec<String> {
         .collect()
 }
 
-fn constraints_from_resolved_roots(
-    packages: &[String],
-    resolved: &[ResolvedPackage],
-) -> Result<BTreeMap<String, Vec<String>>, String> {
-    let resolved_by_package = resolved
-        .iter()
-        .map(|package| (package.name.as_str(), package.version.as_str()))
-        .collect::<BTreeMap<_, _>>();
-
-    packages
-        .iter()
-        .map(|package| {
-            if is_base_package(package) {
-                return Ok((package.clone(), vec![]));
-            }
-
-            let version = resolved_by_package
-                .get(package.as_str())
-                .ok_or_else(|| format!("missing resolved version for {package}"))?;
-            Ok((
-                package.clone(),
-                persisted_constraints(&semver_add_constraint(version)?),
-            ))
-        })
-        .collect()
-}
-
 fn apply_added_packages_to_description(
     description: &mut description::RDescription,
     packages: &[String],
@@ -1368,12 +1233,6 @@ fn load_sysreq_snapshot_for_lock(
     empty_sysreq_snapshot()
 }
 
-fn warn_cran_archive_unavailable(repositories: &RepositorySet) {
-    for url in repositories.cran_archive_unavailable_repositories() {
-        warning(RpxWarning::CranArchiveUnavailable { url });
-    }
-}
-
 fn sync_from_lockfile(install_system: bool, install_only_system: bool) -> RpxResult<SyncOutcome> {
     let description = read_description()?;
     let manifest_requirements = description
@@ -1469,13 +1328,6 @@ async fn default_repository() -> Result<PackageRepository, String> {
             Ok(PackageRepository::new(url, RepositoryType::Rrepo))
         }
     }
-}
-
-fn default_registry_base_url() -> String {
-    env::var("RPX_REGISTRY_BASE_URL")
-        .unwrap_or_else(|_| DEFAULT_REGISTRY_BASE_URL.to_string())
-        .trim_end_matches('/')
-        .to_string()
 }
 
 async fn lockfile_from_roots(
@@ -1675,76 +1527,6 @@ fn locked_base_packages_from_locked<'a>(
     base_packages.into_iter().collect()
 }
 
-fn lockfile_from_resolution(
-    roots: Vec<ResolutionRoot>,
-    resolved: &[ResolvedPackage],
-    sysreq_db: &sysreqs::SysreqDbSnapshot,
-    repositories: &[RepositorySource],
-    r_version: Option<&str>,
-) -> Lockfile {
-    let required_base_packages = locked_base_packages(&roots, resolved);
-    let sysreqs = locked_system_requirements(resolved, sysreq_db);
-    Lockfile {
-        version: LOCKFILE_VERSION,
-        revision: LOCKFILE_REVISION,
-        repositories: locked_repositories(repositories),
-        r: LockedR {
-            version: r_version.map_or_else(|| runtime_info().version, ToString::to_string),
-            base_packages: required_base_packages,
-        },
-        sysreqs,
-        roots: roots
-            .into_iter()
-            .map(|root| lockfile::LockedRoot {
-                package: root.name,
-                constraint: root.constraint,
-            })
-            .collect(),
-        packages: resolved
-            .iter()
-            .map(|package| {
-                (
-                    package.name.clone(),
-                    lockfile::LockedPackage {
-                        package: package.name.clone(),
-                        version: package.version.clone(),
-                        source: Some("repository".to_string()),
-                        source_url: Some(package.source_url.clone()),
-                        dependencies: package
-                            .dependencies
-                            .iter()
-                            .map(|dependency| lockfile::LockedDependency {
-                                package: dependency.package.clone(),
-                                kind: dependency.kind.clone(),
-                                min_version: dependency.min_version.clone(),
-                                max_version_exclusive: dependency.max_version_exclusive.clone(),
-                            })
-                            .collect(),
-                    },
-                )
-            })
-            .collect(),
-    }
-}
-
-fn locked_repositories(repositories: &[RepositorySource]) -> Vec<LockedRepository> {
-    repositories
-        .iter()
-        .map(|source| LockedRepository {
-            url: source.base_url().to_string(),
-            kind: locked_repository_kind(source.kind()),
-            cran_archive_support: Some(source.cran_archive_support),
-        })
-        .collect()
-}
-
-fn locked_repository_kind(kind: RepositoryKind) -> LockedRepositoryKind {
-    match kind {
-        RepositoryKind::Rrepo => LockedRepositoryKind::Rrepo,
-        RepositoryKind::CranLike => LockedRepositoryKind::CranLike,
-    }
-}
-
 fn locked_repository_type(kind: LockedRepositoryKind, archives: ArchiveSupport) -> RepositoryType {
     match kind {
         LockedRepositoryKind::Rrepo => RepositoryType::Rrepo,
@@ -1768,35 +1550,6 @@ fn validate_lockfile_compatibility_for_sync(lockfile: &Lockfile) -> RpxResult<()
         Err(LockfileCompatibilityError::Older) => Err(SyncError::LockfileOlder.into()),
         Err(LockfileCompatibilityError::Newer) => Err(SyncError::LockfileNewer.into()),
     }
-}
-
-fn locked_base_packages(roots: &[ResolutionRoot], resolved: &[ResolvedPackage]) -> Vec<String> {
-    let mut packages = BTreeSet::new();
-
-    packages.extend(
-        roots
-            .iter()
-            .filter(|root| is_base_package(&root.name))
-            .map(|root| root.name.clone()),
-    );
-    packages.extend(
-        resolved
-            .iter()
-            .flat_map(|package| &package.dependencies)
-            .filter(|dependency| is_base_package(&dependency.package))
-            .map(|dependency| dependency.package.clone()),
-    );
-
-    packages.into_iter().collect()
-}
-
-fn locked_package_names(lockfile: &Lockfile) -> BTreeSet<String> {
-    lockfile
-        .packages
-        .keys()
-        .filter(|name| !is_base_package(name))
-        .cloned()
-        .collect()
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -2050,32 +1803,6 @@ fn prompt_for_system_dependency_action() -> SyncSystemChoice {
         "1" | "y" | "Y" => SyncSystemChoice::InstallAndContinue,
         "2" | "r" | "R" => SyncSystemChoice::TryROnly,
         _ => SyncSystemChoice::Cancel,
-    }
-}
-
-fn locked_system_requirements(
-    resolved: &[ResolvedPackage],
-    sysreq_db: &sysreqs::SysreqDbSnapshot,
-) -> LockedSystemRequirements {
-    let packages = resolved
-        .iter()
-        .filter_map(|package| {
-            let rules = sysreqs::match_rules(package.system_requirements.as_deref(), sysreq_db);
-            (!rules.is_empty()).then(|| (package.name.clone(), rules))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let rules = packages
-        .values()
-        .flatten()
-        .cloned()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-
-    LockedSystemRequirements {
-        db_commit: sysreq_db.commit.clone(),
-        rules,
-        packages,
     }
 }
 
@@ -2581,29 +2308,19 @@ fn locked_install_order(lockfile: &Lockfile) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DefaultRepositoryPreference, LockfileCompatibilityError, RepositoryType,
-        add_resolution_roots, classify_repository_type, constraints_from_resolved_roots,
-        default_registry_base_url, locked_install_order, lockfile_from_resolution,
-        persisted_constraints, semver_add_constraint, validate_lockfile_compatibility,
+        LockfileCompatibilityError, locked_install_order, persisted_constraints,
+        semver_add_constraint, validate_lockfile_compatibility,
     };
     use crate::description::{RDescription, resolution_root_from_relation};
     use crate::{
         lockfile::{
             LOCKFILE_REVISION, LOCKFILE_VERSION, LockedDependency, LockedPackage, LockedR,
-            LockedRepository, LockedRepositoryKind, LockedSystemRequirements, Lockfile,
+            LockedSystemRequirements, Lockfile,
         },
         registry::ResolutionRoot,
-        repository::{ArchiveSupport, RepositoryKind, RepositorySource},
-        resolver::{ResolvedDependency, ResolvedPackage},
-        sysreqs::SysreqDbSnapshot,
     };
-    use mockito::Server;
     use std::collections::BTreeMap;
-    use std::{
-        env,
-        str::FromStr,
-        sync::{Mutex, OnceLock},
-    };
+    use std::str::FromStr;
 
     #[test]
     fn builds_resolution_roots_from_description_constraints() {
@@ -2642,296 +2359,6 @@ mod tests {
     }
 
     #[test]
-    fn builds_lockfile_from_registry_resolution() {
-        let lockfile = lockfile_from_resolution(
-            vec![
-                ResolutionRoot {
-                    name: "digest".to_string(),
-                    constraint: "*".to_string(),
-                },
-                ResolutionRoot {
-                    name: "cli".to_string(),
-                    constraint: "= 3.6.5".to_string(),
-                },
-            ],
-            &[
-                ResolvedPackage {
-                    name: "cli".to_string(),
-                    version: "3.6.5".to_string(),
-                    source_url: "https://api.rrepo.org/packages/cli/versions/3.6.5/source"
-                        .to_string(),
-                    dependencies: vec![
-                        ResolvedDependency {
-                            package: "R".to_string(),
-                            kind: "Depends".to_string(),
-                            min_version: Some("4.3".to_string()),
-                            max_version_exclusive: None,
-                        },
-                        ResolvedDependency {
-                            package: "utils".to_string(),
-                            kind: "Imports".to_string(),
-                            min_version: None,
-                            max_version_exclusive: None,
-                        },
-                        ResolvedDependency {
-                            package: "base".to_string(),
-                            kind: "Depends".to_string(),
-                            min_version: None,
-                            max_version_exclusive: None,
-                        },
-                    ],
-                    system_requirements: None,
-                },
-                ResolvedPackage {
-                    name: "digest".to_string(),
-                    version: "0.6.37".to_string(),
-                    source_url: "https://api.rrepo.org/packages/digest/versions/0.6.37/source"
-                        .to_string(),
-                    dependencies: vec![],
-                    system_requirements: None,
-                },
-            ],
-            &empty_sysreq_db(),
-            &[RepositorySource::new("https://api.rrepo.org")],
-            Some("4.5.2"),
-        );
-
-        assert_eq!(lockfile.version, LOCKFILE_VERSION);
-        assert_eq!(lockfile.repositories[0].url, "https://api.rrepo.org");
-        assert_eq!(lockfile.r.base_packages, vec!["base", "utils"]);
-        assert_eq!(lockfile.roots[0].package, "digest");
-        assert_eq!(lockfile.roots[1].package, "cli");
-        assert_eq!(
-            lockfile.packages["cli"].source.as_deref(),
-            Some("repository")
-        );
-        assert_eq!(
-            lockfile.packages["cli"].dependencies,
-            vec![
-                LockedDependency {
-                    package: "R".to_string(),
-                    kind: "Depends".to_string(),
-                    min_version: Some("4.3".to_string()),
-                    max_version_exclusive: None,
-                },
-                LockedDependency {
-                    package: "utils".to_string(),
-                    kind: "Imports".to_string(),
-                    min_version: None,
-                    max_version_exclusive: None,
-                },
-                LockedDependency {
-                    package: "base".to_string(),
-                    kind: "Depends".to_string(),
-                    min_version: None,
-                    max_version_exclusive: None,
-                },
-            ]
-        );
-        assert_eq!(
-            lockfile.packages["digest"].source_url.as_deref(),
-            Some("https://api.rrepo.org/packages/digest/versions/0.6.37/source")
-        );
-    }
-
-    #[test]
-    fn reads_registry_base_url_from_environment() {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("environment mutex should lock");
-
-        unsafe {
-            env::set_var("RPX_REGISTRY_BASE_URL", "https://example.test/");
-        }
-
-        assert_eq!(default_registry_base_url(), "https://example.test");
-
-        unsafe {
-            env::remove_var("RPX_REGISTRY_BASE_URL");
-        }
-    }
-
-    #[test]
-    fn resolves_default_repository_preference_from_flags_then_lockfile() {
-        let description = RDescription::from_str("Package: test\nVersion: 0.1.0\n")
-            .expect("description should parse");
-        let lockfile = Lockfile {
-            version: LOCKFILE_VERSION,
-            revision: LOCKFILE_REVISION,
-            repositories: vec![],
-            r: LockedR::default(),
-            sysreqs: LockedSystemRequirements::default(),
-            roots: vec![],
-            packages: BTreeMap::new(),
-        };
-        let lockfile_with_default = Lockfile {
-            version: LOCKFILE_VERSION,
-            revision: LOCKFILE_REVISION,
-            repositories: vec![LockedRepository {
-                url: default_registry_base_url(),
-                kind: LockedRepositoryKind::Rrepo,
-                cran_archive_support: None,
-            }],
-            r: LockedR::default(),
-            sysreqs: LockedSystemRequirements::default(),
-            roots: vec![],
-            packages: BTreeMap::new(),
-        };
-
-        assert_eq!(
-            DefaultRepositoryPreference::from_flags(false, false)
-                .repositories(&description, None)
-                .expect("repositories should build")
-                .sources()
-                .len(),
-            1
-        );
-        assert!(
-            DefaultRepositoryPreference::from_flags(false, false)
-                .repositories(&description, Some(&lockfile))
-                .expect("repositories should build")
-                .sources()
-                .is_empty()
-        );
-        assert_eq!(
-            DefaultRepositoryPreference::from_flags(true, false)
-                .repositories(&description, Some(&lockfile))
-                .expect("repositories should build")
-                .sources()
-                .len(),
-            1
-        );
-        assert_eq!(
-            DefaultRepositoryPreference::from_flags(false, false)
-                .repositories(&description, Some(&lockfile_with_default))
-                .expect("repositories should build")
-                .sources()
-                .len(),
-            1
-        );
-        assert!(
-            DefaultRepositoryPreference::from_flags(false, true)
-                .repositories(&description, Some(&lockfile))
-                .expect("repositories should build")
-                .sources()
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn omits_default_repository_from_project_sources_when_disabled() {
-        let description = RDescription::from_str("Package: test\nVersion: 0.1.0\n")
-            .expect("description should parse");
-
-        let repositories = DefaultRepositoryPreference::Disabled
-            .repositories(&description, None)
-            .expect("repositories should build");
-        let sources = repositories.sources();
-
-        assert!(sources.is_empty());
-    }
-
-    #[test]
-    fn classifies_rrepo_repository_sources_up_front() {
-        let mut server = Server::new();
-        let packages_mock = server
-            .mock("GET", "/packages")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"repositorySlug":"test","packages":[]}"#)
-            .expect(1)
-            .create();
-
-        let repository_type =
-            classify_repository_type(&server.url()).expect("rrepo should classify");
-
-        assert_eq!(repository_type, RepositoryType::Rrepo);
-        packages_mock.assert();
-    }
-
-    #[test]
-    fn classifies_cran_like_repository_sources_up_front() {
-        let mut server = Server::new();
-        let rrepo_mock = server
-            .mock("GET", "/packages")
-            .with_status(404)
-            .expect(1)
-            .create();
-        let gz_mock = server
-            .mock("GET", "/src/contrib/PACKAGES.gz")
-            .with_status(404)
-            .expect(1)
-            .create();
-        let packages_mock = server
-            .mock("GET", "/src/contrib/PACKAGES")
-            .with_status(200)
-            .with_header("content-type", "text/plain")
-            .with_body("Package: digest\nVersion: 0.6.38\n")
-            .expect(1)
-            .create();
-        let archive_mock = server
-            .mock("GET", "/src/contrib/Archive/")
-            .with_status(404)
-            .expect(1)
-            .create();
-
-        let repository_type =
-            classify_repository_type(&server.url()).expect("CRAN-like should classify");
-
-        assert_eq!(
-            repository_type,
-            RepositoryType::Cran {
-                archives: crate::repository::ArchiveSupport::Unavailable
-            }
-        );
-        rrepo_mock.assert();
-        gz_mock.assert();
-        packages_mock.assert();
-        archive_mock.assert();
-    }
-
-    #[test]
-    fn project_sources_include_classified_additional_repositories_once() {
-        let mut server = Server::new();
-        server
-            .mock("GET", "/packages")
-            .with_status(404)
-            .expect(1)
-            .create();
-        server
-            .mock("GET", "/src/contrib/PACKAGES.gz")
-            .with_status(404)
-            .expect(1)
-            .create();
-        server
-            .mock("GET", "/src/contrib/PACKAGES")
-            .with_status(200)
-            .with_header("content-type", "text/plain")
-            .with_body("Package: digest\nVersion: 0.6.38\n")
-            .expect(1)
-            .create();
-        server
-            .mock("GET", "/src/contrib/Archive/")
-            .with_status(200)
-            .expect(1)
-            .create();
-        let mut description = RDescription::from_str("Package: test\nVersion: 0.1.0\n")
-            .expect("description should parse");
-        description.additional_repositories = vec![server.url()];
-
-        let repositories = DefaultRepositoryPreference::Disabled
-            .repositories(&description, None)
-            .expect("repositories should build");
-        let sources = repositories.sources();
-
-        assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].kind(), RepositoryKind::CranLike);
-        assert_eq!(sources[0].cran_archive_support, ArchiveSupport::Available);
-    }
-
-    #[test]
     fn builds_semver_constraint_from_resolved_version() {
         assert_eq!(
             semver_add_constraint("1.1.4").unwrap(),
@@ -2954,82 +2381,6 @@ mod tests {
             vec![">= 1.1.4".to_string(), "< 2.0.0".to_string()]
         );
         assert!(persisted_constraints("*").is_empty());
-    }
-
-    #[test]
-    fn derives_constraints_from_resolved_root_versions() {
-        let constraints = constraints_from_resolved_roots(
-            &["digest".to_string()],
-            &[ResolvedPackage {
-                name: "digest".to_string(),
-                version: "0.6.37".to_string(),
-                source_url: "https://api.rrepo.org/packages/digest/versions/0.6.37/source"
-                    .to_string(),
-                dependencies: vec![],
-                system_requirements: None,
-            }],
-        )
-        .expect("constraints should derive");
-
-        assert_eq!(
-            constraints,
-            BTreeMap::from([(
-                "digest".to_string(),
-                vec![">= 0.6.37".to_string(), "< 1.0.0".to_string()],
-            )])
-        );
-    }
-
-    #[test]
-    fn derives_empty_constraints_for_base_package_roots() {
-        let constraints = constraints_from_resolved_roots(&["grid".to_string()], &[])
-            .expect("base package constraints should derive");
-
-        assert_eq!(constraints, BTreeMap::from([("grid".to_string(), vec![])]));
-    }
-
-    #[test]
-    fn records_direct_base_roots_as_runtime_requirements() {
-        let lockfile = lockfile_from_resolution(
-            vec![ResolutionRoot {
-                name: "grid".to_string(),
-                constraint: "*".to_string(),
-            }],
-            &[],
-            &empty_sysreq_db(),
-            &[],
-            Some("4.5.2"),
-        );
-
-        assert_eq!(lockfile.r.base_packages, vec!["grid"]);
-        assert!(!lockfile.packages.contains_key("grid"));
-    }
-
-    #[test]
-    fn keeps_existing_roots_when_adding_new_package() {
-        let description = RDescription::from_str(
-            "Package: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\nImports: cli\n",
-        )
-        .expect("description should parse");
-
-        let roots = add_resolution_roots(
-            &description,
-            &BTreeMap::from([("digest".to_string(), ">= 0.6.37, < 1.0.0".to_string())]),
-        );
-
-        assert_eq!(
-            roots,
-            vec![
-                ResolutionRoot {
-                    name: "cli".to_string(),
-                    constraint: "*".to_string(),
-                },
-                ResolutionRoot {
-                    name: "digest".to_string(),
-                    constraint: ">= 0.6.37, < 1.0.0".to_string(),
-                },
-            ]
-        );
     }
 
     #[test]
@@ -3171,13 +2522,5 @@ mod tests {
 
         let error = locked_install_order(&lockfile).expect_err("cycle should fail");
         assert!(error.contains("cyclic or unresolved lockfile dependencies"));
-    }
-
-    fn empty_sysreq_db() -> SysreqDbSnapshot {
-        SysreqDbSnapshot {
-            commit: "test-commit".to_string(),
-            rules: vec![],
-            scripts: BTreeMap::new(),
-        }
     }
 }

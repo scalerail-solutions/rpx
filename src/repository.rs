@@ -1,29 +1,20 @@
-use crate::http::{self, CranPackagesIndex};
-use crate::output::try_prompt;
-use crate::registry::{
-    PackageVersionsResponse, RegistryClient, VersionSummary, is_not_found_error,
-    is_unauthorized_error,
-};
+use crate::http::{self};
+use crate::registry::{is_not_found_error};
 use crate::resolver::PackageVersion;
 use flate2::read::GzDecoder;
 use keyring::Entry;
-use moka::future::Cache;
 use r_description::{Version, lossy::RDescription};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
-    fs,
     hash::{Hash, Hasher},
-    io::{self, IsTerminal, Read},
-    path::{Path, PathBuf},
+    io::{Read},
+    path::{Path },
     sync::{Arc, OnceLock},
 };
 use tar::Archive;
 use tokio::task::JoinSet;
-
-use crate::project::cache_dir_path;
-use crate::r_version::compare_r_versions;
 
 const KEYRING_SERVICE: &str = "rpx";
 static REPOSITORY_HTTP_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -41,27 +32,14 @@ pub enum RepositoryKind {
     CranLike,
 }
 
-#[derive(Debug, Clone)]
-pub struct SourcedPackageVersions {
-    pub source: RepositorySource,
-    pub response: PackageVersionsResponse,
-}
-
 pub trait CredentialStore: Send + Sync {
     fn get(&self, source: &RepositorySource) -> Result<Option<String>, String>;
-    fn set(&self, source: &RepositorySource, token: &str) -> Result<(), String>;
     fn delete(&self, source: &RepositorySource) -> Result<(), String>;
-}
-
-pub trait ApiKeyPrompter: Send + Sync {
-    fn prompt(&self, source: &RepositorySource, had_stored_token: bool) -> Result<String, String>;
 }
 
 #[derive(Debug, Clone)]
 pub struct KeyringCredentialStore;
 
-#[derive(Debug, Clone)]
-pub struct TerminalApiKeyPrompter;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PackageRepository {
@@ -140,6 +118,7 @@ impl PackageRepository {
         self.url.clone()
     }
 
+    #[allow(dead_code)]
     pub async fn packages(&self, client: &http::HttpClient) -> Result<Vec<String>, String> {
         match self.repo_type {
             RepositoryType::Rrepo => Ok(http::rrepo_repository_packages(client, &self.url)
@@ -267,10 +246,6 @@ impl PackageRepository {
 pub struct RepositorySet {
     sources: Vec<RepositorySource>,
     credentials: Arc<dyn CredentialStore>,
-    prompter: Arc<dyn ApiKeyPrompter>,
-    cran_current_indexes: Cache<String, Arc<CranPackagesIndex>>,
-    cran_archive_unavailable: Arc<std::sync::Mutex<BTreeSet<String>>>,
-    cran_archive_listing_support: Arc<std::sync::Mutex<BTreeMap<String, ArchiveSupport>>>,
 }
 
 impl std::fmt::Debug for RepositorySet {
@@ -314,13 +289,6 @@ impl RepositorySource {
         }
     }
 
-    pub(crate) fn from_package_repositories(repositories: Vec<PackageRepository>) -> Vec<Self> {
-        repositories
-            .into_iter()
-            .map(Self::from_package_repository)
-            .collect()
-    }
-
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
@@ -335,14 +303,12 @@ impl RepositorySet {
         Self::with_support(
             sources,
             Arc::new(KeyringCredentialStore),
-            Arc::new(TerminalApiKeyPrompter),
         )
     }
 
     pub fn with_support(
         sources: Vec<RepositorySource>,
         credentials: Arc<dyn CredentialStore>,
-        prompter: Arc<dyn ApiKeyPrompter>,
     ) -> Self {
         let mut deduped = Vec::new();
         let mut seen = BTreeSet::new();
@@ -352,332 +318,18 @@ impl RepositorySet {
                 deduped.push(source);
             }
         }
-        let cran_archive_listing_support = deduped
-            .iter()
-            .map(|source| (source.base_url().to_string(), source.cran_archive_support))
-            .collect::<BTreeMap<_, _>>();
-        let cran_archive_unavailable = cran_archive_listing_support
-            .iter()
-            .filter_map(|(url, support)| {
-                (*support == ArchiveSupport::Unavailable).then_some(url.clone())
-            })
-            .collect::<BTreeSet<_>>();
 
         Self {
             sources: deduped,
             credentials,
-            prompter,
-            cran_current_indexes: Cache::new(64),
-            cran_archive_unavailable: Arc::new(std::sync::Mutex::new(cran_archive_unavailable)),
-            cran_archive_listing_support: Arc::new(std::sync::Mutex::new(
-                cran_archive_listing_support,
-            )),
         }
     }
-
-    pub fn sources(&self) -> &[RepositorySource] {
-        &self.sources
-    }
-
-    pub fn fetch_all_package_versions_with_retry(
-        &self,
-        package: &str,
-    ) -> Result<Vec<SourcedPackageVersions>, String> {
-        let mut responses = Vec::new();
-
-        for source in &self.sources {
-            let result = match source.kind() {
-                RepositoryKind::Rrepo => self.with_authorized_client(source, |client| {
-                    client.fetch_package_versions_with_retry(package)
-                }),
-                RepositoryKind::CranLike => REPOSITORY_HTTP_RUNTIME
-                    .get_or_init(|| {
-                        tokio::runtime::Runtime::new()
-                            .expect("repository HTTP runtime should start")
-                    })
-                    .block_on(self.fetch_cran_like_package_versions(source, package)),
-            };
-
-            match result {
-                Ok(response) => responses.push(SourcedPackageVersions {
-                    source: source.clone(),
-                    response,
-                }),
-                Err(error) if is_not_found_error(&error) => {}
-                Err(error) => return Err(error),
-            }
-        }
-
-        if responses.is_empty() {
-            return Err(format!(
-                "unexpected registry response (404 Not Found): package {package} not found"
-            ));
-        }
-
-        Ok(responses)
-    }
-
-    pub fn fetch_description_with_retry(
-        &self,
-        source: &RepositorySource,
-        package: &str,
-        version: &str,
-    ) -> Result<String, String> {
-        match source.kind() {
-            RepositoryKind::Rrepo => self.with_authorized_client(source, |client| {
-                client.fetch_description_with_retry(package, version)
-            }),
-            RepositoryKind::CranLike => Self::fetch_cran_like_description(source, package, version),
-        }
-    }
-
     pub fn has_stored_credential(&self, source: &RepositorySource) -> Result<bool, String> {
         Ok(self.credentials.get(source)?.is_some())
     }
 
     pub fn remove_api_key(&self, source: &RepositorySource) -> Result<(), String> {
         self.credentials.delete(source)
-    }
-
-    pub fn cran_archive_unavailable_repositories(&self) -> Vec<String> {
-        self.cran_archive_unavailable
-            .lock()
-            .expect("CRAN-like archive availability should lock")
-            .iter()
-            .cloned()
-            .collect()
-    }
-
-    async fn fetch_cran_like_package_versions(
-        &self,
-        source: &RepositorySource,
-        package: &str,
-    ) -> Result<PackageVersionsResponse, String> {
-        let base_url = reqwest::Url::parse(source.base_url()).map_err(|error| {
-            format!(
-                "invalid CRAN-like repository URL {}: {error}",
-                source.base_url()
-            )
-        })?;
-        let client = crate::http::client();
-        let mut by_version = BTreeMap::new();
-
-        match self.cran_archive_support(source) {
-            Some(ArchiveSupport::Unavailable) => {
-                let index = self.cran_like_current_index(source).await?;
-                for entry in index
-                    .packages
-                    .iter()
-                    .filter(|entry| entry.package == package)
-                {
-                    let version = VersionSummary {
-                        version: entry.version.clone(),
-                        source_url: cran_like_current_tarball_url(
-                            source,
-                            &entry.package,
-                            &entry.version,
-                        ),
-                    };
-                    by_version.insert(version.version.clone(), version);
-                }
-            }
-            Some(ArchiveSupport::Available) => {
-                let index = self.cran_like_current_index(source).await?;
-                let archive =
-                    crate::http::cran_package_archive_listing(&client, &base_url, package).await;
-                for entry in index
-                    .packages
-                    .iter()
-                    .filter(|entry| entry.package == package)
-                {
-                    let version = VersionSummary {
-                        version: entry.version.clone(),
-                        source_url: cran_like_current_tarball_url(
-                            source,
-                            &entry.package,
-                            &entry.version,
-                        ),
-                    };
-                    by_version.insert(version.version.clone(), version);
-                }
-
-                match archive {
-                    Ok(Some(archive)) => {
-                        for version in archive.versions {
-                            let version = version.to_string();
-                            by_version.entry(version.clone()).or_insert(VersionSummary {
-                                source_url: cran_like_archive_tarball_url(
-                                    source, package, &version,
-                                ),
-                                version,
-                            });
-                        }
-                    }
-                    Ok(None) | Err(crate::http::HttpError::RequestFailed { .. }) => {}
-                    Err(crate::http::HttpError::UnexpectedStatus { status, .. })
-                        if status == reqwest::StatusCode::FORBIDDEN => {}
-                    Err(error) => return Err(error.to_string()),
-                }
-            }
-            None => {
-                let index = self.cran_like_current_index(source).await?;
-                let root_archive = crate::http::cran_archive_root(&client, &base_url).await;
-                let package_archive =
-                    crate::http::cran_package_archive_listing(&client, &base_url, package).await;
-                for entry in index
-                    .packages
-                    .iter()
-                    .filter(|entry| entry.package == package)
-                {
-                    let version = VersionSummary {
-                        version: entry.version.clone(),
-                        source_url: cran_like_current_tarball_url(
-                            source,
-                            &entry.package,
-                            &entry.version,
-                        ),
-                    };
-                    by_version.insert(version.version.clone(), version);
-                }
-
-                match (&root_archive, &package_archive) {
-                    (_, Ok(Some(_))) => {
-                        self.record_cran_archive_support(source, ArchiveSupport::Available);
-                    }
-                    (Ok(_), _) => {
-                        self.record_cran_archive_support(source, ArchiveSupport::Available);
-                    }
-                    (Err(crate::http::HttpError::UnexpectedStatus { status, .. }), _)
-                        if *status == reqwest::StatusCode::NOT_FOUND
-                            || *status == reqwest::StatusCode::FORBIDDEN =>
-                    {
-                        self.record_cran_archive_support(source, ArchiveSupport::Unavailable);
-                    }
-                    (Err(crate::http::HttpError::RequestFailed { .. }), _) => {}
-                    (Err(error), _) => return Err(error.to_string()),
-                }
-
-                let root_archive_unavailable = matches!(
-                    root_archive,
-                    Err(crate::http::HttpError::UnexpectedStatus { status, .. })
-                        if status == reqwest::StatusCode::NOT_FOUND
-                            || status == reqwest::StatusCode::FORBIDDEN
-                );
-
-                match package_archive {
-                    Ok(Some(archive)) => {
-                        for version in archive.versions {
-                            let version = version.to_string();
-                            by_version.entry(version.clone()).or_insert(VersionSummary {
-                                source_url: cran_like_archive_tarball_url(
-                                    source, package, &version,
-                                ),
-                                version,
-                            });
-                        }
-                    }
-                    Ok(None) | Err(crate::http::HttpError::RequestFailed { .. }) => {}
-                    Err(_) if root_archive_unavailable => {}
-                    Err(crate::http::HttpError::UnexpectedStatus { status, .. })
-                        if status == reqwest::StatusCode::FORBIDDEN => {}
-                    Err(error) => return Err(error.to_string()),
-                }
-            }
-        }
-
-        package_versions_response(package, by_version)
-    }
-
-    fn cran_archive_support(&self, source: &RepositorySource) -> Option<ArchiveSupport> {
-        self.cran_archive_listing_support
-            .lock()
-            .expect("CRAN-like archive listing support should lock")
-            .get(source.base_url())
-            .copied()
-    }
-
-    fn record_cran_archive_support(&self, source: &RepositorySource, support: ArchiveSupport) {
-        self.cran_archive_listing_support
-            .lock()
-            .expect("CRAN-like archive listing support should lock")
-            .insert(source.base_url().to_string(), support);
-        if support == ArchiveSupport::Unavailable {
-            self.cran_archive_unavailable
-                .lock()
-                .expect("CRAN-like archive availability should lock")
-                .insert(source.base_url().to_string());
-        }
-    }
-
-    async fn cran_like_current_index(
-        &self,
-        source: &RepositorySource,
-    ) -> Result<Arc<CranPackagesIndex>, String> {
-        let key = source.base_url().to_string();
-
-        self.cran_current_indexes
-            .try_get_with(key.clone(), async move {
-                let base_url = reqwest::Url::parse(&key)
-                    .map_err(|error| format!("invalid CRAN-like repository URL {key}: {error}"))?;
-                let client = crate::http::client();
-
-                let index = crate::http::cran_packages(&client, &base_url)
-                    .await
-                    .map_err(|error| {
-                        format!("failed to fetch CRAN-like PACKAGES index from {key}: {error}")
-                    })?;
-
-                Ok(Arc::new(index))
-            })
-            .await
-            .map_err(|error: Arc<String>| error.as_ref().clone())
-    }
-
-    fn fetch_cran_like_description(
-        source: &RepositorySource,
-        package: &str,
-        version: &str,
-    ) -> Result<String, String> {
-        let path = cran_like_description_cache_path(source, package, version);
-        if let Ok(description) = fs::read_to_string(&path) {
-            if description_declares_package_version(&description, package, version) {
-                return Ok(description);
-            }
-            let _ = fs::remove_file(&path);
-        }
-
-        let description = fetch_description_from_cran_like_tarballs(source, package, version)?;
-        write_text_cache(&path, &description);
-        Ok(description)
-    }
-
-    fn with_authorized_client<T>(
-        &self,
-        source: &RepositorySource,
-        mut action: impl FnMut(&RegistryClient) -> Result<T, String>,
-    ) -> Result<T, String> {
-        let stored_token = self.credentials.get(source)?;
-        let client = RegistryClient::with_token(source.base_url(), stored_token.clone());
-
-        match action(&client) {
-            Ok(result) => Ok(result),
-            Err(error) if is_unauthorized_error(&error) => {
-                let token = self.prompt_and_store_token(source, stored_token.is_some())?;
-                let client = RegistryClient::with_token(source.base_url(), Some(token));
-                action(&client)
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    fn prompt_and_store_token(
-        &self,
-        source: &RepositorySource,
-        had_stored_token: bool,
-    ) -> Result<String, String> {
-        let token = self.prompter.prompt(source, had_stored_token)?;
-        self.credentials.set(source, &token)?;
-        Ok(token)
     }
 }
 
@@ -693,12 +345,6 @@ impl CredentialStore for KeyringCredentialStore {
         }
     }
 
-    fn set(&self, source: &RepositorySource, token: &str) -> Result<(), String> {
-        keyring_entry(source)?
-            .set_password(token)
-            .map_err(|error| format!("failed to store API key for {}: {error}", source.base_url()))
-    }
-
     fn delete(&self, source: &RepositorySource) -> Result<(), String> {
         match keyring_entry(source)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
@@ -710,61 +356,8 @@ impl CredentialStore for KeyringCredentialStore {
     }
 }
 
-impl ApiKeyPrompter for TerminalApiKeyPrompter {
-    fn prompt(&self, source: &RepositorySource, had_stored_token: bool) -> Result<String, String> {
-        if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
-            return Err(format!(
-                "{} requires an API key, but no interactive terminal is available",
-                source.base_url()
-            ));
-        }
-
-        let prompt = if had_stored_token {
-            format!(
-                "Stored API key rejected for {}. Enter a new API key: ",
-                source.base_url()
-            )
-        } else {
-            format!("API key required for {}: ", source.base_url())
-        };
-
-        try_prompt(prompt).map_err(|error| format!("failed to prompt for API key: {error}"))?;
-
-        let token = rpassword::read_password()
-            .map_err(|error| format!("failed to read API key: {error}"))?;
-        let token = token.trim().to_string();
-
-        if token.is_empty() {
-            return Err("API key cannot be empty".to_string());
-        }
-
-        Ok(token)
-    }
-}
-
 pub fn normalize_repository_url(value: &str) -> String {
     value.trim().trim_end_matches('/').to_string()
-}
-
-fn sort_version_summaries(versions: &mut [VersionSummary]) {
-    versions.sort_by(|left, right| compare_r_versions(&left.version, &right.version));
-}
-
-fn package_versions_response(
-    package: &str,
-    by_version: BTreeMap<String, VersionSummary>,
-) -> Result<PackageVersionsResponse, String> {
-    if by_version.is_empty() {
-        return Err(missing_package_error(package));
-    }
-
-    let mut versions = by_version.into_values().collect::<Vec<_>>();
-    sort_version_summaries(&mut versions);
-
-    Ok(PackageVersionsResponse {
-        package: package.to_string(),
-        versions,
-    })
 }
 
 fn cran_like_current_tarball_url(
@@ -1054,26 +647,6 @@ fn description_declares_package_version(description: &str, package: &str, versio
         && record.get("Version").is_some_and(|value| value == version)
 }
 
-fn cran_like_description_cache_path(
-    source: &RepositorySource,
-    package: &str,
-    version: &str,
-) -> PathBuf {
-    cache_dir_path()
-        .join("cran-like")
-        .join(hash_string(source.base_url()))
-        .join("descriptions")
-        .join(package)
-        .join(format!("{version}.dcf"))
-}
-
-fn write_text_cache(path: &Path, value: &str) {
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let _ = fs::write(path, value);
-}
-
 async fn unexpected_cran_like_response_async(response: reqwest::Response) -> String {
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
@@ -1103,241 +676,4 @@ fn hash_string(value: &str) -> String {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use flate2::{Compression, write::GzEncoder};
-    use mockito::Server;
-    use std::{collections::BTreeMap, io::Write as _, sync::Mutex};
-
-    #[derive(Default)]
-    struct MemoryCredentialStore {
-        values: Mutex<BTreeMap<String, String>>,
-    }
-
-    impl CredentialStore for MemoryCredentialStore {
-        fn get(&self, source: &RepositorySource) -> Result<Option<String>, String> {
-            Ok(self
-                .values
-                .lock()
-                .expect("memory store should lock")
-                .get(source.base_url())
-                .cloned())
-        }
-
-        fn set(&self, source: &RepositorySource, token: &str) -> Result<(), String> {
-            self.values
-                .lock()
-                .expect("memory store should lock")
-                .insert(source.base_url().to_string(), token.to_string());
-            Ok(())
-        }
-
-        fn delete(&self, source: &RepositorySource) -> Result<(), String> {
-            self.values
-                .lock()
-                .expect("memory store should lock")
-                .remove(source.base_url());
-            Ok(())
-        }
-    }
-
-    struct StaticPrompter {
-        token: String,
-    }
-
-    impl ApiKeyPrompter for StaticPrompter {
-        fn prompt(
-            &self,
-            _source: &RepositorySource,
-            _had_stored_token: bool,
-        ) -> Result<String, String> {
-            Ok(self.token.clone())
-        }
-    }
-
-    #[test]
-    fn normalizes_repository_urls() {
-        assert_eq!(
-            normalize_repository_url(" https://scalerail.rrepo.dev/test/ "),
-            "https://scalerail.rrepo.dev/test"
-        );
-    }
-
-    #[test]
-    fn prefers_default_repository_before_additional_repositories() {
-        let mut default_server = Server::new();
-        let mut additional_server = Server::new();
-
-        let default_mock = default_server
-            .mock("GET", "/packages/digest/versions")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(
-                r#"{
-  "package": "digest",
-  "versions": [
-    {
-      "version": "0.6.37",
-      "sourceUrl": "https://api.rrepo.org/packages/digest/versions/0.6.37/source"
-    }
-  ]
-}"#,
-            )
-            .expect(1)
-            .create();
-        let additional_mock = additional_server
-            .mock("GET", "/packages/digest/versions")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(
-                r#"{
-  "package": "digest",
-  "versions": [
-    {
-      "version": "9.9.9",
-      "sourceUrl": "https://example.test/packages/digest/versions/9.9.9/source"
-    }
-  ]
-}"#,
-            )
-            .expect(0)
-            .create();
-
-        let repositories = RepositorySet::with_support(
-            vec![
-                RepositorySource::new(default_server.url()),
-                RepositorySource::new(additional_server.url()),
-            ],
-            Arc::new(MemoryCredentialStore::default()),
-            Arc::new(StaticPrompter {
-                token: "secret".to_string(),
-            }),
-        );
-
-        let result = repositories
-            .fetch_package_versions_with_retry("digest")
-            .expect("package versions should resolve");
-
-        default_mock.assert();
-        additional_mock.assert();
-        assert_eq!(result.source.base_url(), default_server.url());
-        assert_eq!(result.response.versions[0].version, "0.6.37");
-    }
-
-    #[test]
-    fn uses_preclassified_cran_archive_support_for_package_versions() {
-        let mut server = Server::new();
-        let current_mock = server
-            .mock("GET", "/src/contrib/PACKAGES")
-            .with_status(200)
-            .with_header("content-type", "text/plain")
-            .with_body("Package: digest\nVersion: 0.6.38\n")
-            .expect(1)
-            .create();
-        let root_archive_mock = server
-            .mock("GET", "/src/contrib/Archive/")
-            .with_status(200)
-            .expect(0)
-            .create();
-        let package_archive_mock = server
-            .mock("GET", "/src/contrib/Archive/digest/")
-            .with_status(200)
-            .with_body(r#"<a href="digest_0.6.37.tar.gz">digest_0.6.37.tar.gz</a>"#)
-            .expect(1)
-            .create();
-        let source = RepositorySource::cran_like_with_archive_support(
-            server.url(),
-            ArchiveSupport::Available,
-        );
-        let repositories = RepositorySet::with_support(
-            vec![source],
-            Arc::new(MemoryCredentialStore::default()),
-            Arc::new(StaticPrompter {
-                token: "secret".to_string(),
-            }),
-        );
-
-        let result = repositories
-            .fetch_package_versions_with_retry("digest")
-            .expect("digest should resolve");
-
-        assert_eq!(result.response.versions.len(), 2);
-        current_mock.assert();
-        root_archive_mock.assert();
-        package_archive_mock.assert();
-    }
-
-    #[test]
-    fn keeps_querying_rrepo_after_package_not_found() {
-        let mut server = Server::new();
-        let digest_rrepo_mock = server
-            .mock("GET", "/packages/digest/versions")
-            .with_status(404)
-            .expect(1)
-            .create();
-        let rlang_rrepo_mock = server
-            .mock("GET", "/packages/rlang/versions")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(
-                r#"{
-  "package": "rlang",
-  "versions": [
-    {
-      "version": "1.1.6",
-      "sourceUrl": "https://example.test/packages/rlang/versions/1.1.6/source"
-    }
-  ]
-}"#,
-            )
-            .expect(1)
-            .create();
-        let repositories = RepositorySet::with_support(
-            vec![RepositorySource::new(server.url())],
-            Arc::new(MemoryCredentialStore::default()),
-            Arc::new(StaticPrompter {
-                token: "secret".to_string(),
-            }),
-        );
-
-        let result = repositories
-            .fetch_package_versions_with_retry("digest")
-            .expect_err("digest should remain missing");
-        assert!(is_not_found_error(&result));
-        let result = repositories
-            .fetch_package_versions_with_retry("rlang")
-            .expect("rlang should resolve from rrepo source");
-        assert_eq!(result.response.versions[0].version, "1.1.6");
-
-        digest_rrepo_mock.assert();
-        rlang_rrepo_mock.assert();
-    }
-
-    fn source_tarball(package: &str, description: &str) -> Vec<u8> {
-        source_tarball_entries(&[(&format!("{package}/DESCRIPTION"), description)])
-    }
-
-    fn source_tarball_entries(entries: &[(&str, &str)]) -> Vec<u8> {
-        let mut tar = Vec::new();
-        {
-            let mut builder = tar::Builder::new(&mut tar);
-            for (path, description) in entries {
-                let mut header = tar::Header::new_gnu();
-                header.set_size(description.len() as u64);
-                header.set_mode(0o644);
-                header.set_cksum();
-                builder
-                    .append_data(&mut header, path, description.as_bytes())
-                    .expect("DESCRIPTION should be written to tarball");
-            }
-            builder.finish().expect("tarball should finish");
-        }
-
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&tar).expect("tarball should gzip");
-        encoder.finish().expect("gzip should finish")
-    }
 }
