@@ -1,4 +1,7 @@
-use crate::project::{LOCKFILE_NAME, lockfile_path_result};
+use crate::{
+    project::{LOCKFILE_NAME, lockfile_path_result},
+    repository::ArchiveSupport,
+};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs};
 
@@ -25,7 +28,7 @@ pub struct LockedRepository {
     pub url: String,
     pub kind: LockedRepositoryKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cran_archive_support: Option<LockedCranArchiveSupport>,
+    pub cran_archive_support: Option<ArchiveSupport>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
@@ -114,10 +117,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        LOCKFILE_REVISION, LOCKFILE_VERSION, LockedCranArchiveSupport, LockedDependency,
-        LockedPackage, LockedR, LockedRepository, LockedRepositoryKind, LockedRoot,
-        LockedSystemRequirements, Lockfile,
+        LOCKFILE_REVISION, LOCKFILE_VERSION, LockedDependency, LockedPackage, LockedR,
+        LockedRepository, LockedRepositoryKind, LockedRoot, LockedSystemRequirements, Lockfile,
     };
+    use crate::repository::ArchiveSupport;
 
     #[test]
     fn serializes_new_registry_lockfile_shape() {
@@ -185,7 +188,7 @@ mod tests {
             repositories: vec![LockedRepository {
                 url: "https://cran.example".to_string(),
                 kind: LockedRepositoryKind::CranLike,
-                cran_archive_support: Some(LockedCranArchiveSupport::Unavailable),
+                cran_archive_support: Some(ArchiveSupport::Unavailable),
             }],
             r: LockedR::default(),
             sysreqs: LockedSystemRequirements::default(),

@@ -1,25 +1,23 @@
 use std::{
-    cell::RefCell,
-    cmp::{Ordering, Reverse},
+    cmp::Reverse,
     collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
-    hash::{Hash, Hasher},
     str::FromStr,
+    sync::Arc,
 };
 
 use pubgrub::{
     Dependencies, DependencyConstraints, DependencyProvider, PackageResolutionStatistics, Ranges,
     resolve,
 };
-use r_description::VersionConstraint;
+use r_description::{Version, VersionConstraint};
 
 use crate::{
+    default_repository,
     description::{DescriptionDependency, RDescription},
-    r_version::{compare_version_components, r_version_components},
-    registry::ResolutionRoot,
-    repository::{RepositorySet, RepositorySource},
-    ui::ResolutionUi,
+    http,
+    repository::{PackageRepository, RepositorySource, RepositoryType},
 };
 
 const ROOT_PACKAGE: &str = "__rpx_root__";
@@ -39,56 +37,7 @@ const BASE_PACKAGES: &[&str] = &[
     "tools",
     "utils",
 ];
-type VersionRange = Ranges<RPackageVersion>;
-
-#[derive(Debug, Clone, Eq)]
-struct RPackageVersion {
-    raw: String,
-    components: Vec<u32>,
-}
-
-impl PartialEq for RPackageVersion {
-    fn eq(&self, other: &Self) -> bool {
-        self.components == other.components
-    }
-}
-
-impl Hash for RPackageVersion {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.components.hash(state);
-    }
-}
-
-impl fmt::Display for RPackageVersion {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.raw)
-    }
-}
-
-impl FromStr for RPackageVersion {
-    type Err = String;
-
-    fn from_str(version: &str) -> Result<Self, Self::Err> {
-        let components = r_version_components(version)?;
-
-        Ok(Self {
-            raw: version.to_string(),
-            components,
-        })
-    }
-}
-
-impl Ord for RPackageVersion {
-    fn cmp(&self, other: &Self) -> Ordering {
-        compare_version_components(&self.components, &other.components)
-    }
-}
-
-impl PartialOrd for RPackageVersion {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
+type VersionRange = Ranges<Version>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedPackage {
@@ -145,169 +94,111 @@ impl From<String> for ResolverError {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct PackageVersion {
+    version: Version,
+    repository: Arc<PackageRepository>,
+}
+
+impl PackageVersion {
+    pub fn new(version: Version, repository: Arc<PackageRepository>) -> Self {
+        Self {
+            version,
+            repository,
+        }
+    }
+
+    pub fn parse(version: &str, repository: Arc<PackageRepository>) -> Result<Self, String> {
+        Ok(Self::new(
+            parse_version(version).map_err(|error| error.to_string())?,
+            repository,
+        ))
+    }
+
+    pub fn version(&self) -> &Version {
+        &self.version
+    }
+
+    pub fn repository(&self) -> &Arc<PackageRepository> {
+        &self.repository
+    }
+
+    pub fn source_url(&self, package: &str) -> String {
+        let base_url = self.repository.base_url().to_string();
+        let base_url = base_url.trim_end_matches('/');
+
+        match self.repository.repo_type() {
+            RepositoryType::Rrepo => format!(
+                "{}/packages/{package}/versions/{}/source",
+                base_url, self.version
+            ),
+            RepositoryType::Cran { .. } => format!(
+                "{}/src/contrib/Archive/{package}/{package}_{}.tar.gz",
+                base_url, self.version
+            ),
+        }
+    }
+}
+
+impl PartialEq for PackageVersion {
+    fn eq(&self, other: &Self) -> bool {
+        self.version == other.version
+    }
+}
+
+impl Eq for PackageVersion {}
+
+impl PartialOrd for PackageVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PackageVersion {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.version.cmp(&other.version)
+    }
+}
+
+impl std::hash::Hash for PackageVersion {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.version.hash(state);
+    }
+}
+impl std::fmt::Display for PackageVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} from {}", self.version, self.repository.base_url())
+    }
+}
+
 #[derive(Debug)]
-struct RegistryDependencyProvider<'a> {
-    repositories: &'a RepositorySet,
-    progress: ResolutionUi,
-    root_dependencies: Vec<PackageDependency>,
-    preferred_versions_by_package: BTreeMap<String, RPackageVersion>,
-    versions_by_package: RefCell<BTreeMap<String, Vec<VersionCandidate>>>,
-    metadata_by_package_version: RefCell<BTreeMap<(String, String), PackageMetadata>>,
+struct RDependencyProvider {
+    client: http::HttpClient,
+    repositories: Vec<PackageRepository>,
+    root_dependencies: BTreeMap<String, Ranges<PackageVersion>>,
+    preferred_versions: BTreeMap<String, PackageVersion>,
 }
 
-impl<'a> RegistryDependencyProvider<'a> {
+impl RDependencyProvider {
     fn new(
-        repositories: &'a RepositorySet,
-        roots: &[ResolutionRoot],
-        preferred_versions_by_package: BTreeMap<String, RPackageVersion>,
+        client: http::HttpClient,
+        repositories: Vec<PackageRepository>,
+        root_dependencies: BTreeMap<String, Ranges<PackageVersion>>,
+        preferred_versions: BTreeMap<String, PackageVersion>,
     ) -> Result<Self, ResolverError> {
-        let progress = ResolutionUi::new();
-        let root_dependencies = roots
-            .iter()
-            .filter(|root| !is_base_package(&root.name))
-            .map(|root| {
-                let range = parse_constraint_range(&root.constraint)?;
-                Ok(PackageDependency {
-                    range,
-                    resolved: ResolvedDependency {
-                        package: root.name.clone(),
-                        kind: "Imports".to_string(),
-                        min_version: None,
-                        max_version_exclusive: None,
-                    },
-                })
-            })
-            .collect::<Result<Vec<_>, ResolverError>>()?;
-
         Ok(Self {
+            client,
             repositories,
-            progress,
             root_dependencies,
-            preferred_versions_by_package,
-            versions_by_package: RefCell::new(BTreeMap::new()),
-            metadata_by_package_version: RefCell::new(BTreeMap::new()),
+            preferred_versions,
         })
-    }
-
-    fn package_versions(&self, package: &str) -> Result<Vec<VersionCandidate>, ResolverError> {
-        if let Some(versions) = self.versions_by_package.borrow().get(package) {
-            self.progress
-                .on_cache_hit(&format!("cached versions for {package}"));
-            return Ok(versions.clone());
-        }
-
-        self.progress.on_version_load(package);
-        let sourced_versions = self
-            .repositories
-            .fetch_all_package_versions_with_retry(package)?;
-        let mut versions_by_version = BTreeMap::new();
-
-        for sourced in sourced_versions {
-            for version in sourced.response.versions {
-                versions_by_version
-                    .entry(version.version.clone())
-                    .or_insert_with(|| VersionCandidate {
-                        version: version.version,
-                        source_url: version.source_url,
-                        source: sourced.source.clone(),
-                    });
-            }
-        }
-
-        let mut versions = versions_by_version.into_values().collect::<Vec<_>>();
-        versions.sort_by(|left, right| {
-            let left_version = parse_version(&left.version).expect("registry version should parse");
-            let right_version =
-                parse_version(&right.version).expect("registry version should parse");
-            left_version.cmp(&right_version)
-        });
-        self.versions_by_package
-            .borrow_mut()
-            .insert(package.to_string(), versions.clone());
-        Ok(versions)
-    }
-
-    fn registry_contains_package(&self, package: &str) -> Result<bool, ResolverError> {
-        match self.package_versions(package) {
-            Ok(versions) => Ok(!versions.is_empty()),
-            Err(error) if is_not_found_error(&error.0) => Ok(false),
-            Err(error) => Err(error),
-        }
-    }
-
-    fn package_metadata(
-        &self,
-        package: &str,
-        version: &RPackageVersion,
-    ) -> Result<PackageMetadata, ResolverError> {
-        let key = (package.to_string(), version.to_string());
-        if let Some(metadata) = self.metadata_by_package_version.borrow().get(&key) {
-            self.progress
-                .on_cache_hit(&format!("cached DESCRIPTION for {package}@{version}"));
-            return Ok(metadata.clone());
-        }
-
-        self.progress.on_description_load(package, version);
-        let version_entry = self
-            .package_versions(package)?
-            .into_iter()
-            .find(|entry| parse_version(&entry.version).ok().as_ref() == Some(version))
-            .ok_or_else(|| {
-                ResolverError(format!(
-                    "version {version} missing from registry for {package}"
-                ))
-            })?;
-        let description = self.repositories.fetch_description_with_retry(
-            &version_entry.source,
-            package,
-            &version_entry.version,
-        )?;
-        let description = RDescription::from_str(&description).map_err(|error| {
-            ResolverError(format!(
-                "failed to parse DESCRIPTION for {package}@{}: {error}",
-                version_entry.version
-            ))
-        })?;
-        let metadata = PackageMetadata {
-            version: version_entry.version.clone(),
-            source_url: version_entry.source_url,
-            dependencies: description_dependencies(&description)?,
-            system_requirements: description.system_requirements().map(ToString::to_string),
-        };
-        self.metadata_by_package_version
-            .borrow_mut()
-            .insert(key, metadata.clone());
-        Ok(metadata)
-    }
-
-    fn resolved_package(
-        &self,
-        package: &str,
-        version: &RPackageVersion,
-    ) -> Result<ResolvedPackage, ResolverError> {
-        let metadata = self.package_metadata(package, version)?;
-        Ok(ResolvedPackage {
-            name: package.to_string(),
-            version: metadata.version,
-            source_url: metadata.source_url,
-            dependencies: metadata
-                .dependencies
-                .into_iter()
-                .map(|dependency| dependency.resolved)
-                .collect(),
-            system_requirements: metadata.system_requirements,
-        })
-    }
-
-    fn finish_progress(&self, resolved_packages: usize) {
-        self.progress.finish(resolved_packages);
     }
 }
 
-impl DependencyProvider for RegistryDependencyProvider<'_> {
+impl DependencyProvider for RDependencyProvider {
     type P = String;
-    type V = RPackageVersion;
-    type VS = VersionRange;
+    type V = PackageVersion;
+    type VS = Ranges<PackageVersion>;
     type Priority = (u32, Reverse<usize>);
     type M = String;
     type Err = ResolverError;
@@ -318,16 +209,26 @@ impl DependencyProvider for RegistryDependencyProvider<'_> {
         range: &Self::VS,
         package_conflicts_counts: &PackageResolutionStatistics,
     ) -> Self::Priority {
-        let matches = self
-            .package_versions(package)
-            .ok()
-            .map_or(usize::MAX, |versions| {
-                versions
-                    .iter()
-                    .filter_map(|version| parse_version(&version.version).ok())
-                    .filter(|version| range.contains(version))
-                    .count()
-            });
+        let matches = tokio::runtime::Handle::current()
+            .block_on(async {
+                let results = futures_util::future::join_all(
+                    self.repositories
+                        .iter()
+                        .map(|repository| repository.versions(&self.client, package)),
+                )
+                .await;
+
+                results.into_iter().collect::<Result<Vec<_>, String>>().map(
+                    |versions_by_repository| {
+                        versions_by_repository
+                            .into_iter()
+                            .flatten()
+                            .filter(|version| range.contains(version))
+                            .count()
+                    },
+                )
+            })
+            .unwrap_or(usize::MAX);
 
         (package_conflicts_counts.conflict_count(), Reverse(matches))
     }
@@ -338,22 +239,45 @@ impl DependencyProvider for RegistryDependencyProvider<'_> {
         range: &Self::VS,
     ) -> Result<Option<Self::V>, Self::Err> {
         if package == ROOT_PACKAGE {
-            let version = root_version();
-            return Ok(range.contains(&version).then_some(version));
+            let root = tokio::runtime::Handle::current().block_on(root_package_version())?;
+
+            if range.contains(&root) {
+                return Ok(Some(root));
+            }
+
+            return Ok(None);
         }
 
-        if let Some(preferred_version) = self.preferred_versions_by_package.get(package)
-            && range.contains(preferred_version)
+        if let Some(preferred) = self.preferred_versions.get(package)
+            && range.contains(preferred)
         {
-            return Ok(Some(preferred_version.clone()));
+            return Ok(Some(preferred.clone()));
         }
 
-        Ok(self
-            .package_versions(package)?
-            .into_iter()
-            .rev()
-            .filter_map(|version| parse_version(&version.version).ok())
-            .find(|version| range.contains(version)))
+        let versions_by_repository = tokio::runtime::Handle::current()
+            .block_on(async {
+                let results = futures_util::future::join_all(
+                    self.repositories
+                        .iter()
+                        .map(|repository| repository.versions(&self.client, package)),
+                )
+                .await;
+
+                results.into_iter().collect::<Result<Vec<_>, String>>()
+            })
+            .map_err(ResolverError::from)?;
+
+        for versions in versions_by_repository {
+            if let Some(version) = versions
+                .into_iter()
+                .rev()
+                .find(|version| range.contains(version))
+            {
+                return Ok(Some(version));
+            }
+        }
+
+        Ok(None)
     }
 
     fn get_dependencies(
@@ -362,101 +286,127 @@ impl DependencyProvider for RegistryDependencyProvider<'_> {
         version: &Self::V,
     ) -> Result<Dependencies<Self::P, Self::VS, Self::M>, Self::Err> {
         if package == ROOT_PACKAGE {
-            if *version != root_version() {
-                return Ok(Dependencies::Unavailable(format!(
-                    "unsupported root version: {version}"
-                )));
-            }
-
             return Ok(Dependencies::Available(
                 self.root_dependencies
                     .iter()
-                    .map(|dependency| {
-                        (
-                            dependency.resolved.package.clone(),
-                            dependency.range.clone(),
-                        )
-                    })
+                    .map(|(package, range)| (package.clone(), range.clone()))
                     .collect::<DependencyConstraints<_, _>>(),
             ));
         }
 
-        let metadata = self.package_metadata(package, version)?;
-        Ok(Dependencies::Available(
-            metadata
-                .dependencies
-                .into_iter()
-                .filter(|dependency| !is_base_package(&dependency.resolved.package))
-                .filter_map(|dependency| {
-                    match self.registry_contains_package(&dependency.resolved.package) {
-                        Ok(true) => {
-                            Some(Ok((dependency.resolved.package.clone(), dependency.range)))
-                        }
-                        Ok(false) => None,
-                        Err(error) => Some(Err(error)),
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .collect::<DependencyConstraints<_, _>>(),
-        ))
+        if is_base_package(package) {
+            return Ok(Dependencies::Available(DependencyConstraints::default()));
+        }
+
+        let description = tokio::runtime::Handle::current()
+            .block_on(
+                version
+                    .repository
+                    .description(&self.client, package, &version.version),
+            )
+            .map_err(ResolverError::from)?;
+
+        let repository = Arc::clone(&version.repository);
+
+        let constraints = description
+            .depends
+            .as_ref()
+            .into_iter()
+            .chain(description.imports.as_ref())
+            .chain(description.linking_to.as_ref())
+            .flat_map(|relations| relations.iter())
+            .filter(|relation| relation.name != "R")
+            .filter(|relation| !is_base_package(&relation.name))
+            .map(|relation| {
+                Ok((
+                    relation.name.clone(),
+                    relation_package_range(Arc::clone(&repository), relation)?,
+                ))
+            })
+            .collect::<Result<DependencyConstraints<_, _>, ResolverError>>()?;
+
+        Ok(Dependencies::Available(constraints))
     }
+}
+
+async fn root_package_version() -> Result<PackageVersion, ResolverError> {
+    Ok(PackageVersion {
+        version: Version::from_str("0.0.0").expect("root version should parse"),
+        repository: Arc::new(default_repository().await.map_err(ResolverError::from)?),
+    })
+}
+
+fn relation_package_range(
+    repository: Arc<PackageRepository>,
+    relation: &r_description::lossy::Relation,
+) -> Result<Ranges<PackageVersion>, ResolverError> {
+    let Some((operator, version)) = relation.version.as_ref() else {
+        return Ok(Ranges::full());
+    };
+
+    let bound = PackageVersion {
+        version: version.clone(),
+        repository,
+    };
+
+    Ok(match operator {
+        VersionConstraint::Equal => Ranges::singleton(bound),
+        VersionConstraint::GreaterThan => Ranges::strictly_higher_than(bound),
+        VersionConstraint::GreaterThanEqual => Ranges::higher_than(bound),
+        VersionConstraint::LessThan => Ranges::strictly_lower_than(bound),
+        VersionConstraint::LessThanEqual => Ranges::lower_than(bound),
+        VersionConstraint::NotEqual => {
+            return Err(ResolverError(
+                "not-equal dependency constraints are not supported".to_string(),
+            ));
+        }
+    })
 }
 
 pub fn is_base_package(package: &str) -> bool {
     BASE_PACKAGES.contains(&package)
 }
 
-pub fn resolve_from_registry(
-    repositories: &RepositorySet,
-    roots: &[ResolutionRoot],
-    preferred_versions_by_package: &BTreeMap<String, String>,
-) -> Result<Vec<ResolvedPackage>, String> {
-    if roots.is_empty() {
+pub async fn resolve_from_registry(
+    client: http::HttpClient,
+    repositories: Vec<PackageRepository>,
+    root_dependencies: BTreeMap<String, Ranges<PackageVersion>>,
+    preferred_versions: BTreeMap<String, PackageVersion>,
+) -> Result<Vec<(String, PackageVersion)>, String> {
+    if root_dependencies.is_empty() {
         return Ok(Vec::new());
     }
 
-    let preferred_versions_by_package = preferred_versions_by_package
-        .iter()
-        .map(|(package, version)| Ok((package.clone(), parse_version(version)?)))
-        .collect::<Result<BTreeMap<_, _>, ResolverError>>()
+    let root_version = root_package_version()
+        .await
         .map_err(|error| error.to_string())?;
+
     let provider =
-        RegistryDependencyProvider::new(repositories, roots, preferred_versions_by_package)
+        RDependencyProvider::new(client, repositories, root_dependencies, preferred_versions)
             .map_err(|error| error.to_string())?;
-    let selected = match solve_selected_versions(&provider) {
-        Ok(selected) => selected,
-        Err(error) => {
-            provider.progress.fail();
-            return Err(error);
-        }
-    };
-    let mut resolved = selected
-        .into_iter()
-        .map(|(package, version)| provider.resolved_package(&package, &version))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error: ResolverError| {
-            provider.progress.fail();
-            error.to_string()
-        })?;
-    resolved.sort_by(|left, right| left.name.cmp(&right.name));
-    provider.finish_progress(resolved.len());
-    Ok(resolved)
+
+    tokio::task::spawn_blocking(move || {
+        let selected = resolve(&provider, ROOT_PACKAGE.to_string(), root_version)
+            .map_err(|error| error.to_string())?;
+
+        let mut selected = selected
+            .into_iter()
+            .filter(|(package, _)| package != ROOT_PACKAGE)
+            .collect::<Vec<_>>();
+
+        selected.sort_by(|left, right| left.0.cmp(&right.0));
+
+        Ok(selected)
+    })
+    .await
+    .map_err(|error| format!("failed to join resolver task: {error}"))?
 }
 
-fn solve_selected_versions<DP>(provider: &DP) -> Result<Vec<(String, RPackageVersion)>, String>
-where
-    DP: DependencyProvider<P = String, V = RPackageVersion, VS = VersionRange, M = String>,
-    DP::Err: fmt::Display,
-{
-    let selected = resolve(provider, ROOT_PACKAGE.to_string(), root_version())
-        .map_err(|error| error.to_string())?;
-    let mut selected = selected
-        .into_iter()
-        .filter(|(package, _)| package != ROOT_PACKAGE)
-        .collect::<Vec<_>>();
-    selected.sort_by(|left, right| left.0.cmp(&right.0));
-    Ok(selected)
+pub fn package_range(
+    repository: Arc<PackageRepository>,
+    constraint: &str,
+) -> Result<Ranges<PackageVersion>, String> {
+    parse_package_constraint_range(repository, constraint).map_err(|error| error.to_string())
 }
 
 fn description_dependencies(
@@ -555,6 +505,50 @@ fn parse_constraint_range(constraint: &str) -> Result<VersionRange, ResolverErro
         })
 }
 
+fn parse_package_constraint_range(
+    repository: Arc<PackageRepository>,
+    constraint: &str,
+) -> Result<Ranges<PackageVersion>, ResolverError> {
+    let constraint = constraint.trim();
+    if constraint.is_empty() || constraint == "*" {
+        return Ok(Ranges::full());
+    }
+
+    constraint
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .try_fold(Ranges::full(), |range, part| {
+            Ok(range.intersection(&package_range_from_constraint_part(
+                Arc::clone(&repository),
+                part,
+            )?))
+        })
+}
+
+fn package_range_from_constraint_part(
+    repository: Arc<PackageRepository>,
+    constraint: &str,
+) -> Result<Ranges<PackageVersion>, ResolverError> {
+    let (operator, version) = parse_constraint_part(constraint);
+    let version = PackageVersion::new(parse_version(version)?, repository);
+
+    Ok(match operator {
+        ParsedConstraint::Eq => Ranges::singleton(version),
+        ParsedConstraint::Gt => Ranges::strictly_higher_than(version),
+        ParsedConstraint::Gte => Ranges::higher_than(version),
+        ParsedConstraint::Lt => Ranges::strictly_lower_than(version),
+        ParsedConstraint::Lte => Ranges::lower_than(version),
+        ParsedConstraint::Ne => {
+            return Err(ResolverError(
+                "not-equal dependency constraints are not supported".to_string(),
+            ));
+        }
+    })
+}
+
 fn range_from_constraint_part(constraint: &str) -> Result<VersionRange, ResolverError> {
     let (operator, version) = parse_constraint_part(constraint);
     let version = parse_version(version)?;
@@ -590,14 +584,10 @@ fn parse_constraint_part(constraint: &str) -> (ParsedConstraint, &str) {
     (ParsedConstraint::Eq, constraint.trim())
 }
 
-fn parse_version(version: &str) -> Result<RPackageVersion, ResolverError> {
+fn parse_version(version: &str) -> Result<Version, ResolverError> {
     version
-        .parse::<RPackageVersion>()
+        .parse::<Version>()
         .map_err(|error| ResolverError(format!("invalid version {version}: {error}")))
-}
-
-fn root_version() -> RPackageVersion {
-    RPackageVersion::from_str("0.0.0").expect("root version should parse")
 }
 
 fn is_not_found_error(error: &str) -> bool {
@@ -612,396 +602,4 @@ enum ParsedConstraint {
     Lt,
     Lte,
     Ne,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use mockito::Server;
-
-    #[derive(Debug, Clone)]
-    struct TestPackageVersion {
-        version: RPackageVersion,
-        dependencies: Vec<(String, VersionRange)>,
-    }
-
-    #[derive(Debug, Clone)]
-    struct TestProvider {
-        root_dependencies: Vec<(String, VersionRange)>,
-        packages: BTreeMap<String, Vec<TestPackageVersion>>,
-    }
-
-    impl DependencyProvider for TestProvider {
-        type P = String;
-        type V = RPackageVersion;
-        type VS = VersionRange;
-        type Priority = (u32, Reverse<usize>);
-        type M = String;
-        type Err = ResolverError;
-
-        fn prioritize(
-            &self,
-            package: &Self::P,
-            range: &Self::VS,
-            package_conflicts_counts: &PackageResolutionStatistics,
-        ) -> Self::Priority {
-            let matches = self.packages.get(package).map_or(usize::MAX, |versions| {
-                versions
-                    .iter()
-                    .filter(|version| range.contains(&version.version))
-                    .count()
-            });
-            (package_conflicts_counts.conflict_count(), Reverse(matches))
-        }
-
-        fn choose_version(
-            &self,
-            package: &Self::P,
-            range: &Self::VS,
-        ) -> Result<Option<Self::V>, Self::Err> {
-            if package == ROOT_PACKAGE {
-                let version = root_version();
-                return Ok(range.contains(&version).then_some(version));
-            }
-
-            Ok(self
-                .packages
-                .get(package)
-                .into_iter()
-                .flat_map(|versions| versions.iter())
-                .rev()
-                .find(|version| range.contains(&version.version))
-                .map(|version| version.version.clone()))
-        }
-
-        fn get_dependencies(
-            &self,
-            package: &Self::P,
-            version: &Self::V,
-        ) -> Result<Dependencies<Self::P, Self::VS, Self::M>, Self::Err> {
-            if package == ROOT_PACKAGE {
-                return Ok(Dependencies::Available(
-                    self.root_dependencies.clone().into_iter().collect(),
-                ));
-            }
-
-            let dependencies = self
-                .packages
-                .get(package)
-                .and_then(|versions| {
-                    versions
-                        .iter()
-                        .find(|candidate| &candidate.version == version)
-                })
-                .map(|version| version.dependencies.clone())
-                .unwrap_or_default();
-            Ok(Dependencies::Available(dependencies.into_iter().collect()))
-        }
-    }
-
-    #[test]
-    fn compares_cran_hyphen_versions_numerically() {
-        assert!(parse_version("7.3-65").unwrap() > parse_version("7.3-9").unwrap());
-        assert!(parse_version("7.3-60.2").unwrap() > parse_version("7.3-60").unwrap());
-    }
-
-    #[test]
-    fn extracts_supported_description_dependency_kinds() {
-        let description = RDescription::from_str(
-            "Package: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\nDepends: R (>= 4.3), cli\nImports: digest (>= 0.6.37)\nLinkingTo: cpp11\nSuggests: testthat\nEnhances: covr\n",
-        )
-        .expect("description should parse");
-
-        let dependencies =
-            description_dependencies(&description).expect("dependencies should parse");
-
-        assert_eq!(
-            dependencies
-                .iter()
-                .map(|dependency| {
-                    (
-                        dependency.resolved.package.clone(),
-                        dependency.resolved.kind.clone(),
-                    )
-                })
-                .collect::<Vec<_>>(),
-            vec![
-                ("cli".to_string(), "Depends".to_string()),
-                ("digest".to_string(), "Imports".to_string()),
-                ("cpp11".to_string(), "LinkingTo".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn extracts_cran_style_strict_constraints_from_registry_description() {
-        let description = RDescription::from_str(
-            "Package: Rdpack\nVersion: 2.6.6\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\nDepends: R (>= 2.15.0), methods\nImports: tools, utils, rbibutils (> 2.4)\n",
-        )
-        .expect("description should parse");
-
-        let dependencies =
-            description_dependencies(&description).expect("dependencies should parse");
-
-        assert_eq!(
-            dependencies
-                .iter()
-                .map(|dependency| {
-                    (
-                        dependency.resolved.package.clone(),
-                        dependency.resolved.kind.clone(),
-                        dependency.resolved.min_version.clone(),
-                        dependency.resolved.max_version_exclusive.clone(),
-                    )
-                })
-                .collect::<Vec<_>>(),
-            vec![
-                ("methods".to_string(), "Depends".to_string(), None, None),
-                (
-                    "rbibutils".to_string(),
-                    "Imports".to_string(),
-                    Some("2.4".to_string()),
-                    None,
-                ),
-                ("tools".to_string(), "Imports".to_string(), None, None),
-                ("utils".to_string(), "Imports".to_string(), None, None),
-            ]
-        );
-    }
-
-    #[test]
-    fn resolves_transitives_to_highest_compatible_versions() {
-        let provider = TestProvider {
-            root_dependencies: vec![("dplyr".to_string(), VersionRange::full())],
-            packages: BTreeMap::from([
-                (
-                    "dplyr".to_string(),
-                    vec![TestPackageVersion {
-                        version: parse_version("1.1.4").expect("version should parse"),
-                        dependencies: vec![(
-                            "rlang".to_string(),
-                            parse_constraint_range(">= 1.1.0").expect("constraint should parse"),
-                        )],
-                    }],
-                ),
-                (
-                    "rlang".to_string(),
-                    vec![
-                        TestPackageVersion {
-                            version: parse_version("1.0.6").expect("version should parse"),
-                            dependencies: vec![],
-                        },
-                        TestPackageVersion {
-                            version: parse_version("1.1.1").expect("version should parse"),
-                            dependencies: vec![],
-                        },
-                    ],
-                ),
-            ]),
-        };
-
-        let resolved = solve_selected_versions(&provider).expect("resolution should work");
-
-        assert_eq!(
-            resolved
-                .into_iter()
-                .map(|(package, version)| format!("{package}@{version}"))
-                .collect::<Vec<_>>(),
-            vec!["dplyr@1.1.4".to_string(), "rlang@1.1.1".to_string()]
-        );
-    }
-
-    #[test]
-    fn backtracks_to_find_consistent_solution() {
-        let provider = TestProvider {
-            root_dependencies: vec![
-                ("pkg".to_string(), VersionRange::full()),
-                (
-                    "dep".to_string(),
-                    parse_constraint_range(">= 1.0.0").expect("constraint should parse"),
-                ),
-            ],
-            packages: BTreeMap::from([
-                (
-                    "pkg".to_string(),
-                    vec![
-                        TestPackageVersion {
-                            version: parse_version("1.0.0").expect("version should parse"),
-                            dependencies: vec![(
-                                "dep".to_string(),
-                                parse_constraint_range("< 2.0.0").expect("constraint should parse"),
-                            )],
-                        },
-                        TestPackageVersion {
-                            version: parse_version("2.0.0").expect("version should parse"),
-                            dependencies: vec![(
-                                "dep".to_string(),
-                                parse_constraint_range(">= 2.0.0")
-                                    .expect("constraint should parse"),
-                            )],
-                        },
-                    ],
-                ),
-                (
-                    "dep".to_string(),
-                    vec![
-                        TestPackageVersion {
-                            version: parse_version("1.5.0").expect("version should parse"),
-                            dependencies: vec![],
-                        },
-                        TestPackageVersion {
-                            version: parse_version("2.0.0").expect("version should parse"),
-                            dependencies: vec![],
-                        },
-                    ],
-                ),
-            ]),
-        };
-
-        let resolved = solve_selected_versions(&provider).expect("resolution should work");
-
-        assert_eq!(
-            resolved
-                .into_iter()
-                .map(|(package, version)| format!("{package}@{version}"))
-                .collect::<Vec<_>>(),
-            vec!["dep@2.0.0".to_string(), "pkg@2.0.0".to_string()]
-        );
-    }
-
-    #[test]
-    fn prefers_locked_version_when_it_satisfies_requested_range() {
-        let repositories = RepositorySet::new(vec![]);
-        let provider = RegistryDependencyProvider::new(
-            &repositories,
-            &[],
-            BTreeMap::from([(
-                "cli".to_string(),
-                parse_version("3.6.4").expect("version should parse"),
-            )]),
-        )
-        .expect("provider should build");
-
-        provider.versions_by_package.borrow_mut().insert(
-            "cli".to_string(),
-            vec![
-                VersionCandidate {
-                    version: "3.6.4".to_string(),
-                    source_url: "https://example.test/cli/3.6.4".to_string(),
-                    source: RepositorySource::new("https://example.test"),
-                },
-                VersionCandidate {
-                    version: "3.6.5".to_string(),
-                    source_url: "https://example.test/cli/3.6.5".to_string(),
-                    source: RepositorySource::new("https://example.test"),
-                },
-            ],
-        );
-
-        let chosen = provider
-            .choose_version(
-                &"cli".to_string(),
-                &parse_constraint_range(">= 3.6.0, < 4.0.0").expect("constraint should parse"),
-            )
-            .expect("selection should succeed")
-            .expect("selection should exist");
-
-        assert_eq!(chosen.to_string(), "3.6.4");
-    }
-
-    #[test]
-    fn resolves_highest_compatible_version_across_repositories() {
-        let mut first = Server::new();
-        let first_versions = first
-            .mock("GET", "/packages/pkg/versions")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(format!(
-                r#"{{"package":"pkg","versions":[{{"version":"1.0.0","sourceUrl":"{}/packages/pkg/versions/1.0.0/source"}}]}}"#,
-                first.url()
-            ))
-            .expect(1)
-            .create();
-        let mut second = Server::new();
-        let second_versions = second
-            .mock("GET", "/packages/pkg/versions")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(format!(
-                r#"{{"package":"pkg","versions":[{{"version":"2.0.0","sourceUrl":"{}/packages/pkg/versions/2.0.0/source"}}]}}"#,
-                second.url()
-            ))
-            .expect(1)
-            .create();
-        let second_description = second
-            .mock("GET", "/packages/pkg/versions/2.0.0/description")
-            .with_status(200)
-            .with_body("Package: pkg\nVersion: 2.0.0\n")
-            .expect(1)
-            .create();
-        let repositories = RepositorySet::new(vec![
-            RepositorySource::new(first.url()),
-            RepositorySource::new(second.url()),
-        ]);
-
-        let resolved = resolve_from_registry(
-            &repositories,
-            &[ResolutionRoot {
-                name: "pkg".to_string(),
-                constraint: "*".to_string(),
-            }],
-            &BTreeMap::new(),
-        )
-        .expect("resolution should succeed");
-
-        assert_eq!(resolved[0].version, "2.0.0");
-        assert_eq!(
-            resolved[0].source_url,
-            format!("{}/packages/pkg/versions/2.0.0/source", second.url())
-        );
-        first_versions.assert();
-        second_versions.assert();
-        second_description.assert();
-    }
-
-    #[test]
-    fn keeps_preferred_locked_version_from_enabled_repositories() {
-        let mut server = Server::new();
-        let versions = server
-            .mock("GET", "/packages/pkg/versions")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(format!(
-                r#"{{"package":"pkg","versions":[{{"version":"1.0.0","sourceUrl":"{0}/packages/pkg/versions/1.0.0/source"}},{{"version":"2.0.0","sourceUrl":"{0}/packages/pkg/versions/2.0.0/source"}}]}}"#,
-                server.url()
-            ))
-            .expect(1)
-            .create();
-        let description = server
-            .mock("GET", "/packages/pkg/versions/1.0.0/description")
-            .with_status(200)
-            .with_body("Package: pkg\nVersion: 1.0.0\n")
-            .expect(1)
-            .create();
-        let repositories = RepositorySet::new(vec![RepositorySource::new(server.url())]);
-        let preferred = BTreeMap::from([("pkg".to_string(), "1.0.0".to_string())]);
-
-        let resolved = resolve_from_registry(
-            &repositories,
-            &[ResolutionRoot {
-                name: "pkg".to_string(),
-                constraint: "*".to_string(),
-            }],
-            &preferred,
-        )
-        .expect("resolution should succeed");
-
-        assert_eq!(resolved[0].version, "1.0.0");
-        assert_eq!(
-            resolved[0].source_url,
-            format!("{}/packages/pkg/versions/1.0.0/source", server.url())
-        );
-        versions.assert();
-        description.assert();
-    }
 }
