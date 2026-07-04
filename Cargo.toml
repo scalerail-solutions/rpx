@@ -16,6 +16,7 @@ directories = "6.0.0"
 flate2 = "1.1.5"
 futures-core = "0.3"
 futures-util = "0.3"
+http = "1"
 indicatif = "0.18.4"
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "linux-native", "windows-native"] }
 miette = { version = "7.6.0", features = ["fancy"] }
@@ -46,3 +47,6 @@ pedantic = "warn"
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+[patch.crates-io]
+r-description = { git = "https://github.com/blyedev/r-description-rs.git", branch = "opencode/brave-engine" }

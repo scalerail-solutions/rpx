@@ -1,6 +1,7 @@
 use clap::Parser;
 use futures_util::StreamExt;
 use miette::Diagnostic;
+use r_description::{VersionConstraint, lossless::RDescription};
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
@@ -337,7 +338,8 @@ fn init_tracing() {
                     .expect("progress footer style should be valid"),
             ),
         );
-    let filter = EnvFilter::new("warn,reqwest_tracing=info,rpx=info");
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("warn,reqwest_tracing=info,rpx=info"));
     let fmt_layer =
         tracing_subscriber::fmt::layer().with_writer(indicatif_layer.get_stderr_writer());
 
@@ -361,6 +363,8 @@ fn progress_bar_style() -> ProgressStyle {
 }
 
 async fn run_inner() -> RpxResult<()> {
+    init_tracing();
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -1051,7 +1055,7 @@ fn preferred_versions_from_lockfile(
             let repository = repository_for_locked_package(repositories, package)?;
             let version = package
                 .version
-                .parse::<r_description::Version>()
+                .parse()
                 .map_err(|error| LockError::ResolveFailed {
                     details: format!(
                         "invalid locked version {} for {name}: {error}",
@@ -1288,8 +1292,6 @@ async fn sync_from_lockfile(
     outcome.removed = extra_packages.len();
     let _ = remove_packages_from_venv(&extra_packages);
 
-    init_tracing();
-
     install_locked_packages(
         lockfile.packages.values().cloned().collect::<Vec<_>>(),
         lockfile.repositories.iter().cloned().collect::<Vec<_>>(),
@@ -1344,7 +1346,7 @@ async fn lockfile_from_roots(
     let root_dependencies = root_dependency_ranges(&repositories, &roots)
         .map_err(|details| LockError::ResolveFailed { details })?;
     let selected = resolve_from_registry(
-        http::client(),
+        http::progress_client(),
         repositories.clone(),
         root_dependencies,
         preferred_versions,
@@ -1371,7 +1373,7 @@ async fn lockfile_from_selected_versions(
     repositories: &[PackageRepository],
     r_version: Option<&str>,
 ) -> Result<Lockfile, String> {
-    let client = http::client();
+    let client = http::traced_client();
     let mut packages = BTreeMap::new();
     let mut sysreq_packages = BTreeMap::new();
 
@@ -1380,9 +1382,11 @@ async fn lockfile_from_selected_versions(
             .repository()
             .description(&client, &name, version.version())
             .await?;
+
         let dependencies = locked_dependencies_from_description(&description)?;
 
-        let rules = sysreqs::match_rules(description.system_requirements.as_deref(), sysreq_db);
+        let rules = sysreqs::match_rules(&description, sysreq_db);
+
         if !rules.is_empty() {
             sysreq_packages.insert(name.clone(), rules);
         }
@@ -1439,38 +1443,46 @@ async fn lockfile_from_selected_versions(
 }
 
 fn locked_dependencies_from_description(
-    description: &r_description::lossy::RDescription,
+    description: &RDescription,
+) -> Result<Vec<lockfile::LockedDependency>, String> {
+    let depends = description.depends();
+    let imports = description.imports();
+    let linking_to = description.linking_to();
+
+    locked_dependencies_from_relations_fields(
+        depends.as_ref(),
+        imports.as_ref(),
+        linking_to.as_ref(),
+    )
+}
+
+fn locked_dependencies_from_relations_fields(
+    depends: Option<&r_description::lossless::Relations>,
+    imports: Option<&r_description::lossless::Relations>,
+    linking_to: Option<&r_description::lossless::Relations>,
 ) -> Result<Vec<lockfile::LockedDependency>, String> {
     let mut dependencies = Vec::new();
 
-    dependencies.extend(locked_dependencies_from_relations(
-        "Depends",
-        description.depends.as_ref(),
-    )?);
-    dependencies.extend(locked_dependencies_from_relations(
-        "Imports",
-        description.imports.as_ref(),
-    )?);
-    dependencies.extend(locked_dependencies_from_relations(
-        "LinkingTo",
-        description.linking_to.as_ref(),
-    )?);
+    dependencies.extend(locked_dependencies_from_relations("Depends", depends)?);
+    dependencies.extend(locked_dependencies_from_relations("Imports", imports)?);
+    dependencies.extend(locked_dependencies_from_relations("LinkingTo", linking_to)?);
 
     Ok(dependencies)
 }
 
 fn locked_dependencies_from_relations(
     kind: &str,
-    relations: Option<&r_description::lossy::Relations>,
+    relations: Option<&r_description::lossless::Relations>,
 ) -> Result<Vec<lockfile::LockedDependency>, String> {
     relations
         .into_iter()
         .flat_map(|relations| relations.iter())
-        .filter(|relation| relation.name != "R")
+        .filter(|relation| relation.name() != "R")
         .map(|relation| {
-            let (min_version, max_version_exclusive) = lossy_relation_bounds(relation);
+            let (min_version, max_version_exclusive) = relation_bounds(&relation);
+
             Ok(lockfile::LockedDependency {
-                package: relation.name.clone(),
+                package: relation.name().to_string(),
                 kind: kind.to_string(),
                 min_version,
                 max_version_exclusive,
@@ -1479,20 +1491,46 @@ fn locked_dependencies_from_relations(
         .collect()
 }
 
-fn lossy_relation_bounds(
-    relation: &r_description::lossy::Relation,
+fn relation_bounds(
+    relation: &r_description::lossless::Relation,
 ) -> (Option<String>, Option<String>) {
-    let Some((operator, version)) = relation.version.as_ref() else {
+    let version = relation.version();
+
+    let Some((operator, version)) = version.as_ref() else {
         return (None, None);
     };
 
+    let version = version.to_string();
+
     match operator {
-        r_description::VersionConstraint::GreaterThan
-        | r_description::VersionConstraint::GreaterThanEqual => (Some(version.to_string()), None),
-        r_description::VersionConstraint::LessThan
-        | r_description::VersionConstraint::LessThanEqual => (None, Some(version.to_string())),
-        r_description::VersionConstraint::Equal => (Some(version.to_string()), None),
-        r_description::VersionConstraint::NotEqual => (None, None),
+        VersionConstraint::Equal => {
+            // A lockfile with min/max-exclusive cannot represent exact equality perfectly
+            // unless your lockfile semantics define max as the same version or you compute
+            // the next version. Keep this aligned with the old lossy behavior.
+            (Some(version), None)
+        }
+
+        VersionConstraint::GreaterThan => {
+            // Same caveat: strict lower bound cannot be represented exactly by min_version.
+            // Match existing behavior unless you have a stricter representation.
+            (Some(version), None)
+        }
+
+        VersionConstraint::GreaterThanEqual => (Some(version), None),
+
+        VersionConstraint::LessThan => (None, Some(version)),
+
+        VersionConstraint::LessThanEqual => {
+            // Existing max_version_exclusive cannot precisely represent <=.
+            // Match whatever the previous lossy_relation_bounds did.
+            (None, Some(version))
+        }
+
+        VersionConstraint::NotEqual => {
+            // Existing code did not return Result from bounds, so either ignore or
+            // change relation_bounds to Result if you want to reject this.
+            (None, None)
+        }
     }
 }
 
@@ -1982,12 +2020,21 @@ async fn install_locked_package_inner(
     repository: LockedRepository,
     span: tracing::Span,
 ) -> Result<String, String> {
+    fn response_for_status(response: reqwest::Response) -> Result<reqwest::Response, String> {
+        response
+            .error_for_status()
+            .map_err(|error| error.to_string())
+    }
+
     let project_library = project_library_path();
+
     record_package_stage(&span, &package, "checking R version");
     let r_version = r_version_async().await?;
     let r_minor = r_minor_version(&r_version)
         .ok_or_else(|| format!("failed to parse R minor version from {r_version}"))?;
+
     let key = CompiledPackageCacheKey::new(&package.package, &package.version, &r_version);
+
     record_package_stage(&span, &package, "checking cache");
     if cache::exists(&key).await {
         record_package_stage(&span, &package, "restoring from cache");
@@ -1998,9 +2045,11 @@ async fn install_locked_package_inner(
 
     let base_url = reqwest::Url::parse(&repository.url)
         .map_err(|error| format!("invalid repository URL {}: {error}", repository.url))?;
+
     let client = http::traced_client();
 
     record_package_stage(&span, &package, "downloading binary");
+
     let binary = match (std::env::consts::OS, repository.kind) {
         ("windows", LockedRepositoryKind::Rrepo) => http::rrepo_windows_binary(
             &client,
@@ -2010,8 +2059,10 @@ async fn install_locked_package_inner(
             &r_minor,
         )
         .await
-        .map(|response| (response, "zip", "win.binary".to_string()))
-        .map_err(|error| error.to_string()),
+        .map_err(|error| error.to_string())
+        .and_then(response_for_status)
+        .map(|response| (response, "zip", "win.binary".to_string())),
+
         ("windows", LockedRepositoryKind::CranLike) => http::cran_windows_binary(
             &client,
             &base_url,
@@ -2020,10 +2071,13 @@ async fn install_locked_package_inner(
             &package.version,
         )
         .await
-        .map(|response| (response, "zip", "win.binary".to_string()))
-        .map_err(|error| error.to_string()),
+        .map_err(|error| error.to_string())
+        .and_then(response_for_status)
+        .map(|response| (response, "zip", "win.binary".to_string())),
+
         ("macos", LockedRepositoryKind::Rrepo) => {
             let target = macos_binary_target()?;
+
             http::rrepo_macos_binary(
                 &client,
                 &base_url,
@@ -2033,11 +2087,14 @@ async fn install_locked_package_inner(
                 &r_minor,
             )
             .await
-            .map(|response| (response, "tgz", format!("mac.binary.{target}")))
             .map_err(|error| error.to_string())
+            .and_then(response_for_status)
+            .map(|response| (response, "tgz", format!("mac.binary.{target}")))
         }
+
         ("macos", LockedRepositoryKind::CranLike) => {
             let target = macos_binary_target()?;
+
             http::cran_macos_binary(
                 &client,
                 &base_url,
@@ -2047,9 +2104,11 @@ async fn install_locked_package_inner(
                 &package.version,
             )
             .await
-            .map(|response| (response, "tgz", format!("mac.binary.{target}")))
             .map_err(|error| error.to_string())
+            .and_then(response_for_status)
+            .map(|response| (response, "tgz", format!("mac.binary.{target}")))
         }
+
         _ => Err(format!(
             "binary artifacts are not supported on {}-{}",
             std::env::consts::OS,
@@ -2062,10 +2121,18 @@ async fn install_locked_package_inner(
             span.record("artifact_kind", binary.2.as_str());
             binary
         }
+
         Err(error) => {
-            tracing::debug!(package = %package.package, version = %package.version, error = %error, "binary artifact unavailable; falling back to source");
+            tracing::debug!(
+                package = %package.package,
+                version = %package.version,
+                error = %error,
+                "binary artifact unavailable; falling back to source"
+            );
+
             record_package_stage(&span, &package, "falling back to source");
             record_package_stage(&span, &package, "downloading source");
+
             let response = match repository.kind {
                 LockedRepositoryKind::Rrepo => {
                     http::rrepo_source_artifact(
@@ -2076,6 +2143,7 @@ async fn install_locked_package_inner(
                     )
                     .await
                 }
+
                 LockedRepositoryKind::CranLike => {
                     let source_url = package
                         .source_url
@@ -2101,35 +2169,36 @@ async fn install_locked_package_inner(
                     }
                 }
             }
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())
+            .and_then(response_for_status)?;
 
             span.record("artifact_kind", "source");
+
             (response, "tar.gz", "source".to_string())
         }
     };
 
     let artifact_path = write_artifact_response(&package, extension, response, &span).await?;
+
     record_package_stage(&span, &package, "installing");
+
     let temp_library = build_temp_library_path(&package.package, &unique_build_token());
-    let install_package = package.package.clone();
-    let install_version = package.version.clone();
-    let install_type_for_task = install_type.clone();
-    let artifact_path_for_task = artifact_path.clone();
-    let temp_library_for_task = temp_library.clone();
 
     install_local_package(
-        &artifact_path_for_task,
-        &install_package,
-        &install_version,
-        &install_type_for_task,
-        &temp_library_for_task,
+        &artifact_path,
+        &package.package,
+        &package.version,
+        &install_type,
+        &temp_library,
     )
     .await
     .map_err(|failure| install_failure_message(&package.package, &package.version, &failure))?;
 
     let built_package_path = temp_library.join(&package.package);
+
     record_package_stage(&span, &package, "storing cache");
     cache::store(&key, &built_package_path).await?;
+
     record_package_stage(&span, &package, "restoring project library");
     cache::restore(&key, &project_library).await?;
 
@@ -2141,6 +2210,7 @@ async fn install_locked_package_inner(
     }
 
     record_package_stage(&span, &package, "done");
+
     Ok(package.package)
 }
 
@@ -2162,7 +2232,7 @@ fn package_stage_message(package: &str, version: &str, stage: &str) -> String {
 async fn write_artifact_response(
     package: &LockedPackage,
     extension: &str,
-    response: http::ArtifactResponse,
+    response: reqwest::Response,
     span: &tracing::Span,
 ) -> Result<PathBuf, String> {
     let file_name = format!("{}_{}.{}", package.package, package.version, extension);
@@ -2181,10 +2251,12 @@ async fn write_artifact_response(
                 "using cached artifact",
             ));
         }
+
         return Ok(path);
     }
 
-    let content_length = response.content_length;
+    let content_length = response.content_length();
+
     if let Some(total) = content_length {
         span.record("total_bytes", total);
         span.pb_set_style(&progress_bar_style());
@@ -2192,26 +2264,44 @@ async fn write_artifact_response(
         span.pb_set_position(0);
     }
 
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|error| {
+            format!(
+                "failed to create artifact cache directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+
     let mut file = tokio::fs::File::create(&path)
         .await
         .map_err(|error| format!("failed to create artifact file {}: {error}", path.display()))?;
-    let mut stream = response.stream;
+
+    let mut stream = response.bytes_stream();
     let mut written = 0_u64;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| format!("failed to read artifact response: {error}"))?;
         let chunk_len = chunk.len() as u64;
+
         file.write_all(&chunk).await.map_err(|error| {
             format!("failed to write artifact file {}: {error}", path.display())
         })?;
+
         written += chunk_len;
+
         span.record("bytes", written);
+
         if content_length.is_some() {
             span.pb_inc(chunk_len);
         } else {
             span.pb_tick();
         }
     }
+
+    file.flush()
+        .await
+        .map_err(|error| format!("failed to flush artifact file {}: {error}", path.display()))?;
 
     Ok(path)
 }

@@ -1,14 +1,18 @@
-use std::{cmp::Reverse, collections::BTreeMap, error::Error, fmt, str::FromStr, sync::Arc};
-
+use futures_util::{StreamExt, stream};
 use pubgrub::{
     Dependencies, DependencyConstraints, DependencyProvider, PackageResolutionStatistics, Ranges,
     resolve,
 };
-use r_description::{Version, VersionConstraint};
+use r_description::{
+    VersionConstraint,
+    lossless::{RDescription, Relation, Version},
+};
+use std::{cmp::Reverse, collections::BTreeMap, error::Error, fmt, str::FromStr, sync::Arc};
+use tracing::Instrument;
+use tracing_indicatif::span_ext::IndicatifSpanExt;
 
 use crate::{
-    default_repository,
-    http,
+    default_repository, http,
     repository::{PackageRepository, RepositoryType},
 };
 
@@ -138,6 +142,43 @@ impl RDependencyProvider {
             preferred_versions,
         })
     }
+
+    fn prefetch_versions<I>(&self, packages: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let packages = packages.into_iter().collect::<Vec<_>>();
+
+        if packages.is_empty() {
+            return;
+        }
+
+        let repositories = self.repositories.clone();
+        let client = self.client.clone();
+
+        let parent_span = tracing::Span::current();
+
+        tokio::runtime::Handle::current().spawn(
+            async move {
+                stream::iter(packages)
+                    .for_each_concurrent(8, |package| {
+                        let repositories = repositories.clone();
+                        let client = client.clone();
+
+                        async move {
+                            let _ = futures_util::future::join_all(
+                                repositories
+                                    .iter()
+                                    .map(|repository| repository.versions(&client, &package)),
+                            )
+                            .await;
+                        }
+                    })
+                    .await;
+            }
+            .instrument(parent_span),
+        );
+    }
 }
 
 impl DependencyProvider for RDependencyProvider {
@@ -154,6 +195,8 @@ impl DependencyProvider for RDependencyProvider {
         range: &Self::VS,
         package_conflicts_counts: &PackageResolutionStatistics,
     ) -> Self::Priority {
+        let conflicts = package_conflicts_counts.conflict_count();
+
         let matches = tokio::runtime::Handle::current()
             .block_on(async {
                 let results = futures_util::future::join_all(
@@ -175,7 +218,7 @@ impl DependencyProvider for RDependencyProvider {
             })
             .unwrap_or(usize::MAX);
 
-        (package_conflicts_counts.conflict_count(), Reverse(matches))
+        (conflicts, Reverse(matches))
     }
 
     fn choose_version(
@@ -184,45 +227,50 @@ impl DependencyProvider for RDependencyProvider {
         range: &Self::VS,
     ) -> Result<Option<Self::V>, Self::Err> {
         if package == ROOT_PACKAGE {
-            let root = tokio::runtime::Handle::current().block_on(root_package_version())?;
+            let root = tokio::runtime::Handle::current()
+                .block_on(root_package_version())
+                .map_err(ResolverError::from)?;
 
-            if range.contains(&root) {
-                return Ok(Some(root));
-            }
-
-            return Ok(None);
+            return Ok(range.contains(&root).then_some(root));
         }
 
-        if let Some(preferred) = self.preferred_versions.get(package)
-            && range.contains(preferred)
-        {
-            return Ok(Some(preferred.clone()));
+        if let Some(preferred) = self.preferred_versions.get(package) {
+            if range.contains(preferred) {
+                return Ok(Some(preferred.clone()));
+            }
         }
 
         let versions_by_repository = tokio::runtime::Handle::current()
             .block_on(async {
-                let results = futures_util::future::join_all(
+                futures_util::future::join_all(
                     self.repositories
                         .iter()
                         .map(|repository| repository.versions(&self.client, package)),
                 )
-                .await;
-
-                results.into_iter().collect::<Result<Vec<_>, String>>()
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>, String>>()
             })
             .map_err(ResolverError::from)?;
 
-        for versions in versions_by_repository {
-            if let Some(version) = versions
-                .into_iter()
-                .rev()
-                .find(|version| range.contains(version))
-            {
-                return Ok(Some(version));
-            }
-        }
-
-        Ok(None)
+        Ok(versions_by_repository
+            .into_iter()
+            .enumerate()
+            .flat_map(|(repository_index, versions)| {
+                versions
+                    .into_iter()
+                    .filter(move |version| range.contains(version))
+                    .map(move |version| (version, repository_index))
+            })
+            .max_by(|(left_version, left_repo), (right_version, right_repo)| {
+                left_version
+                    .cmp(right_version)
+                    // For equal versions, prefer lower repository index.
+                    // `max_by` wants the preferred item to compare greater,
+                    // so reverse the repo-index comparison.
+                    .then_with(|| right_repo.cmp(left_repo))
+            })
+            .map(|(version, _repository_index)| version))
     }
 
     fn get_dependencies(
@@ -231,12 +279,15 @@ impl DependencyProvider for RDependencyProvider {
         version: &Self::V,
     ) -> Result<Dependencies<Self::P, Self::VS, Self::M>, Self::Err> {
         if package == ROOT_PACKAGE {
-            return Ok(Dependencies::Available(
-                self.root_dependencies
-                    .iter()
-                    .map(|(package, range)| (package.clone(), range.clone()))
-                    .collect::<DependencyConstraints<_, _>>(),
-            ));
+            let constraints = self
+                .root_dependencies
+                .iter()
+                .map(|(package, range)| (package.clone(), range.clone()))
+                .collect::<DependencyConstraints<_, _>>();
+
+            self.prefetch_versions(constraints.keys().cloned());
+
+            return Ok(Dependencies::Available(constraints));
         }
 
         if is_base_package(package) {
@@ -249,29 +300,42 @@ impl DependencyProvider for RDependencyProvider {
                     .repository
                     .description(&self.client, package, &version.version),
             )
-            .map_err(ResolverError::from)?;
-
-        let repository = Arc::clone(&version.repository);
-
-        let constraints = description
-            .depends
-            .as_ref()
-            .into_iter()
-            .chain(description.imports.as_ref())
-            .chain(description.linking_to.as_ref())
-            .flat_map(|relations| relations.iter())
-            .filter(|relation| relation.name != "R")
-            .filter(|relation| !is_base_package(&relation.name))
-            .map(|relation| {
-                Ok((
-                    relation.name.clone(),
-                    relation_package_range(Arc::clone(&repository), relation)?,
+            .map_err(|err| {
+                ResolverError(format!(
+                    "failed to parse dependency metadata for {package} {} from {}: {err}",
+                    version.version,
+                    version.repository.base_url(),
                 ))
-            })
-            .collect::<Result<DependencyConstraints<_, _>, ResolverError>>()?;
+            })?;
+
+        let constraints =
+            dependency_constraints_from_description(Arc::clone(&version.repository), &description)?;
+
+        self.prefetch_versions(constraints.keys().cloned());
 
         Ok(Dependencies::Available(constraints))
     }
+}
+
+fn dependency_constraints_from_description(
+    repository: Arc<PackageRepository>,
+    description: &RDescription,
+) -> Result<DependencyConstraints<String, Ranges<PackageVersion>>, ResolverError> {
+    description
+        .depends()
+        .into_iter()
+        .chain(description.imports())
+        .chain(description.linking_to())
+        .flat_map(|relations| relations.iter())
+        .filter(|relation| relation.name() != "R")
+        .filter(|relation| !is_base_package(&relation.name()))
+        .map(|relation| {
+            Ok((
+                relation.name().to_string(),
+                relation_package_range(Arc::clone(&repository), &relation)?,
+            ))
+        })
+        .collect()
 }
 
 async fn root_package_version() -> Result<PackageVersion, ResolverError> {
@@ -283,9 +347,11 @@ async fn root_package_version() -> Result<PackageVersion, ResolverError> {
 
 fn relation_package_range(
     repository: Arc<PackageRepository>,
-    relation: &r_description::lossy::Relation,
+    relation: &Relation,
 ) -> Result<Ranges<PackageVersion>, ResolverError> {
-    let Some((operator, version)) = relation.version.as_ref() else {
+    let relation_version = relation.version();
+
+    let Some((operator, version)) = relation_version.as_ref() else {
         return Ok(Ranges::full());
     };
 
@@ -322,6 +388,18 @@ pub async fn resolve_from_registry(
         return Ok(Vec::new());
     }
 
+    let span = tracing::info_span!(
+        "resolve_dependencies",
+        roots = root_dependencies.len(),
+        repositories = repositories.len(),
+        preferred = preferred_versions.len(),
+        selected = tracing::field::Empty,
+        stage = tracing::field::Empty,
+        indicatif.pb_show = true,
+    );
+    span.pb_set_message("resolve dependencies");
+    span.pb_start();
+
     let root_version = root_package_version()
         .await
         .map_err(|error| error.to_string())?;
@@ -330,7 +408,11 @@ pub async fn resolve_from_registry(
         RDependencyProvider::new(client, repositories, root_dependencies, preferred_versions)
             .map_err(|error| error.to_string())?;
 
-    tokio::task::spawn_blocking(move || {
+    let resolve_span = span.clone();
+    let selected = tokio::task::spawn_blocking(move || {
+        let _enter = resolve_span.enter();
+        resolve_span.record("stage", "solving");
+
         let selected = resolve(&provider, ROOT_PACKAGE.to_string(), root_version)
             .map_err(|error| error.to_string())?;
 
@@ -340,11 +422,18 @@ pub async fn resolve_from_registry(
             .collect::<Vec<_>>();
 
         selected.sort_by(|left, right| left.0.cmp(&right.0));
+        resolve_span.record("selected", selected.len());
 
-        Ok(selected)
+        Ok::<_, String>(selected)
     })
     .await
-    .map_err(|error| format!("failed to join resolver task: {error}"))?
+    .map_err(|error| format!("failed to join resolver task: {error}"))??;
+
+    span.record("stage", "done");
+    span.record("selected", selected.len());
+    span.pb_set_finish_message(&format!("resolve dependencies {} packages", selected.len()));
+
+    Ok(selected)
 }
 
 pub fn package_range(

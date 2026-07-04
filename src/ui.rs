@@ -1,4 +1,4 @@
-use std::{io::IsTerminal};
+use std::io::IsTerminal;
 
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -45,4 +45,3 @@ impl SystemDepsUi {
         }
     }
 }
-

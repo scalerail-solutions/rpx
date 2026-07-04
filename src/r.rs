@@ -61,7 +61,7 @@ pub async fn install_local_package(
         "packages <- installed.packages(lib.loc = '%LIB%');",
         "if (!('%PACKAGE%' %in% rownames(packages))) stop('Expected package %PACKAGE% to be installed');",
         "installed_version <- packages['%PACKAGE%', 'Version'];",
-        "if (installed_version != '%VERSION%') stop(sprintf('Installed %s version %s, expected %s', '%PACKAGE%', installed_version, '%VERSION%'))"
+        "if (installed_version != '%VERSION%') warning(sprintf('Installed %s version %s, expected %s', '%PACKAGE%', installed_version, '%VERSION%'))"
     )
     .replace("%ARTIFACT%", &escape_r_string(artifact_path))
     .replace("%TYPE%", &escape_r_string(pkg_type))

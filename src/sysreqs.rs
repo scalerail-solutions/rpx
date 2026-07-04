@@ -1,4 +1,5 @@
 use flate2::read::GzDecoder;
+use r_description::lossless::RDescription;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -155,16 +156,24 @@ pub(crate) fn empty_snapshot() -> SysreqDbSnapshot {
     }
 }
 
-pub(crate) fn match_rules(spec: Option<&str>, db: &SysreqDbSnapshot) -> Vec<String> {
-    let Some(spec) = spec.map(str::trim).filter(|value| !value.is_empty()) else {
+pub(crate) fn match_rules(description: &RDescription, db: &SysreqDbSnapshot) -> Vec<String> {
+    let system_requirements = description.system_requirements();
+
+    let Some(spec) = system_requirements
+        .as_ref()
+        .map(|values| values.join(" "))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
         return vec![];
     };
 
     let mut matches = BTreeSet::new();
+
     for rule in &db.rules {
         if rule.patterns.iter().any(|pattern| {
             Regex::new(&format!("(?i){pattern}"))
-                .map(|regex| regex.is_match(spec))
+                .map(|regex| regex.is_match(&spec))
                 .unwrap_or(false)
         }) {
             matches.insert(rule.id.clone());

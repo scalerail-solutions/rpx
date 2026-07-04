@@ -2039,8 +2039,7 @@ dependencies = [
 [[package]]
 name = "r-description"
 version = "0.3.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48eb5103934db1a964f3bdd917eb41d26bf5239c18e4a1e8ed468824953d56b1"
+source = "git+https://github.com/blyedev/r-description-rs.git?branch=opencode%2Fbrave-engine#dec091b2dfae15eb2e4f45fa5a503303a18d7303"
 dependencies = [
  "deb822-derive",
  "deb822-fast",
@@ -2288,6 +2287,7 @@ dependencies = [
  "flate2",
  "futures-core",
  "futures-util",
+ "http",
  "indicatif",
  "keyring",
  "miette",
