@@ -181,6 +181,10 @@ pub enum HttpError {
         source: reqwest::Error,
     },
 
+    #[error("failed to extract source package from {url}: {details}")]
+    #[diagnostic(code(rpx::http::artifact_extract_failed))]
+    ArtifactExtractFailed { url: reqwest::Url, details: String },
+
     #[error("failed to read response body from {url}: {source}")]
     #[diagnostic(code(rpx::http::body_read_failed))]
     BodyReadFailed {
@@ -715,4 +719,148 @@ pub async fn cran_macos_binary(
         .extend(["bin", "macosx", target, "contrib", r_minor, &file_name]);
 
     artifact_response(client, url).await
+}
+
+pub async fn cran_package_description(
+    client: &HttpClient,
+    base_url: &reqwest::Url,
+    package: &str,
+    version: &str,
+) -> Result<r_description::lossy::RDescription, HttpError> {
+    match cran_latest_package_description(client, base_url, package).await {
+        Ok(description) if description.version.to_string() == version => {
+            return Ok(description);
+        }
+        Ok(_) | Err(_) => {
+            // The latest DESCRIPTION is either unavailable or not the exact
+            // selected version. Fall back to the archived source tarball.
+        }
+    }
+
+    let artifact = cran_archive_source_tarball(client, base_url, package, version).await?;
+    let body = description_body_from_source_artifact(artifact, base_url, package, version).await?;
+
+    parse_cran_description_body(&body, base_url, package, version)
+}
+
+async fn description_body_from_source_artifact(
+    mut artifact: ArtifactResponse,
+    base_url: &reqwest::Url,
+    package: &str,
+    version: &str,
+) -> Result<String, HttpError> {
+    use futures_util::TryStreamExt;
+
+    let mut bytes = Vec::with_capacity(artifact.content_length.unwrap_or_default() as usize);
+
+    while let Some(chunk) = artifact
+        .stream
+        .try_next()
+        .await
+        .map_err(|source| HttpError::BodyReadFailed {
+            url: cran_archive_source_url_for_error(base_url, package, version),
+            source,
+        })?
+    {
+        bytes.extend_from_slice(&chunk);
+    }
+
+    description_body_from_tar_gz_bytes(&bytes, base_url, package, version)
+}
+
+fn description_body_from_tar_gz_bytes(
+    bytes: &[u8],
+    base_url: &reqwest::Url,
+    package: &str,
+    version: &str,
+) -> Result<String, HttpError> {
+    let url = cran_archive_source_url_for_error(base_url, package, version);
+    let decoder = GzDecoder::new(bytes);
+    let mut archive = tar::Archive::new(decoder);
+
+    let entries = archive
+        .entries()
+        .map_err(|source| HttpError::ArtifactExtractFailed {
+            url: url.clone(),
+            details: format!("failed to read source package archive: {source}"),
+        })?;
+
+    for entry in entries {
+        let mut entry = entry.map_err(|source| HttpError::ArtifactExtractFailed {
+            url: url.clone(),
+            details: format!("failed to read archive entry: {source}"),
+        })?;
+
+        let is_description = {
+            let path = entry.path().map_err(|source| HttpError::ArtifactExtractFailed {
+                url: url.clone(),
+                details: format!("failed to read archive entry path: {source}"),
+            })?;
+
+            path_is_top_level_description(&path, package)
+        };
+
+        if !is_description {
+            continue;
+        }
+
+        let mut body = String::new();
+        entry
+            .read_to_string(&mut body)
+            .map_err(|source| HttpError::ArtifactExtractFailed {
+                url: url.clone(),
+                details: format!("failed to read DESCRIPTION from source package: {source}"),
+            })?;
+
+        return Ok(body);
+    }
+
+    Err(HttpError::ArtifactExtractFailed {
+        url,
+        details: format!("source package does not contain {package}/DESCRIPTION"),
+    })
+}
+
+fn parse_cran_description_body(
+    body: &str,
+    base_url: &reqwest::Url,
+    package: &str,
+    version: &str,
+) -> Result<r_description::lossy::RDescription, HttpError> {
+    let url = cran_archive_source_url_for_error(base_url, package, version);
+
+    let description = r_description::lossy::RDescription::from_str(body).map_err(|details| {
+        HttpError::DescriptionParseFailed {
+            url: url.clone(),
+            details,
+        }
+    })?;
+
+    Ok(description)
+}
+
+fn path_is_top_level_description(path: &std::path::Path, package: &str) -> bool {
+    let mut components = path.components().filter_map(|component| {
+        let component = component.as_os_str().to_str()?;
+        (component != ".").then_some(component)
+    });
+
+    components.next() == Some(package)
+        && components.next() == Some("DESCRIPTION")
+        && components.next().is_none()
+}
+
+fn cran_archive_source_url_for_error(
+    base_url: &reqwest::Url,
+    package: &str,
+    version: &str,
+) -> reqwest::Url {
+    let file_name = format!("{package}_{version}.tar.gz");
+    let mut url = base_url.clone();
+
+    url.path_segments_mut()
+        .expect("repository base URL should support path segments")
+        .extend(["src", "contrib", "Archive", package, &file_name]);
+
+    url
 }

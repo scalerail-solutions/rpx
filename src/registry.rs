@@ -33,8 +33,3 @@ pub struct VersionSummary {
     #[serde(rename = "sourceUrl")]
     pub source_url: String,
 }
-
-
-pub fn is_not_found_error(error: &str) -> bool {
-    error.starts_with("unexpected registry response (404")
-}

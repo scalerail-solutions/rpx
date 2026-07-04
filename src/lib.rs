@@ -6,7 +6,7 @@ use std::{
     env, fs,
     io::IsTerminal,
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
@@ -53,7 +53,7 @@ use project::{
     project_library_root_path,
 };
 use pubgrub::Ranges;
-use r::{InstallFailure, base_packages, install_local_package, installed_packages, runtime_info};
+use r::{InstallFailure, base_packages, install_local_package, installed_packages};
 use registry::{DEFAULT_REGISTRY_BASE_URL, ResolutionRoot};
 use repository::{RepositoryKind, RepositorySet, RepositorySource, normalize_repository_url};
 use resolver::{is_base_package, resolve_from_registry};
@@ -71,13 +71,14 @@ use ui::SystemDepsUi;
 use crate::{
     cache::CompiledPackageCacheKey,
     lockfile::LockedPackage,
-    r::{RVirtualEnv, installed_packages_async, r_version_async, remove_packages_from_venv},
+    r::{
+        RVirtualEnv, fetch_runtime_info, installed_packages_async, r_version_async,
+        remove_packages_from_venv,
+    },
     repository::{ArchiveSupport, PackageRepository, RepositoryType},
     resolver::{PackageVersion, package_range},
 };
 use tokio::io::AsyncWriteExt;
-
-static REPOSITORY_CLASSIFIER_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 type RpxResult<T> = Result<T, RpxError>;
 
@@ -397,11 +398,11 @@ async fn run_inner() -> RpxResult<()> {
             ))
             .await
         }
-        Commands::Status => cmd_status(),
+        Commands::Status => cmd_status().await,
         Commands::Sync {
             install_system,
             install_only_system,
-        } => cmd_sync(install_system, install_only_system),
+        } => cmd_sync(install_system, install_only_system).await,
         Commands::Clean => cmd_clean(),
         Commands::Repo { command } => cmd_repo(command).await,
     }
@@ -456,7 +457,7 @@ async fn cmd_add(
 
     write_description(&description)?;
     write_project_lockfile(&lockfile)?;
-    let _ = sync_from_lockfile(false, false)?;
+    let _ = sync_from_lockfile(false, false).await?;
     status(format_args!("Added {}", packages.join(", ")));
     Ok(())
 }
@@ -638,7 +639,7 @@ async fn cmd_remove(
 
     write_description(&description)?;
     write_project_lockfile(&lockfile)?;
-    let _ = sync_from_lockfile(false, false)?;
+    let _ = sync_from_lockfile(false, false).await?;
 
     Ok(())
 }
@@ -671,12 +672,12 @@ async fn cmd_lock(repository_preference: DefaultRepositoryPreference) -> RpxResu
     Ok(())
 }
 
-fn cmd_sync(install_system: bool, install_only_system: bool) -> RpxResult<()> {
+async fn cmd_sync(install_system: bool, install_only_system: bool) -> RpxResult<()> {
     if (install_system || install_only_system) && !host_supports_system_sync() {
         return Err(SyncError::UnsupportedSystemInstall.into());
     }
 
-    let outcome = sync_from_lockfile(install_system, install_only_system)?;
+    let outcome = sync_from_lockfile(install_system, install_only_system).await?;
     if install_only_system {
         return Ok(());
     }
@@ -688,7 +689,7 @@ fn cmd_sync(install_system: bool, install_only_system: bool) -> RpxResult<()> {
     Ok(())
 }
 
-fn cmd_status() -> RpxResult<()> {
+async fn cmd_status() -> RpxResult<()> {
     let description = read_description()?;
     let lockfile = read_project_lockfile()?;
 
@@ -714,7 +715,7 @@ fn cmd_status() -> RpxResult<()> {
         .iter()
         .map(|root| root.package.clone())
         .collect::<BTreeSet<_>>();
-    let installed = installed_packages();
+    let installed = installed_packages().await;
     let installed_names = installed
         .iter()
         .map(|package| &package.package)
@@ -724,7 +725,7 @@ fn cmd_status() -> RpxResult<()> {
         .map(|package| (package.package.clone(), package.version.clone()))
         .collect::<std::collections::BTreeMap<_, _>>();
     let locked_names = lockfile.packages.keys().collect::<BTreeSet<&String>>();
-    let runtime_status = runtime_status(&lockfile);
+    let runtime_status = runtime_status(&lockfile).await;
     let system_plan = if host_supports_system_sync() {
         system_plan_from_lockfile(&lockfile).ok()
     } else {
@@ -1233,7 +1234,10 @@ fn load_sysreq_snapshot_for_lock(
     empty_sysreq_snapshot()
 }
 
-fn sync_from_lockfile(install_system: bool, install_only_system: bool) -> RpxResult<SyncOutcome> {
+async fn sync_from_lockfile(
+    install_system: bool,
+    install_only_system: bool,
+) -> RpxResult<SyncOutcome> {
     let description = read_description()?;
     let manifest_requirements = description
         .imports
@@ -1248,7 +1252,7 @@ fn sync_from_lockfile(install_system: bool, install_only_system: bool) -> RpxRes
         .collect::<BTreeSet<_>>();
     let lockfile = read_project_lockfile()?;
     validate_lockfile_compatibility_for_sync(&lockfile)?;
-    validate_runtime_for_sync(&lockfile)?;
+    validate_runtime_for_sync(&lockfile).await?;
     if host_supports_system_sync() {
         let system_plan = system_plan_from_lockfile(&lockfile).unwrap_or_else(|error| {
             warning(RpxWarning::SystemPlanFailed { details: error });
@@ -1273,6 +1277,7 @@ fn sync_from_lockfile(install_system: bool, install_only_system: bool) -> RpxRes
     let mut outcome = SyncOutcome::default();
 
     let extra_packages = installed_packages()
+        .await
         .into_iter()
         .filter_map(|p| match lockfile.packages.get(&p.package) {
             Some(locked) if locked.version == p.version => None,
@@ -1285,13 +1290,12 @@ fn sync_from_lockfile(install_system: bool, install_only_system: bool) -> RpxRes
 
     init_tracing();
 
-    REPOSITORY_CLASSIFIER_RUNTIME
-        .get_or_init(|| tokio::runtime::Runtime::new().expect("install runtime should start"))
-        .block_on(install_locked_packages(
-            lockfile.packages.values().cloned().collect::<Vec<_>>(),
-            lockfile.repositories.iter().cloned().collect::<Vec<_>>(),
-        ))
-        .map_err(|details| SyncError::DownloadArtifactsFailed { details })?;
+    install_locked_packages(
+        lockfile.packages.values().cloned().collect::<Vec<_>>(),
+        lockfile.repositories.iter().cloned().collect::<Vec<_>>(),
+    )
+    .await
+    .map_err(|details| SyncError::DownloadArtifactsFailed { details })?;
 
     return Ok(outcome);
 }
@@ -1405,12 +1409,17 @@ async fn lockfile_from_selected_versions(
 
     let required_base_packages = locked_base_packages_from_locked(&roots, packages.values());
 
+    let resolved_r_version = match r_version {
+        Some(version) => version.to_string(),
+        None => fetch_runtime_info().await.version,
+    };
+
     Ok(Lockfile {
         version: LOCKFILE_VERSION,
         revision: LOCKFILE_REVISION,
         repositories: locked_package_repositories(repositories),
         r: LockedR {
-            version: r_version.map_or_else(|| runtime_info().version, ToString::to_string),
+            version: resolved_r_version,
             base_packages: required_base_packages,
         },
         sysreqs: LockedSystemRequirements {
@@ -1558,8 +1567,8 @@ struct RuntimeStatus {
     missing_base_packages: Vec<String>,
 }
 
-fn runtime_status(lockfile: &Lockfile) -> RuntimeStatus {
-    let runtime = runtime_info();
+async fn runtime_status(lockfile: &Lockfile) -> RuntimeStatus {
+    let runtime = fetch_runtime_info().await;
     let version_mismatch =
         (!lockfile.r.version.is_empty() && lockfile.r.version != runtime.version).then(|| {
             format!(
@@ -1567,7 +1576,7 @@ fn runtime_status(lockfile: &Lockfile) -> RuntimeStatus {
                 runtime.version, lockfile.r.version
             )
         });
-    let available_base_packages = base_packages().into_iter().collect::<BTreeSet<_>>();
+    let available_base_packages = base_packages().await.into_iter().collect::<BTreeSet<_>>();
     let locked_base_packages = lockfile
         .r
         .base_packages
@@ -1806,8 +1815,8 @@ fn prompt_for_system_dependency_action() -> SyncSystemChoice {
     }
 }
 
-fn validate_runtime_for_sync(lockfile: &Lockfile) -> RpxResult<()> {
-    let status = runtime_status(lockfile);
+async fn validate_runtime_for_sync(lockfile: &Lockfile) -> RpxResult<()> {
+    let status = runtime_status(lockfile).await;
 
     if let Some(version_mismatch) = status.version_mismatch {
         warning(RpxWarning::RuntimeVersionMismatch {
@@ -2108,17 +2117,14 @@ async fn install_locked_package_inner(
     let artifact_path_for_task = artifact_path.clone();
     let temp_library_for_task = temp_library.clone();
 
-    tokio::task::spawn_blocking(move || {
-        install_local_package(
-            &artifact_path_for_task,
-            &install_package,
-            &install_version,
-            &install_type_for_task,
-            &temp_library_for_task,
-        )
-    })
+    install_local_package(
+        &artifact_path_for_task,
+        &install_package,
+        &install_version,
+        &install_type_for_task,
+        &temp_library_for_task,
+    )
     .await
-    .map_err(|error| format!("failed to join install task: {error}"))?
     .map_err(|failure| install_failure_message(&package.package, &package.version, &failure))?;
 
     let built_package_path = temp_library.join(&package.package);
