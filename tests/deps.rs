@@ -1,6 +1,7 @@
 mod common;
 
 use common::*;
+use r_description::lossless::RDescription;
 
 fn write_description(
     container: &testcontainers::core::Container<testcontainers::GenericImage>,
@@ -45,6 +46,18 @@ fn assert_package_state(
     );
 }
 
+fn parsed_description(contents: &str) -> RDescription {
+    contents.parse().expect("DESCRIPTION should parse")
+}
+
+fn relation_names(relations: Option<r_description::lossless::Relations>) -> Vec<String> {
+    relations
+        .into_iter()
+        .flat_map(|relations| relations.iter())
+        .map(|relation| relation.name())
+        .collect()
+}
+
 #[test]
 fn runs_rpx_add_inside_custom_r_image() {
     let container = start_container();
@@ -65,7 +78,11 @@ fn runs_rpx_add_inside_custom_r_image() {
     let lockfile = read_project_file(&container, project_path, "rpx.lock");
     assert!(lockfile.contains("\"digest\""), "lockfile was: {lockfile}");
     assert!(
-        lockfile.contains("\"registry\""),
+        lockfile.contains("\"repositories\""),
+        "lockfile was: {lockfile}"
+    );
+    assert!(
+        lockfile.contains("\"url\": \"https://upstream.rrepo.dev/cran\""),
         "lockfile was: {lockfile}"
     );
     assert!(lockfile.contains("\"roots\""), "lockfile was: {lockfile}");
@@ -76,9 +93,7 @@ fn runs_rpx_add_inside_custom_r_image() {
 
     let description = read_project_file(&container, project_path, "DESCRIPTION");
     assert!(
-        description.contains("Imports:\n    digest")
-            || (description.contains("Imports:\n    digest (>=")
-                && description.contains("digest (<<")),
+        description.contains("digest (>=") && description.contains("digest (<"),
         "DESCRIPTION was: {description}"
     );
 }
@@ -219,7 +234,7 @@ Imports: digest",
 
     let lockfile = read_project_file(&container, project_path, "rpx.lock");
     assert!(
-        lockfile.contains("\"registry\": \"https://upstream.rrepo.dev/cran\""),
+        lockfile.contains("\"url\": \"https://upstream.rrepo.dev/cran\""),
         "lockfile was: {lockfile}"
     );
     assert!(
@@ -250,12 +265,15 @@ Depends: R (>= 4.3), digest",
 
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
     let description = read_project_file(&container, project_path, "DESCRIPTION");
+    let parsed = parsed_description(&description);
+    let depends = relation_names(parsed.depends());
+    let imports = relation_names(parsed.imports());
     assert!(
-        description.contains("Depends:\n    digest,\n    R (>= 4.3)"),
+        depends.contains(&"digest".to_string()) && depends.contains(&"R".to_string()),
         "DESCRIPTION was: {description}"
     );
     assert!(
-        !description.contains("Imports: digest"),
+        !imports.contains(&"digest".to_string()),
         "DESCRIPTION was: {description}"
     );
 }
@@ -287,8 +305,10 @@ Depends: R (>= 4.3), digest",
 
     assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
     let description = read_project_file(&container, project_path, "DESCRIPTION");
+    let parsed = parsed_description(&description);
+    let depends = relation_names(parsed.depends());
     assert!(
-        description.contains("Depends:\n    R (>= 4.3)"),
+        depends == vec!["R".to_string()],
         "DESCRIPTION was: {description}"
     );
     assert!(
