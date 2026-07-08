@@ -2048,7 +2048,7 @@ dependencies = [
 [[package]]
 name = "r-description"
 version = "0.4.0"
-source = "git+https://github.com/blyedev/r-description-rs.git?branch=release%2Ftemp#40a5a2a6372ae6d52f6900addbca63c48edd7afb"
+source = "git+https://github.com/blyedev/r-description-rs.git?branch=release%2Ftemp#e815d603a33db9ebd45adb3012d69d3700cbf726"
 dependencies = [
  "deb822-derive",
  "deb822-fast",

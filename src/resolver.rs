@@ -18,8 +18,8 @@ use tracing::Instrument;
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 
 use crate::{
-    default_repository, http,
-    repository::{PackageRepository, RepositoryType},
+    http,
+    repository::{DEFAULT_REGISTRY_BASE_URL, PackageRepository, RepositoryType},
 };
 
 const ROOT_PACKAGE: &str = "__rpx_root__";
@@ -397,9 +397,16 @@ fn dependency_constraints_from_description(
 }
 
 async fn root_package_version() -> Result<PackageVersion, ResolverError> {
+    let url = reqwest::Url::parse(DEFAULT_REGISTRY_BASE_URL).map_err(|error| {
+        ResolverError::from(format!(
+            "invalid default registry URL {}: {error}",
+            DEFAULT_REGISTRY_BASE_URL
+        ))
+    })?;
+
     Ok(PackageVersion {
         version: Version::from_str("0.0.0").expect("root version should parse"),
-        repository: Arc::new(default_repository().await.map_err(ResolverError::from)?),
+        repository: Arc::new(PackageRepository::new(url, RepositoryType::Rrepo)),
     })
 }
 

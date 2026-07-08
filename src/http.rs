@@ -27,70 +27,34 @@ pub type HttpClient = reqwest_middleware::ClientWithMiddleware;
 const KEYRING_SERVICE: &str = "rpx";
 
 pub fn client() -> HttpClient {
-    ClientBuilder::new(reqwest::Client::new()).build()
-}
-
-pub fn client_with_auth(auth: AuthManager) -> HttpClient {
     ClientBuilder::new(reqwest::Client::new())
-        .with(AuthMiddleware::new(auth))
-        .build()
-}
-
-pub fn traced_client() -> HttpClient {
-    ClientBuilder::new(reqwest::Client::new())
-        .with(TracingMiddleware::default())
-        .build()
-}
-
-pub fn traced_client_with_auth(auth: AuthManager) -> HttpClient {
-    ClientBuilder::new(reqwest::Client::new())
-        .with(AuthMiddleware::new(auth))
-        .with(TracingMiddleware::default())
-        .build()
-}
-
-pub fn progress_client() -> HttpClient {
-    ClientBuilder::new(reqwest::Client::new())
-        .with(TracingMiddleware::<RpxHttpProgressTrace>::new())
-        .build()
-}
-
-pub fn progress_client_with_auth(auth: AuthManager) -> HttpClient {
-    ClientBuilder::new(reqwest::Client::new())
-        .with(AuthMiddleware::new(auth))
+        .with(AuthMiddleware::new(AuthManager::new()))
         .with(TracingMiddleware::<RpxHttpProgressTrace>::new())
         .build()
 }
 
 #[derive(Debug, Clone)]
-pub struct AuthRepository {
-    base_url: reqwest::Url,
+pub struct AuthScope {
+    origin: String,
 }
 
-impl AuthRepository {
-    pub fn new(base_url: reqwest::Url) -> Self {
-        Self { base_url }
+impl AuthScope {
+    fn from_url(url: &reqwest::Url) -> Option<Self> {
+        let host = url.host_str()?;
+        let mut origin = format!("{}://{}", url.scheme(), host);
+        if let Some(port) = url.port() {
+            origin.push_str(&format!(":{port}"));
+        }
+        Some(Self { origin })
     }
 
     fn key(&self) -> String {
-        normalize_repository_url(self.base_url.as_str())
-    }
-
-    fn matches(&self, url: &reqwest::Url) -> bool {
-        if !url.as_str().starts_with(self.base_url.as_str()) {
-            return false;
-        }
-
-        let path = url.path();
-        !path.contains("/src/contrib/")
-            && !path.contains("/bin/windows/")
-            && !path.contains("/bin/macosx/")
+        self.origin.clone()
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct AuthManager {
-    repositories: Arc<Vec<AuthRepository>>,
     tokens: Cache<String, Arc<str>>,
     challenges: Cache<String, Arc<str>>,
     credentials: Arc<dyn CredentialStore>,
@@ -98,9 +62,8 @@ pub struct AuthManager {
 }
 
 impl AuthManager {
-    pub fn new(repositories: Vec<AuthRepository>) -> Self {
+    pub fn new() -> Self {
         Self {
-            repositories: Arc::new(repositories),
             tokens: Cache::new(64),
             challenges: Cache::new(64),
             credentials: Arc::new(KeyringCredentialStore),
@@ -108,28 +71,13 @@ impl AuthManager {
         }
     }
 
-    pub fn empty() -> Self {
-        Self::new(Vec::new())
-    }
-
-    fn repository_for_url(&self, url: &reqwest::Url) -> Option<AuthRepository> {
-        self.repositories
-            .iter()
-            .filter(|repository| repository.matches(url))
-            .max_by_key(|repository| repository.base_url.as_str().len())
-            .cloned()
-    }
-
-    async fn token_for_repository(
-        &self,
-        repository: &AuthRepository,
-    ) -> Result<Option<Arc<str>>, AuthError> {
-        let key = repository.key();
+    async fn token_for_scope(&self, scope: &AuthScope) -> Result<Option<Arc<str>>, AuthError> {
+        let key = scope.key();
         if let Some(token) = self.tokens.get(&key).await {
             return Ok(Some(token));
         }
 
-        let Some(token) = self.credentials.get(repository)? else {
+        let Some(token) = self.credentials.get(scope)? else {
             return Ok(None);
         };
         let token = Arc::<str>::from(token);
@@ -137,13 +85,13 @@ impl AuthManager {
         Ok(Some(token))
     }
 
-    async fn challenge_token(&self, repository: AuthRepository) -> Result<Arc<str>, AuthError> {
-        let key = repository.key();
+    async fn challenge_token(&self, scope: AuthScope) -> Result<Arc<str>, AuthError> {
+        let key = scope.key();
         let manager = self.clone();
         let result = self
             .challenges
             .try_get_with(key.clone(), async move {
-                manager.prompt_and_store_token(repository).await
+                manager.prompt_and_store_token(scope).await
             })
             .await
             .map_err(|error| AuthError::Message(error.to_string()));
@@ -151,33 +99,24 @@ impl AuthManager {
         result
     }
 
-    async fn prompt_and_store_token(
-        &self,
-        repository: AuthRepository,
-    ) -> Result<Arc<str>, AuthError> {
-        let had_stored_token = self.token_for_repository(&repository).await?.is_some();
-        let token = self.prompter.prompt(&repository, had_stored_token)?;
-        self.credentials.set(&repository, &token)?;
+    async fn prompt_and_store_token(&self, scope: AuthScope) -> Result<Arc<str>, AuthError> {
+        let had_stored_token = self.token_for_scope(&scope).await?.is_some();
+        let token = self.prompter.prompt(&scope, had_stored_token)?;
+        self.credentials.set(&scope, &token)?;
         let token = Arc::<str>::from(token);
-        self.tokens
-            .insert(repository.key(), Arc::clone(&token))
-            .await;
+        self.tokens.insert(scope.key(), Arc::clone(&token)).await;
         Ok(token)
     }
 }
 
 pub trait CredentialStore: Send + Sync + std::fmt::Debug {
-    fn get(&self, repository: &AuthRepository) -> Result<Option<String>, AuthError>;
-    fn set(&self, repository: &AuthRepository, token: &str) -> Result<(), AuthError>;
-    fn delete(&self, repository: &AuthRepository) -> Result<(), AuthError>;
+    fn get(&self, scope: &AuthScope) -> Result<Option<String>, AuthError>;
+    fn set(&self, scope: &AuthScope, token: &str) -> Result<(), AuthError>;
+    fn delete(&self, scope: &AuthScope) -> Result<(), AuthError>;
 }
 
 pub trait ApiKeyPrompter: Send + Sync + std::fmt::Debug {
-    fn prompt(
-        &self,
-        repository: &AuthRepository,
-        had_stored_token: bool,
-    ) -> Result<String, AuthError>;
+    fn prompt(&self, scope: &AuthScope, had_stored_token: bool) -> Result<String, AuthError>;
 }
 
 #[derive(Debug, Clone)]
@@ -187,8 +126,8 @@ pub struct KeyringCredentialStore;
 pub struct TerminalApiKeyPrompter;
 
 impl CredentialStore for KeyringCredentialStore {
-    fn get(&self, repository: &AuthRepository) -> Result<Option<String>, AuthError> {
-        let Ok(entry) = keyring_entry(repository) else {
+    fn get(&self, scope: &AuthScope) -> Result<Option<String>, AuthError> {
+        let Ok(entry) = keyring_entry(scope) else {
             return Ok(None);
         };
 
@@ -198,48 +137,42 @@ impl CredentialStore for KeyringCredentialStore {
         }
     }
 
-    fn set(&self, repository: &AuthRepository, token: &str) -> Result<(), AuthError> {
-        keyring_entry(repository)?
-            .set_password(token)
-            .map_err(|error| {
-                AuthError::Message(format!(
-                    "failed to store API key for {}: {error}",
-                    repository.base_url
-                ))
-            })
+    fn set(&self, scope: &AuthScope, token: &str) -> Result<(), AuthError> {
+        keyring_entry(scope)?.set_password(token).map_err(|error| {
+            AuthError::Message(format!(
+                "failed to store API key for {}: {error}",
+                scope.origin
+            ))
+        })
     }
 
-    fn delete(&self, repository: &AuthRepository) -> Result<(), AuthError> {
-        match keyring_entry(repository)?.delete_credential() {
+    fn delete(&self, scope: &AuthScope) -> Result<(), AuthError> {
+        match keyring_entry(scope)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(error) => Err(AuthError::Message(format!(
                 "failed to remove stored API key for {}: {error}",
-                repository.base_url
+                scope.origin
             ))),
         }
     }
 }
 
 impl ApiKeyPrompter for TerminalApiKeyPrompter {
-    fn prompt(
-        &self,
-        repository: &AuthRepository,
-        had_stored_token: bool,
-    ) -> Result<String, AuthError> {
+    fn prompt(&self, scope: &AuthScope, had_stored_token: bool) -> Result<String, AuthError> {
         if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
             return Err(AuthError::Message(format!(
                 "{} requires an API key, but no interactive terminal is available",
-                repository.base_url
+                scope.origin
             )));
         }
 
         let prompt = if had_stored_token {
             format!(
                 "Stored API key rejected for {}. Enter a new API key: ",
-                repository.base_url
+                scope.origin
             )
         } else {
-            format!("API key required for {}: ", repository.base_url)
+            format!("API key required for {}: ", scope.origin)
         };
 
         try_prompt(prompt).map_err(|error| {
@@ -293,14 +226,14 @@ impl Middleware for AuthMiddleware {
         extensions: &mut Extensions,
         next: Next<'_>,
     ) -> reqwest_middleware::Result<reqwest::Response> {
-        let Some(repository) = self.auth.repository_for_url(req.url()) else {
+        let Some(scope) = AuthScope::from_url(req.url()) else {
             return next.run(req, extensions).await;
         };
 
         let retry_request = req.try_clone();
         if let Some(token) = self
             .auth
-            .token_for_repository(&repository)
+            .token_for_scope(&scope)
             .await
             .map_err(AuthMiddlewareError::from)
             .map_err(reqwest_middleware::Error::middleware)?
@@ -319,7 +252,7 @@ impl Middleware for AuthMiddleware {
 
         let token = self
             .auth
-            .challenge_token(repository)
+            .challenge_token(scope)
             .await
             .map_err(AuthMiddlewareError::from)
             .map_err(reqwest_middleware::Error::middleware)?;
@@ -337,32 +270,34 @@ fn set_bearer_token(request: &mut reqwest::Request, token: &str) -> reqwest_midd
 }
 
 pub fn has_stored_credential(base_url: &reqwest::Url) -> Result<bool, AuthError> {
+    let Some(scope) = AuthScope::from_url(base_url) else {
+        return Ok(false);
+    };
     KeyringCredentialStore
-        .get(&AuthRepository::new(base_url.clone()))
+        .get(&scope)
         .map(|token| token.is_some())
 }
 
 pub fn remove_stored_credential(base_url: &reqwest::Url) -> Result<(), AuthError> {
-    KeyringCredentialStore.delete(&AuthRepository::new(base_url.clone()))
+    let Some(scope) = AuthScope::from_url(base_url) else {
+        return Ok(());
+    };
+    KeyringCredentialStore.delete(&scope)
 }
 
-fn keyring_entry(repository: &AuthRepository) -> Result<Entry, AuthError> {
-    Entry::new(KEYRING_SERVICE, &keyring_account_name(repository))
+fn keyring_entry(scope: &AuthScope) -> Result<Entry, AuthError> {
+    Entry::new(KEYRING_SERVICE, &keyring_account_name(scope))
         .map_err(|error| AuthError::Message(format!("failed to access local keyring: {error}")))
 }
 
-fn keyring_account_name(repository: &AuthRepository) -> String {
-    format!("repo:{}", hash_string(&repository.key()))
+fn keyring_account_name(scope: &AuthScope) -> String {
+    format!("host:{}", hash_string(&scope.key()))
 }
 
 fn hash_string(value: &str) -> String {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
-}
-
-fn normalize_repository_url(value: &str) -> String {
-    value.trim().trim_end_matches('/').to_string()
 }
 
 struct RpxHttpProgressTrace;
