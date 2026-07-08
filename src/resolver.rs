@@ -7,7 +7,14 @@ use r_description::{
     VersionConstraint,
     lossless::{RDescription, Relation, Version},
 };
-use std::{cmp::Reverse, collections::BTreeMap, error::Error, fmt, str::FromStr, sync::Arc};
+use std::{
+    cmp::Reverse,
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+    str::FromStr,
+    sync::Arc,
+};
 use tracing::Instrument;
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 
@@ -381,16 +388,20 @@ pub fn is_base_package(package: &str) -> bool {
 pub async fn resolve_from_registry(
     client: http::HttpClient,
     repositories: Vec<PackageRepository>,
-    root_dependencies: BTreeMap<String, Ranges<PackageVersion>>,
+    root_relations: BTreeSet<Relation>,
     preferred_versions: BTreeMap<String, PackageVersion>,
 ) -> Result<Vec<(String, PackageVersion)>, String> {
-    if root_dependencies.is_empty() {
+    if root_relations.is_empty() {
         return Ok(Vec::new());
     }
 
+    let root_count = root_relations.len();
+    let root_dependencies = root_dependency_ranges(&repositories, &root_relations)
+        .map_err(|error| error.to_string())?;
+
     let span = tracing::info_span!(
         "resolve_dependencies",
-        roots = root_dependencies.len(),
+        roots = root_count,
         repositories = repositories.len(),
         preferred = preferred_versions.len(),
         selected = tracing::field::Empty,
@@ -436,86 +447,34 @@ pub async fn resolve_from_registry(
     Ok(selected)
 }
 
-pub fn package_range(
-    repository: Arc<PackageRepository>,
-    constraint: &str,
-) -> Result<Ranges<PackageVersion>, String> {
-    parse_package_constraint_range(repository, constraint).map_err(|error| error.to_string())
-}
+fn root_dependency_ranges(
+    repositories: &[PackageRepository],
+    roots: &BTreeSet<Relation>,
+) -> Result<BTreeMap<String, Ranges<PackageVersion>>, ResolverError> {
+    let mut root_dependencies: BTreeMap<String, Ranges<PackageVersion>> = BTreeMap::new();
 
-fn parse_package_constraint_range(
-    repository: Arc<PackageRepository>,
-    constraint: &str,
-) -> Result<Ranges<PackageVersion>, ResolverError> {
-    let constraint = constraint.trim();
-    if constraint.is_empty() || constraint == "*" {
-        return Ok(Ranges::full());
-    }
-
-    constraint
-        .trim_start_matches('(')
-        .trim_end_matches(')')
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .try_fold(Ranges::full(), |range, part| {
-            Ok(range.intersection(&package_range_from_constraint_part(
-                Arc::clone(&repository),
-                part,
-            )?))
-        })
-}
-
-fn package_range_from_constraint_part(
-    repository: Arc<PackageRepository>,
-    constraint: &str,
-) -> Result<Ranges<PackageVersion>, ResolverError> {
-    let (operator, version) = parse_constraint_part(constraint);
-    let version = PackageVersion::new(parse_version(version)?, repository);
-
-    Ok(match operator {
-        ParsedConstraint::Eq => Ranges::singleton(version),
-        ParsedConstraint::Gt => Ranges::strictly_higher_than(version),
-        ParsedConstraint::Gte => Ranges::higher_than(version),
-        ParsedConstraint::Lt => Ranges::strictly_lower_than(version),
-        ParsedConstraint::Lte => Ranges::lower_than(version),
-        ParsedConstraint::Ne => {
-            return Err(ResolverError(
-                "not-equal dependency constraints are not supported".to_string(),
-            ));
+    for relation in roots {
+        let package = relation.name();
+        if is_base_package(&package) {
+            continue;
         }
-    })
-}
 
-fn parse_constraint_part(constraint: &str) -> (ParsedConstraint, &str) {
-    for (prefix, operator) in [
-        (">=", ParsedConstraint::Gte),
-        ("<=", ParsedConstraint::Lte),
-        ("==", ParsedConstraint::Eq),
-        ("!=", ParsedConstraint::Ne),
-        (">", ParsedConstraint::Gt),
-        ("<", ParsedConstraint::Lt),
-    ] {
-        if let Some(version) = constraint.strip_prefix(prefix) {
-            return (operator, version.trim());
+        let repository = repositories
+            .first()
+            .cloned()
+            .ok_or_else(|| ResolverError("no repositories configured".to_string()))?;
+        let repository = Arc::new(repository);
+        let range = relation_package_range(Arc::clone(&repository), relation)?;
+        match root_dependencies.entry(package) {
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let combined = entry.get().intersection(&range);
+                entry.insert(combined);
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(range);
+            }
         }
     }
 
-    (ParsedConstraint::Eq, constraint.trim())
-}
-
-fn parse_version(version: &str) -> Result<Version, ResolverError> {
-    version
-        .parse::<Version>()
-        .map_err(|error| ResolverError(format!("invalid version {version}: {error}")))
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ParsedConstraint {
-    Eq,
-    Gt,
-    Gte,
-    Lt,
-    Lte,
-    Ne,
+    Ok(root_dependencies)
 }

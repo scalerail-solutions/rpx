@@ -160,11 +160,8 @@ pub enum RepoCommands {
     Remove {
         #[arg(help = "Repository base URL", value_name = "URL", required = true)]
         url: String,
-
-        #[arg(long, help = "Also remove any stored API key for this repository")]
-        remove_credential: bool,
     },
-
-    #[command(about = "List configured additional repositories")]
-    List,
+    //
+    // #[command(about = "List configured additional repositories")]
+    // List,
 }

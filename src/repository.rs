@@ -1,6 +1,5 @@
 use crate::http;
 use crate::resolver::PackageVersion;
-use keyring::Entry;
 use miette::Diagnostic;
 use moka::future::Cache;
 use r_description::lossless::{RDescription, Version};
@@ -8,39 +7,15 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering,
-    collections::{BTreeSet, hash_map::DefaultHasher},
+    collections::{BTreeMap, BTreeSet},
     hash::{Hash, Hasher},
     sync::Arc,
-    time::Duration,
 };
 use thiserror::Error;
-
-const KEYRING_SERVICE: &str = "rpx";
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RepositorySource {
-    base_url: String,
-    kind: RepositoryKind,
-    pub cran_archive_support: ArchiveSupport,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum RepositoryKind {
-    Rrepo,
-    CranLike,
-}
-
-pub trait CredentialStore: Send + Sync {
-    fn get(&self, source: &RepositorySource) -> Result<Option<String>, String>;
-    fn delete(&self, source: &RepositorySource) -> Result<(), String>;
-}
 
 #[derive(Debug, Clone)]
 pub struct KeyringCredentialStore;
 
-const PACKAGE_VERSIONS_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
-const CRAN_PACKAGES_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
-const CRAN_ARCHIVE_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 #[derive(Debug, Clone)]
 pub struct PackageRepository {
     url: reqwest::Url,
@@ -189,8 +164,12 @@ impl PackageRepository {
         self.url.clone()
     }
 
-    #[allow(dead_code)]
-    pub async fn packages(&self, client: &http::HttpClient) -> Result<BTreeSet<String>, String> {
+    pub async fn packages(
+        &self,
+        client: &http::HttpClient,
+    ) -> Result<BTreeMap<String, PackageVersion>, String> {
+        let repository = Arc::new(self.clone());
+
         match self.repo_type {
             RepositoryType::Rrepo => {
                 let response = self
@@ -213,7 +192,26 @@ impl PackageRepository {
                 Ok(response
                     .packages
                     .iter()
-                    .map(|package| package.name.clone())
+                    .filter_map(|package| {
+                        let version = match package.latest_version.parse::<Version>() {
+                            Ok(version) => version,
+                            Err(error) => {
+                                tracing::debug!(
+                                    package = %package.name,
+                                    version = %package.latest_version,
+                                    repository = %self.url,
+                                    error = %error,
+                                    "skipping package with invalid latest version"
+                                );
+                                return None;
+                            }
+                        };
+
+                        Some((
+                            package.name.clone(),
+                            PackageVersion::new(version, Arc::clone(&repository)),
+                        ))
+                    })
                     .collect())
             }
 
@@ -242,7 +240,26 @@ impl PackageRepository {
                 Ok(index
                     .packages
                     .iter()
-                    .map(|package| package.package.clone())
+                    .filter_map(|package| {
+                        let version = match package.version.parse::<Version>() {
+                            Ok(version) => version,
+                            Err(error) => {
+                                tracing::debug!(
+                                    package = %package.package,
+                                    version = %package.version,
+                                    repository = %self.url,
+                                    error = %error,
+                                    "skipping package with invalid latest version"
+                                );
+                                return None;
+                            }
+                        };
+
+                        Some((
+                            package.package.clone(),
+                            PackageVersion::new(version, Arc::clone(&repository)),
+                        ))
+                    })
                     .collect())
             }
         }
@@ -576,123 +593,6 @@ impl Hash for PackageRepository {
     }
 }
 
-#[derive(Clone)]
-pub struct RepositorySet {
-    sources: Vec<RepositorySource>,
-    credentials: Arc<dyn CredentialStore>,
-}
-
-impl std::fmt::Debug for RepositorySet {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RepositorySet")
-            .field("sources", &self.sources)
-            .finish_non_exhaustive()
-    }
-}
-
-impl RepositorySource {
-    pub fn new(base_url: impl AsRef<str>) -> Self {
-        Self::with_kind(base_url, RepositoryKind::Rrepo)
-    }
-
-    pub fn with_kind(base_url: impl AsRef<str>, kind: RepositoryKind) -> Self {
-        Self {
-            base_url: normalize_repository_url(base_url.as_ref()),
-            kind,
-            cran_archive_support: ArchiveSupport::Unavailable,
-        }
-    }
-
-    pub(crate) fn cran_like_with_archive_support(
-        base_url: impl AsRef<str>,
-        support: ArchiveSupport,
-    ) -> Self {
-        Self {
-            base_url: normalize_repository_url(base_url.as_ref()),
-            kind: RepositoryKind::CranLike,
-            cran_archive_support: support,
-        }
-    }
-
-    pub fn base_url(&self) -> &str {
-        &self.base_url
-    }
-
-    pub fn kind(&self) -> RepositoryKind {
-        self.kind
-    }
-}
-
-impl RepositorySet {
-    pub fn new(sources: Vec<RepositorySource>) -> Self {
-        Self::with_support(sources, Arc::new(KeyringCredentialStore))
-    }
-
-    pub fn with_support(
-        sources: Vec<RepositorySource>,
-        credentials: Arc<dyn CredentialStore>,
-    ) -> Self {
-        let mut deduped = Vec::new();
-        let mut seen = BTreeSet::new();
-
-        for source in sources {
-            if seen.insert((source.base_url.clone(), source.kind)) {
-                deduped.push(source);
-            }
-        }
-
-        Self {
-            sources: deduped,
-            credentials,
-        }
-    }
-    pub fn has_stored_credential(&self, source: &RepositorySource) -> Result<bool, String> {
-        Ok(self.credentials.get(source)?.is_some())
-    }
-
-    pub fn remove_api_key(&self, source: &RepositorySource) -> Result<(), String> {
-        self.credentials.delete(source)
-    }
-}
-
-impl CredentialStore for KeyringCredentialStore {
-    fn get(&self, source: &RepositorySource) -> Result<Option<String>, String> {
-        let Ok(entry) = keyring_entry(source) else {
-            return Ok(None);
-        };
-
-        match entry.get_password() {
-            Ok(password) => Ok(Some(password)),
-            Err(_) => Ok(None),
-        }
-    }
-
-    fn delete(&self, source: &RepositorySource) -> Result<(), String> {
-        match keyring_entry(source)?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(error) => Err(format!(
-                "failed to remove stored API key for {}: {error}",
-                source.base_url()
-            )),
-        }
-    }
-}
-
 pub fn normalize_repository_url(value: &str) -> String {
     value.trim().trim_end_matches('/').to_string()
-}
-
-fn keyring_entry(source: &RepositorySource) -> Result<Entry, String> {
-    Entry::new(KEYRING_SERVICE, &keyring_account_name(source))
-        .map_err(|error| format!("failed to access local keyring: {error}"))
-}
-
-fn keyring_account_name(source: &RepositorySource) -> String {
-    format!("repo:{}", hash_string(source.base_url()))
-}
-
-fn hash_string(value: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    value.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
 }

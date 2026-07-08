@@ -2,12 +2,6 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_REGISTRY_BASE_URL: &str = "https://upstream.rrepo.dev/cran";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ResolutionRoot {
-    pub name: String,
-    pub constraint: String,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IngestingResponse {}
 

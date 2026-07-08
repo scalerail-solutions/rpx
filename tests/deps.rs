@@ -80,9 +80,7 @@ fn runs_rpx_add_inside_custom_r_image() {
 
     let description = read_project_file(&container, project_path, "DESCRIPTION");
     assert!(
-        description.contains("Imports:\n    digest")
-            || (description.contains("Imports:\n    digest (>=")
-                && description.contains("digest (<<")),
+        description.contains("digest (>=") && description.contains("digest (<"),
         "DESCRIPTION was: {description}"
     );
 }

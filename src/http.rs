@@ -553,7 +553,6 @@ pub async fn cran_macos_binary(
     client.get(url).send().await
 }
 
-
 async fn description_body_from_source_artifact(
     mut artifact: ArtifactResponse,
     base_url: &reqwest::Url,

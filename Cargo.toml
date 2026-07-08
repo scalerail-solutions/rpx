@@ -27,12 +27,13 @@ reqwest = { version = "0.13", default-features = false, features = ["blocking", 
 reqwest-middleware = "0.5"
 reqwest-tracing = "0.7"
 rpassword = "7.3.1"
-r-description = { version = "0.3.8", features = ["serde"] }
+r-description = { version = "0.4.0", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+strsim = "0.11"
 tar = "0.4.44"
 thiserror = "2.0.17"
-tokio = { version = "1.51.1", features = ["rt-multi-thread", "macros", "process", "fs", "io-util"] }
+tokio = { version = "1.51.1", features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "sync"] }
 tracing = "0.1.41"
 tracing-indicatif = "0.3.13"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
@@ -49,4 +50,4 @@ inherits = "release"
 lto = "thin"
 
 [patch.crates-io]
-r-description = { git = "https://github.com/blyedev/r-description-rs.git", branch = "opencode/brave-engine" }
+r-description = { git = "https://github.com/blyedev/r-description-rs.git", branch = "release/temp" }
