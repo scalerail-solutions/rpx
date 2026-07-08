@@ -40,7 +40,6 @@ mod lockfile;
 mod output;
 mod project;
 mod r;
-mod registry;
 mod repository;
 mod resolver;
 mod sysreqs;
@@ -58,7 +57,7 @@ use project::{
     project_library_root_path,
 };
 use r::{InstallFailure, base_packages, install_local_package, installed_packages};
-use registry::DEFAULT_REGISTRY_BASE_URL;
+use repository::DEFAULT_REGISTRY_BASE_URL;
 use repository::normalize_repository_url;
 use resolver::{is_base_package, resolve_from_registry};
 use sysreqs::{

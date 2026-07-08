@@ -1,6 +1,5 @@
 use crate::http;
 use crate::resolver::PackageVersion;
-use miette::Diagnostic;
 use moka::future::Cache;
 use r_description::lossless::{RDescription, Version};
 use reqwest::Url;
@@ -11,10 +10,8 @@ use std::{
     hash::{Hash, Hasher},
     sync::Arc,
 };
-use thiserror::Error;
 
-#[derive(Debug, Clone)]
-pub struct KeyringCredentialStore;
+pub const DEFAULT_REGISTRY_BASE_URL: &str = "https://upstream.rrepo.dev/cran";
 
 #[derive(Debug, Clone)]
 pub struct PackageRepository {
@@ -25,13 +22,6 @@ pub struct PackageRepository {
     rrepo_packages: Cache<(), Arc<http::RrepoPackagesResponse>>,
     cran_packages: Cache<(), Arc<http::CranPackagesIndex>>,
     cran_archives: Cache<String, BTreeSet<Version>>,
-}
-
-pub struct PackageDependencyMetadata {
-    pub depends: Option<r_description::lossy::Relations>,
-    pub imports: Option<r_description::lossy::Relations>,
-    pub linking_to: Option<r_description::lossy::Relations>,
-    pub system_requirements: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -45,17 +35,6 @@ pub enum RepositoryType {
 pub enum ArchiveSupport {
     Available,
     Unavailable,
-}
-
-#[derive(Debug, Error, Diagnostic)]
-pub enum RepositoryError {
-    #[error("failed to send request to {url}: {source}")]
-    #[diagnostic(code(rpx::repository::failure))]
-    RepositoryFailed {
-        url: reqwest::Url,
-        #[source]
-        source: reqwest_middleware::Error,
-    },
 }
 
 impl PackageRepository {
