@@ -1,24 +1,39 @@
 #![allow(dead_code)]
 
+use async_trait::async_trait;
 use flate2::read::GzDecoder;
 use http::Extensions;
+use keyring::Entry;
 use miette::Diagnostic;
+use moka::future::Cache;
 use r_description::lossless::{Relations, Version};
-use reqwest_middleware::ClientBuilder;
+use reqwest::header::{AUTHORIZATION, HeaderValue};
+use reqwest_middleware::{ClientBuilder, Middleware, Next};
 use reqwest_tracing::{
     ReqwestOtelSpanBackend, TracingMiddleware, default_on_request_end, reqwest_otel_span,
 };
-use std::io::{Cursor, Read};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::{Cursor, IsTerminal, Read};
 use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::Arc;
 use thiserror::Error;
 use tracing::Span;
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 
+use crate::output::try_prompt;
+
 pub type HttpClient = reqwest_middleware::ClientWithMiddleware;
+const KEYRING_SERVICE: &str = "rpx";
 
 pub fn client() -> HttpClient {
     ClientBuilder::new(reqwest::Client::new()).build()
+}
+
+pub fn client_with_auth(auth: AuthManager) -> HttpClient {
+    ClientBuilder::new(reqwest::Client::new())
+        .with(AuthMiddleware::new(auth))
+        .build()
 }
 
 pub fn traced_client() -> HttpClient {
@@ -27,10 +42,327 @@ pub fn traced_client() -> HttpClient {
         .build()
 }
 
+pub fn traced_client_with_auth(auth: AuthManager) -> HttpClient {
+    ClientBuilder::new(reqwest::Client::new())
+        .with(AuthMiddleware::new(auth))
+        .with(TracingMiddleware::default())
+        .build()
+}
+
 pub fn progress_client() -> HttpClient {
     ClientBuilder::new(reqwest::Client::new())
         .with(TracingMiddleware::<RpxHttpProgressTrace>::new())
         .build()
+}
+
+pub fn progress_client_with_auth(auth: AuthManager) -> HttpClient {
+    ClientBuilder::new(reqwest::Client::new())
+        .with(AuthMiddleware::new(auth))
+        .with(TracingMiddleware::<RpxHttpProgressTrace>::new())
+        .build()
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthRepository {
+    base_url: reqwest::Url,
+}
+
+impl AuthRepository {
+    pub fn new(base_url: reqwest::Url) -> Self {
+        Self { base_url }
+    }
+
+    fn key(&self) -> String {
+        normalize_repository_url(self.base_url.as_str())
+    }
+
+    fn matches(&self, url: &reqwest::Url) -> bool {
+        if !url.as_str().starts_with(self.base_url.as_str()) {
+            return false;
+        }
+
+        let path = url.path();
+        !path.contains("/src/contrib/")
+            && !path.contains("/bin/windows/")
+            && !path.contains("/bin/macosx/")
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthManager {
+    repositories: Arc<Vec<AuthRepository>>,
+    tokens: Cache<String, Arc<str>>,
+    challenges: Cache<String, Arc<str>>,
+    credentials: Arc<dyn CredentialStore>,
+    prompter: Arc<dyn ApiKeyPrompter>,
+}
+
+impl AuthManager {
+    pub fn new(repositories: Vec<AuthRepository>) -> Self {
+        Self {
+            repositories: Arc::new(repositories),
+            tokens: Cache::new(64),
+            challenges: Cache::new(64),
+            credentials: Arc::new(KeyringCredentialStore),
+            prompter: Arc::new(TerminalApiKeyPrompter),
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self::new(Vec::new())
+    }
+
+    fn repository_for_url(&self, url: &reqwest::Url) -> Option<AuthRepository> {
+        self.repositories
+            .iter()
+            .filter(|repository| repository.matches(url))
+            .max_by_key(|repository| repository.base_url.as_str().len())
+            .cloned()
+    }
+
+    async fn token_for_repository(
+        &self,
+        repository: &AuthRepository,
+    ) -> Result<Option<Arc<str>>, AuthError> {
+        let key = repository.key();
+        if let Some(token) = self.tokens.get(&key).await {
+            return Ok(Some(token));
+        }
+
+        let Some(token) = self.credentials.get(repository)? else {
+            return Ok(None);
+        };
+        let token = Arc::<str>::from(token);
+        self.tokens.insert(key, Arc::clone(&token)).await;
+        Ok(Some(token))
+    }
+
+    async fn challenge_token(&self, repository: AuthRepository) -> Result<Arc<str>, AuthError> {
+        let key = repository.key();
+        let manager = self.clone();
+        let result = self
+            .challenges
+            .try_get_with(key.clone(), async move {
+                manager.prompt_and_store_token(repository).await
+            })
+            .await
+            .map_err(|error| AuthError::Message(error.to_string()));
+        self.challenges.invalidate(&key).await;
+        result
+    }
+
+    async fn prompt_and_store_token(
+        &self,
+        repository: AuthRepository,
+    ) -> Result<Arc<str>, AuthError> {
+        let had_stored_token = self.token_for_repository(&repository).await?.is_some();
+        let token = self.prompter.prompt(&repository, had_stored_token)?;
+        self.credentials.set(&repository, &token)?;
+        let token = Arc::<str>::from(token);
+        self.tokens
+            .insert(repository.key(), Arc::clone(&token))
+            .await;
+        Ok(token)
+    }
+}
+
+pub trait CredentialStore: Send + Sync + std::fmt::Debug {
+    fn get(&self, repository: &AuthRepository) -> Result<Option<String>, AuthError>;
+    fn set(&self, repository: &AuthRepository, token: &str) -> Result<(), AuthError>;
+    fn delete(&self, repository: &AuthRepository) -> Result<(), AuthError>;
+}
+
+pub trait ApiKeyPrompter: Send + Sync + std::fmt::Debug {
+    fn prompt(
+        &self,
+        repository: &AuthRepository,
+        had_stored_token: bool,
+    ) -> Result<String, AuthError>;
+}
+
+#[derive(Debug, Clone)]
+pub struct KeyringCredentialStore;
+
+#[derive(Debug, Clone)]
+pub struct TerminalApiKeyPrompter;
+
+impl CredentialStore for KeyringCredentialStore {
+    fn get(&self, repository: &AuthRepository) -> Result<Option<String>, AuthError> {
+        let Ok(entry) = keyring_entry(repository) else {
+            return Ok(None);
+        };
+
+        match entry.get_password() {
+            Ok(password) => Ok(Some(password)),
+            Err(keyring::Error::NoEntry) | Err(_) => Ok(None),
+        }
+    }
+
+    fn set(&self, repository: &AuthRepository, token: &str) -> Result<(), AuthError> {
+        keyring_entry(repository)?
+            .set_password(token)
+            .map_err(|error| {
+                AuthError::Message(format!(
+                    "failed to store API key for {}: {error}",
+                    repository.base_url
+                ))
+            })
+    }
+
+    fn delete(&self, repository: &AuthRepository) -> Result<(), AuthError> {
+        match keyring_entry(repository)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(AuthError::Message(format!(
+                "failed to remove stored API key for {}: {error}",
+                repository.base_url
+            ))),
+        }
+    }
+}
+
+impl ApiKeyPrompter for TerminalApiKeyPrompter {
+    fn prompt(
+        &self,
+        repository: &AuthRepository,
+        had_stored_token: bool,
+    ) -> Result<String, AuthError> {
+        if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+            return Err(AuthError::Message(format!(
+                "{} requires an API key, but no interactive terminal is available",
+                repository.base_url
+            )));
+        }
+
+        let prompt = if had_stored_token {
+            format!(
+                "Stored API key rejected for {}. Enter a new API key: ",
+                repository.base_url
+            )
+        } else {
+            format!("API key required for {}: ", repository.base_url)
+        };
+
+        try_prompt(prompt).map_err(|error| {
+            AuthError::Message(format!("failed to prompt for API key: {error}"))
+        })?;
+
+        let token = rpassword::read_password()
+            .map_err(|error| AuthError::Message(format!("failed to read API key: {error}")))?;
+        let token = token.trim().to_string();
+
+        if token.is_empty() {
+            return Err(AuthError::Message("API key cannot be empty".to_string()));
+        }
+
+        Ok(token)
+    }
+}
+
+#[derive(Debug, Clone, Error)]
+#[error("{0}")]
+pub struct AuthMiddlewareError(String);
+
+#[derive(Debug, Clone, Error)]
+pub enum AuthError {
+    #[error("{0}")]
+    Message(String),
+}
+
+impl From<AuthError> for AuthMiddlewareError {
+    fn from(error: AuthError) -> Self {
+        Self(error.to_string())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AuthMiddleware {
+    auth: AuthManager,
+}
+
+impl AuthMiddleware {
+    fn new(auth: AuthManager) -> Self {
+        Self { auth }
+    }
+}
+
+#[async_trait]
+impl Middleware for AuthMiddleware {
+    async fn handle(
+        &self,
+        mut req: reqwest::Request,
+        extensions: &mut Extensions,
+        next: Next<'_>,
+    ) -> reqwest_middleware::Result<reqwest::Response> {
+        let Some(repository) = self.auth.repository_for_url(req.url()) else {
+            return next.run(req, extensions).await;
+        };
+
+        let retry_request = req.try_clone();
+        if let Some(token) = self
+            .auth
+            .token_for_repository(&repository)
+            .await
+            .map_err(AuthMiddlewareError::from)
+            .map_err(reqwest_middleware::Error::middleware)?
+        {
+            set_bearer_token(&mut req, &token)?;
+        }
+
+        let response = next.clone().run(req, extensions).await?;
+        if response.status() != reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(response);
+        }
+
+        let Some(mut retry_request) = retry_request else {
+            return Ok(response);
+        };
+
+        let token = self
+            .auth
+            .challenge_token(repository)
+            .await
+            .map_err(AuthMiddlewareError::from)
+            .map_err(reqwest_middleware::Error::middleware)?;
+        set_bearer_token(&mut retry_request, &token)?;
+        next.run(retry_request, extensions).await
+    }
+}
+
+fn set_bearer_token(request: &mut reqwest::Request, token: &str) -> reqwest_middleware::Result<()> {
+    let value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|error| {
+        reqwest_middleware::Error::middleware(AuthMiddlewareError(error.to_string()))
+    })?;
+    request.headers_mut().insert(AUTHORIZATION, value);
+    Ok(())
+}
+
+pub fn has_stored_credential(base_url: &reqwest::Url) -> Result<bool, AuthError> {
+    KeyringCredentialStore
+        .get(&AuthRepository::new(base_url.clone()))
+        .map(|token| token.is_some())
+}
+
+pub fn remove_stored_credential(base_url: &reqwest::Url) -> Result<(), AuthError> {
+    KeyringCredentialStore.delete(&AuthRepository::new(base_url.clone()))
+}
+
+fn keyring_entry(repository: &AuthRepository) -> Result<Entry, AuthError> {
+    Entry::new(KEYRING_SERVICE, &keyring_account_name(repository))
+        .map_err(|error| AuthError::Message(format!("failed to access local keyring: {error}")))
+}
+
+fn keyring_account_name(repository: &AuthRepository) -> String {
+    format!("repo:{}", hash_string(&repository.key()))
+}
+
+fn hash_string(value: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn normalize_repository_url(value: &str) -> String {
+    value.trim().trim_end_matches('/').to_string()
 }
 
 struct RpxHttpProgressTrace;

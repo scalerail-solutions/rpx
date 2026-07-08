@@ -145,6 +145,14 @@ enum RepoError {
     #[error("failed to add repository {url}: {details}")]
     #[diagnostic(code(rpx::repo::add_failed))]
     Add { url: String, details: String },
+
+    #[error("failed to remove repository credential: {details}")]
+    #[diagnostic(code(rpx::repo::credential_remove_failed))]
+    CredentialRemove { details: String },
+
+    #[error("failed to inspect repository credential: {details}")]
+    #[diagnostic(code(rpx::repo::credential_inspect_failed))]
+    CredentialInspect { details: String },
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -493,13 +501,21 @@ async fn cmd_add(
 async fn cmd_repo(command: RepoCommands) -> RpxResult<()> {
     match command {
         RepoCommands::Add { url } => cmd_repo_add(&url).await,
-        RepoCommands::Remove { url } => cmd_repo_remove(&url).await,
+        RepoCommands::Remove {
+            url,
+            remove_credential,
+        } => cmd_repo_remove(&url, remove_credential).await,
+        RepoCommands::List => cmd_repo_list().await,
     }
 }
 
 async fn cmd_repo_add(url: &str) -> RpxResult<()> {
     let mut description = read_description()?;
-    let new_repo = PackageRepository::from_url(&http::client(), url)
+    let client = auth_client_for_url(url).map_err(|details| RepoError::Add {
+        url: normalize_repository_url(url),
+        details,
+    })?;
+    let new_repo = PackageRepository::from_url(&client, url)
         .await
         .map_err(|details| RepoError::Add {
             url: normalize_repository_url(url),
@@ -532,25 +548,20 @@ async fn cmd_repo_add(url: &str) -> RpxResult<()> {
     Ok(())
 }
 
-async fn cmd_repo_remove(url: &str) -> RpxResult<()> {
+async fn cmd_repo_remove(url: &str, remove_credential: bool) -> RpxResult<()> {
     let mut description = read_description()?;
-    let repo = PackageRepository::from_url(&http::client(), url)
-        .await
-        .map_err(|details| RepoError::Add {
-            url: normalize_repository_url(url),
-            details,
-        })?;
+    let normalized_url = normalize_repository_url(url);
+    let base_url = reqwest::Url::parse(&normalized_url).map_err(|error| RepoError::Add {
+        url: normalized_url.clone(),
+        details: format!("invalid repository URL {normalized_url}: {error}"),
+    })?;
 
     let mut additional_repositories = description.additional_repositories().unwrap_or_default();
     let previous_len = additional_repositories.len();
-    additional_repositories
-        .retain(|existing| normalize_repository_url(existing) != repo.base_url().as_str());
+    additional_repositories.retain(|existing| normalize_repository_url(existing) != normalized_url);
 
     if additional_repositories.len() == previous_len {
-        status(format_args!(
-            "Repository not configured: {}",
-            repo.base_url().as_str()
-        ));
+        status(format_args!("Repository not configured: {normalized_url}"));
         return Ok(());
     }
 
@@ -560,7 +571,50 @@ async fn cmd_repo_remove(url: &str) -> RpxResult<()> {
         .collect::<Vec<_>>();
     description.set_additional_repositories(&additional_repositories);
     write_description(&description)?;
-    status(format_args!("Removed repository {}", repo.base_url()));
+
+    if remove_credential {
+        http::remove_stored_credential(&base_url).map_err(|error| RepoError::CredentialRemove {
+            details: error.to_string(),
+        })?;
+    }
+
+    status(format_args!("Removed repository {normalized_url}"));
+    Ok(())
+}
+
+async fn cmd_repo_list() -> RpxResult<()> {
+    let description = read_description()?;
+    let lockfile = read_current_project_lockfile_optional(&description)?;
+    let additional_repositories = description.additional_repositories().unwrap_or_default();
+
+    if additional_repositories.is_empty() {
+        status("No additional repositories configured");
+        return Ok(());
+    }
+
+    for url in additional_repositories {
+        let normalized_url = normalize_repository_url(&url);
+        let base_url = reqwest::Url::parse(&normalized_url).map_err(|error| RepoError::Add {
+            url: normalized_url.clone(),
+            details: format!("invalid repository URL {normalized_url}: {error}"),
+        })?;
+        let credential = http::has_stored_credential(&base_url).map_err(|error| {
+            RepoError::CredentialInspect {
+                details: error.to_string(),
+            }
+        })?;
+        status(format_args!(
+            "{} [{}; {}]",
+            normalized_url,
+            repository_kind_label(lockfile.as_ref(), &normalized_url),
+            if credential {
+                "credential stored"
+            } else {
+                "no credential"
+            }
+        ));
+    }
+
     Ok(())
 }
 
@@ -889,15 +943,14 @@ impl DefaultRepositoryPreference {
                 .collect::<Result<Vec<_>, String>>()?,
 
             None => {
-                let client = http::client();
                 let additional_repositories =
                     description.additional_repositories().unwrap_or_default();
 
-                futures_util::future::join_all(
-                    additional_repositories
-                        .iter()
-                        .map(|url| PackageRepository::from_url(&client, url)),
-                )
+                futures_util::future::join_all(additional_repositories.iter().map(
+                    |url| async move {
+                        PackageRepository::from_url(&auth_client_for_url(url)?, url).await
+                    },
+                ))
                 .await
                 .into_iter()
                 .collect::<Result<Vec<_>, String>>()?
@@ -1004,7 +1057,7 @@ async fn latest_package_versions_for_add(
     }
 
     let requested = packages.iter().cloned().collect::<BTreeSet<_>>();
-    let client = http::progress_client();
+    let client = http::progress_client_with_auth(auth_manager_for_repositories(repositories));
     let mut selected = BTreeMap::<String, PackageVersion>::new();
     let mut known_packages = BTreeSet::<String>::new();
     let package_indexes = futures_util::future::join_all(repositories.iter().map(|repository| {
@@ -1323,8 +1376,21 @@ async fn lock_from_description(
     Ok(LockOutcome { changed })
 }
 
-fn load_sysreq_snapshot_for_lock(
+async fn load_sysreq_snapshot_for_lock(
     existing_lockfile: Option<&Lockfile>,
+) -> sysreqs::SysreqDbSnapshot {
+    let existing_commit = existing_lockfile
+        .map(|lockfile| lockfile.sysreqs.db_commit.as_str())
+        .filter(|commit| !commit.is_empty())
+        .map(ToString::to_string);
+
+    tokio::task::spawn_blocking(move || load_sysreq_snapshot_for_lock_blocking(existing_commit))
+        .await
+        .unwrap_or_else(|_| empty_sysreq_snapshot())
+}
+
+fn load_sysreq_snapshot_for_lock_blocking(
+    existing_commit: Option<String>,
 ) -> sysreqs::SysreqDbSnapshot {
     if let Ok(snapshot) = latest_sysreq_snapshot() {
         return snapshot;
@@ -1335,14 +1401,10 @@ fn load_sysreq_snapshot_for_lock(
         return snapshot;
     }
 
-    if let Some(commit) = existing_lockfile
-        .map(|lockfile| lockfile.sysreqs.db_commit.as_str())
-        .filter(|commit| !commit.is_empty())
-        && let Ok(snapshot) = sysreqs::snapshot_for_commit(commit)
+    if let Some(commit) = existing_commit
+        && let Ok(snapshot) = sysreqs::snapshot_for_commit(&commit)
     {
-        warning(RpxWarning::PinnedSysreqSnapshot {
-            commit: commit.to_string(),
-        });
+        warning(RpxWarning::PinnedSysreqSnapshot { commit });
         return snapshot;
     }
 
@@ -1427,7 +1489,7 @@ async fn default_repository() -> Result<PackageRepository, String> {
         Ok(url) => {
             let normalized_url = normalize_repository_url(&url);
 
-            PackageRepository::from_url(&http::client(), &normalized_url)
+            PackageRepository::from_url(&auth_client_for_url(&normalized_url)?, &normalized_url)
                 .await
                 .map_err(|details| {
                     format!(
@@ -1450,6 +1512,56 @@ async fn default_repository() -> Result<PackageRepository, String> {
     }
 }
 
+fn auth_client_for_url(url: &str) -> Result<http::HttpClient, String> {
+    Ok(http::client_with_auth(auth_manager_for_url(url)?))
+}
+
+fn auth_manager_for_url(url: &str) -> Result<http::AuthManager, String> {
+    let normalized_url = normalize_repository_url(url);
+    let base_url = reqwest::Url::parse(&normalized_url)
+        .map_err(|error| format!("invalid repository URL {normalized_url}: {error}"))?;
+    Ok(http::AuthManager::new(vec![http::AuthRepository::new(
+        base_url,
+    )]))
+}
+
+fn auth_manager_for_repositories(repositories: &[PackageRepository]) -> http::AuthManager {
+    http::AuthManager::new(
+        repositories
+            .iter()
+            .filter(|repository| repository.repo_type() == RepositoryType::Rrepo)
+            .map(|repository| http::AuthRepository::new(repository.base_url()))
+            .collect(),
+    )
+}
+
+fn auth_manager_for_locked_repositories(repositories: &[LockedRepository]) -> http::AuthManager {
+    http::AuthManager::new(
+        repositories
+            .iter()
+            .filter(|repository| repository.kind == LockedRepositoryKind::Rrepo)
+            .filter_map(|repository| reqwest::Url::parse(&repository.url).ok())
+            .map(http::AuthRepository::new)
+            .collect(),
+    )
+}
+
+fn repository_kind_label(lockfile: Option<&Lockfile>, url: &str) -> &'static str {
+    let normalized_url = normalize_repository_url(url);
+    lockfile
+        .and_then(|lockfile| {
+            lockfile
+                .repositories
+                .iter()
+                .find(|repository| normalize_repository_url(&repository.url) == normalized_url)
+        })
+        .map(|repository| match repository.kind {
+            LockedRepositoryKind::Rrepo => "rrepo",
+            LockedRepositoryKind::CranLike => "CRAN-like",
+        })
+        .unwrap_or("unknown")
+}
+
 async fn lockfile_from_roots(
     repositories: Vec<PackageRepository>,
     roots: BTreeSet<Relation>,
@@ -1458,7 +1570,7 @@ async fn lockfile_from_roots(
     r_version: Option<&str>,
 ) -> RpxResult<Lockfile> {
     let selected = resolve_from_registry(
-        http::progress_client(),
+        http::progress_client_with_auth(auth_manager_for_repositories(&repositories)),
         repositories.clone(),
         roots.clone(),
         preferred_versions,
@@ -1466,7 +1578,7 @@ async fn lockfile_from_roots(
     .await
     .map_err(|details| LockError::ResolveFailed { details })?;
 
-    let sysreq_db = load_sysreq_snapshot_for_lock(existing_lockfile);
+    let sysreq_db = load_sysreq_snapshot_for_lock(existing_lockfile).await;
     lockfile_from_selected_versions(roots, selected, &sysreq_db, &repositories, r_version)
         .await
         .map_err(|details| LockError::ResolveFailed { details }.into())
@@ -1479,7 +1591,7 @@ async fn lockfile_from_selected_versions(
     repositories: &[PackageRepository],
     r_version: Option<&str>,
 ) -> Result<Lockfile, String> {
-    let client = http::traced_client();
+    let client = http::traced_client_with_auth(auth_manager_for_repositories(repositories));
     let mut packages = BTreeMap::new();
     let mut sysreq_packages = BTreeMap::new();
 
@@ -2244,7 +2356,7 @@ async fn prepare_locked_package_artifact_inner(
     let base_url = reqwest::Url::parse(&repository.url)
         .map_err(|error| format!("invalid repository URL {}: {error}", repository.url))?;
 
-    let client = http::traced_client();
+    let client = http::traced_client_with_auth(auth_manager_for_locked_repositories(&repositories));
 
     record_package_stage(&span, &package, "downloading binary");
 

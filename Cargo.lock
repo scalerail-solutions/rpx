@@ -2306,6 +2306,7 @@ dependencies = [
 name = "rpx"
 version = "1.4.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "clap",
  "deb822-fast",
