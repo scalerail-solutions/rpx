@@ -699,6 +699,21 @@ async fn cmd_remove(
         &repositories,
         &removed_packages,
     )?;
+    let installed_before_sync = installed_packages()
+        .await
+        .into_iter()
+        .map(|package| package.package)
+        .collect::<BTreeSet<_>>();
+    let removed = packages
+        .iter()
+        .filter(|package| installed_before_sync.contains(package.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let missing = packages
+        .iter()
+        .filter(|package| !installed_before_sync.contains(package.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
     let lockfile = lockfile_from_roots(
         &client,
         repositories,
@@ -712,6 +727,15 @@ async fn cmd_remove(
     write_description(&description)?;
     write_project_lockfile(&lockfile)?;
     let _ = sync_from_lockfile(false, false).await?;
+
+    if !removed.is_empty() {
+        status(format_args!("Removed {}", removed.join(", ")));
+    }
+    for package in missing {
+        status(format_args!(
+            "{package} is already missing from the project library"
+        ));
+    }
 
     Ok(())
 }
@@ -771,24 +795,8 @@ async fn cmd_status() -> RpxResult<()> {
         Err(LockfileCompatibilityError::Newer) => return Err(StatusError::LockfileNewer.into()),
     }
 
-    let manifest_requirements = description
-        .imports()
-        .into_iter()
-        .flat_map(|relations| relations.iter())
-        .chain(
-            description
-                .depends()
-                .into_iter()
-                .flat_map(|relations| relations.iter())
-                .filter(|relation| relation.name() != "R"),
-        )
-        .map(|relation| relation.name())
-        .collect::<BTreeSet<_>>();
-    let lock_requirements = lockfile
-        .roots
-        .iter()
-        .map(|root| root.package.clone())
-        .collect::<BTreeSet<_>>();
+    let manifest_requirements = manifest_requirement_names(&description);
+    let lock_requirements = lockfile_requirement_names(&lockfile);
     let installed = installed_packages().await;
     let installed_names = installed
         .iter()
@@ -816,11 +824,11 @@ async fn cmd_status() -> RpxResult<()> {
         .collect::<Vec<_>>();
     let missing_from_library = locked_names
         .difference(&installed_names)
-        .cloned()
+        .map(|package| (*package).clone())
         .collect::<Vec<_>>();
     let extra_in_library = installed_names
         .difference(&locked_names)
-        .cloned()
+        .map(|package| (*package).clone())
         .collect::<Vec<_>>();
     let version_mismatches = lockfile
         .packages
@@ -889,9 +897,8 @@ async fn cmd_status() -> RpxResult<()> {
         "Packages locked but no longer in DESCRIPTION:",
         &extra_in_lockfile,
     );
-    // TODO: get it back when infrerence is back lol
-    // print_status_group("Packages locked but not installed:", &missing_from_library);
-    // print_status_group("Packages installed but not locked:", &extra_in_library);
+    print_status_group("Packages locked but not installed:", &missing_from_library);
+    print_status_group("Packages installed but not locked:", &extra_in_library);
     print_status_group(
         "Installed versions that differ from rpx.lock:",
         &version_mismatches,
@@ -1101,6 +1108,23 @@ fn roots_from_description(description: &RDescription) -> BTreeSet<Relation> {
                 .flat_map(|relations| relations.iter()),
         )
         .filter(|relation| relation.name() != "R")
+        .collect()
+}
+
+fn manifest_requirement_names(description: &RDescription) -> BTreeSet<String> {
+    roots_from_description(description)
+        .into_iter()
+        .map(|relation| relation.name())
+        .filter(|package| !is_base_package(package))
+        .collect()
+}
+
+fn lockfile_requirement_names(lockfile: &Lockfile) -> BTreeSet<String> {
+    lockfile
+        .roots
+        .iter()
+        .map(|root| root.package.clone())
+        .filter(|package| !is_base_package(package))
         .collect()
 }
 
@@ -1511,19 +1535,7 @@ async fn sync_from_lockfile(
     install_only_system: bool,
 ) -> RpxResult<SyncOutcome> {
     let description = read_description()?;
-    let manifest_requirements = description
-        .imports()
-        .into_iter()
-        .flat_map(|relations| relations.iter())
-        .chain(
-            description
-                .depends()
-                .into_iter()
-                .flat_map(|relations| relations.iter())
-                .filter(|relation| relation.name() != "R"),
-        )
-        .map(|relation| relation.name())
-        .collect::<BTreeSet<_>>();
+    let manifest_requirements = manifest_requirement_names(&description);
     let lockfile = read_project_lockfile()?;
     validate_lockfile_compatibility_for_sync(&lockfile)?;
     validate_runtime_for_sync(&lockfile).await?;
@@ -1538,11 +1550,7 @@ async fn sync_from_lockfile(
             return Ok(SyncOutcome::default());
         }
     }
-    let lock_requirements = lockfile
-        .roots
-        .iter()
-        .map(|root| root.package.clone())
-        .collect::<BTreeSet<_>>();
+    let lock_requirements = lockfile_requirement_names(&lockfile);
 
     if manifest_requirements != lock_requirements {
         return Err(SyncError::LockfileOlder.into());
