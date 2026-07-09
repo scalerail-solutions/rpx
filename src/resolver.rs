@@ -23,7 +23,7 @@ use crate::{
 };
 
 const ROOT_PACKAGE: &str = "__rpx_root__";
-const DESCRIPTION_PREFETCH_WORKERS: usize = 16;
+const DESCRIPTION_PREFETCH_WORKERS: usize = 50;
 const BASE_PACKAGES: &[&str] = &[
     "base",
     "compiler",
