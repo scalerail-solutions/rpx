@@ -84,7 +84,7 @@ use crate::{
 
 type RpxResult<T> = Result<T, RpxError>;
 
-const SYNC_SHARED_WORKERS: usize = 16;
+const SYNC_SHARED_WORKERS: usize = 50;
 const SYNC_INSTALL_WORKERS: usize = 8;
 
 #[derive(Debug, Error, Diagnostic)]
