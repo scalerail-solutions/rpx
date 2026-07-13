@@ -56,16 +56,16 @@ Install R:
 - macOS: https://cran.r-project.org/bin/macosx/
 - CRAN mirrors: https://cran.r-project.org/mirrors.html
 
-Install version 1.4.1 on macOS or Linux:
+Install the latest release on macOS or Linux:
 
 ```bash
-curl -LsSf https://rrepo.org/rpx/v1.4.1/rpx-installer.sh | sh
+curl -LsSf https://rrepo.org/rpx/latest/rpx-installer.sh | sh
 ```
 
-Install version 1.4.1 on Windows:
+Install the latest release on Windows:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://rrepo.org/rpx/v1.4.1/rpx-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://rrepo.org/rpx/latest/rpx-installer.ps1 | iex"
 ```
 
 Windows binary signing is still being worked on. The PowerShell installer is available, but Windows Defender or SmartScreen may warn until the signing flow is finalized.
