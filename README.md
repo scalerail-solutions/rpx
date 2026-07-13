@@ -59,13 +59,13 @@ Install R:
 Install the latest release on macOS or Linux:
 
 ```bash
-curl -LsSf https://github.com/scalerail-solutions/rpx/releases/latest/download/rpx-installer.sh | sh
+curl -LsSf https://rrepo.org/rpx/latest/rpx-installer.sh | sh
 ```
 
 Install the latest release on Windows:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/scalerail-solutions/rpx/releases/latest/download/rpx-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://rrepo.org/rpx/latest/rpx-installer.ps1 | iex"
 ```
 
 Windows binary signing is still being worked on. The PowerShell installer is available, but Windows Defender or SmartScreen may warn until the signing flow is finalized.
