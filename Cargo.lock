@@ -2046,9 +2046,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "r-description"
-version = "0.4.0"
-source = "git+https://github.com/blyedev/r-description-rs.git?branch=release%2Ftemp#e815d603a33db9ebd45adb3012d69d3700cbf726"
+name = "r-description-scalerail"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c881d232c36d1a71c317548cec2f73384be2e20c4c7010dc238e9fe6368296ac"
 dependencies = [
  "deb822-derive",
  "deb822-fast",
@@ -2304,7 +2305,7 @@ dependencies = [
 
 [[package]]
 name = "rpx"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2321,7 +2322,7 @@ dependencies = [
  "mockito",
  "moka",
  "pubgrub",
- "r-description",
+ "r-description-scalerail",
  "regex",
  "reqwest",
  "reqwest-middleware",
