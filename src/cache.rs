@@ -89,6 +89,7 @@ pub async fn store(key: &CompiledPackageCacheKey, package_dir: &Path) -> Result<
         .map_err(|error| format!("failed to join cache store task: {error}"))?
 }
 
+#[allow(dead_code)]
 pub fn repository_metadata_cache_path(repository_url: &str, parts: &[&str]) -> PathBuf {
     let mut path = cache_dir_path()
         .join("metadata")
@@ -102,6 +103,7 @@ pub fn repository_metadata_cache_path(repository_url: &str, parts: &[&str]) -> P
     path
 }
 
+#[allow(dead_code)]
 pub async fn read_json_metadata_cache<T>(path: &Path, ttl: Option<Duration>) -> Option<T>
 where
     T: DeserializeOwned,
@@ -121,6 +123,7 @@ where
     serde_json::from_str(&contents).ok()
 }
 
+#[allow(dead_code)]
 pub async fn write_json_metadata_cache<T>(path: &Path, value: &T) -> Result<(), String>
 where
     T: Serialize,

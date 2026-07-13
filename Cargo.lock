@@ -2047,9 +2047,9 @@ dependencies = [
 
 [[package]]
 name = "r-description-scalerail"
-version = "0.5.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3de1bbc90aae37b67d2fff81d251b9c2465e130dc9addfe4385ce98b66d92d2f"
+checksum = "282fb634fbe1507fa9ae0f171c04762d48ffdef588bd0e4c9153827d6af1d655"
 dependencies = [
  "deb822-derive",
  "deb822-fast",

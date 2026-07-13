@@ -56,7 +56,7 @@ use project::{
     artifact_cache_path, build_temp_library_path, cache_dir_path, project_library_path,
     project_library_root_path,
 };
-use r::{InstallFailure, base_packages, install_local_package, installed_packages};
+use r::{base_packages, install_local_package, installed_packages};
 use repository::DEFAULT_REGISTRY_BASE_URL;
 use repository::normalize_repository_url;
 use resolver::{is_base_package, resolve_from_registry};
@@ -75,7 +75,7 @@ use crate::{
     cache::CompiledPackageCacheKey,
     lockfile::LockedPackage,
     r::{
-        RVirtualEnv, fetch_runtime_info, installed_packages_async, r_version_async,
+        RLibraryError, RVirtualEnv, RscriptError, r_version as query_r_version,
         remove_packages_from_venv,
     },
     repository::{ArchiveSupport, PackageRepository, RepositoryType},
@@ -124,6 +124,14 @@ enum RpxError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     Clean(#[from] CleanError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Rscript(#[from] RscriptError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    RLibrary(#[from] RLibraryError),
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -249,6 +257,32 @@ enum SyncError {
     #[error("failed to prepare source artifacts: {details}")]
     #[diagnostic(code(rpx::sync::download_failed))]
     DownloadArtifactsFailed { details: String },
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Rscript(#[from] RscriptError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    RLibrary(#[from] RLibraryError),
+}
+
+#[derive(Debug, Error)]
+enum InstallLockedPackagesError {
+    #[error(transparent)]
+    Rscript(#[from] RscriptError),
+
+    #[error("{0}")]
+    Other(String),
+}
+
+#[derive(Debug, Error)]
+enum SelectedVersionsError {
+    #[error(transparent)]
+    Rscript(#[from] RscriptError),
+
+    #[error("{0}")]
+    Other(String),
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -700,7 +734,7 @@ async fn cmd_remove(
         &removed_packages,
     )?;
     let installed_before_sync = installed_packages()
-        .await
+        .await?
         .into_iter()
         .map(|package| package.package)
         .collect::<BTreeSet<_>>();
@@ -797,7 +831,7 @@ async fn cmd_status() -> RpxResult<()> {
 
     let manifest_requirements = manifest_requirement_names(&description);
     let lock_requirements = lockfile_requirement_names(&lockfile);
-    let installed = installed_packages().await;
+    let installed = installed_packages().await?;
     let installed_names = installed
         .iter()
         .map(|package| &package.package)
@@ -807,7 +841,7 @@ async fn cmd_status() -> RpxResult<()> {
         .map(|package| (package.package.clone(), package.version.clone()))
         .collect::<std::collections::BTreeMap<_, _>>();
     let locked_names = lockfile.packages.keys().collect::<BTreeSet<&String>>();
-    let runtime_status = runtime_status(&lockfile).await;
+    let runtime_status = runtime_status(&lockfile).await?;
     let system_plan = if host_supports_system_sync() {
         system_plan_from_lockfile(&lockfile).ok()
     } else {
@@ -1560,6 +1594,7 @@ async fn sync_from_lockfile(
 
     let extra_packages = installed_packages()
         .await
+        .map_err(SyncError::from)?
         .into_iter()
         .filter_map(|p| match lockfile.packages.get(&p.package) {
             Some(locked) if locked.version == p.version => None,
@@ -1568,7 +1603,7 @@ async fn sync_from_lockfile(
         .collect::<Vec<_>>();
 
     outcome.removed = extra_packages.len();
-    let _ = remove_packages_from_venv(&extra_packages);
+    remove_packages_from_venv(&extra_packages).map_err(SyncError::from)?;
 
     let client = http::client();
     install_locked_packages(
@@ -1577,7 +1612,12 @@ async fn sync_from_lockfile(
         lockfile.repositories.iter().cloned().collect::<Vec<_>>(),
     )
     .await
-    .map_err(|details| SyncError::DownloadArtifactsFailed { details })?;
+    .map_err(|error| match error {
+        InstallLockedPackagesError::Rscript(error) => SyncError::Rscript(error),
+        InstallLockedPackagesError::Other(details) => {
+            SyncError::DownloadArtifactsFailed { details }
+        }
+    })?;
 
     return Ok(outcome);
 }
@@ -1666,7 +1706,10 @@ async fn lockfile_from_roots(
         r_version,
     )
     .await
-    .map_err(|details| LockError::ResolveFailed { details }.into())
+    .map_err(|error| match error {
+        SelectedVersionsError::Rscript(error) => RpxError::Rscript(error),
+        SelectedVersionsError::Other(details) => LockError::ResolveFailed { details }.into(),
+    })
 }
 
 async fn lockfile_from_selected_versions(
@@ -1676,7 +1719,7 @@ async fn lockfile_from_selected_versions(
     sysreq_db: &sysreqs::SysreqDbSnapshot,
     repositories: &[PackageRepository],
     r_version: Option<&str>,
-) -> Result<Lockfile, String> {
+) -> Result<Lockfile, SelectedVersionsError> {
     let mut packages = BTreeMap::new();
     let mut sysreq_packages = BTreeMap::new();
 
@@ -1684,9 +1727,11 @@ async fn lockfile_from_selected_versions(
         let description = version
             .repository()
             .description(&client, &name, version.version())
-            .await?;
+            .await
+            .map_err(SelectedVersionsError::Other)?;
 
-        let dependencies = locked_dependencies_from_description(&description)?;
+        let dependencies = locked_dependencies_from_description(&description)
+            .map_err(SelectedVersionsError::Other)?;
 
         let rules = sysreqs::match_rules(&description, sysreq_db);
 
@@ -1718,7 +1763,7 @@ async fn lockfile_from_selected_versions(
 
     let resolved_r_version = match r_version {
         Some(version) => version.to_string(),
-        None => fetch_runtime_info().await.version,
+        None => query_r_version().await?,
     };
 
     Ok(Lockfile {
@@ -1904,16 +1949,16 @@ struct RuntimeStatus {
     missing_base_packages: Vec<String>,
 }
 
-async fn runtime_status(lockfile: &Lockfile) -> RuntimeStatus {
-    let runtime = fetch_runtime_info().await;
+async fn runtime_status(lockfile: &Lockfile) -> Result<RuntimeStatus, RscriptError> {
+    let runtime_version = query_r_version().await?;
     let version_mismatch =
-        (!lockfile.r.version.is_empty() && lockfile.r.version != runtime.version).then(|| {
+        (!lockfile.r.version.is_empty() && lockfile.r.version != runtime_version).then(|| {
             format!(
                 "R {} installed, R {} locked",
-                runtime.version, lockfile.r.version
+                runtime_version, lockfile.r.version
             )
         });
-    let available_base_packages = base_packages().await.into_iter().collect::<BTreeSet<_>>();
+    let available_base_packages = base_packages().await?.into_iter().collect::<BTreeSet<_>>();
     let locked_base_packages = lockfile
         .r
         .base_packages
@@ -1934,10 +1979,10 @@ async fn runtime_status(lockfile: &Lockfile) -> RuntimeStatus {
         .into_iter()
         .collect();
 
-    RuntimeStatus {
+    Ok(RuntimeStatus {
         version_mismatch,
         missing_base_packages,
-    }
+    })
 }
 
 fn print_runtime_version_warning(runtime_status: &RuntimeStatus) {
@@ -2153,7 +2198,7 @@ fn prompt_for_system_dependency_action() -> SyncSystemChoice {
 }
 
 async fn validate_runtime_for_sync(lockfile: &Lockfile) -> RpxResult<()> {
-    let status = runtime_status(lockfile).await;
+    let status = runtime_status(lockfile).await?;
 
     if let Some(version_mismatch) = status.version_mismatch {
         warning(RpxWarning::RuntimeVersionMismatch {
@@ -2180,7 +2225,7 @@ async fn install_locked_packages(
     client: http::HttpClient,
     packages: Vec<LockedPackage>,
     repositories: Vec<LockedRepository>,
-) -> Result<(), String> {
+) -> Result<(), InstallLockedPackagesError> {
     let total_packages = packages.len() as u64;
     let sync_span = tracing::info_span!(
         "sync_packages",
@@ -2196,14 +2241,15 @@ async fn install_locked_packages(
     sync_span.pb_set_length(total_packages);
     sync_span.pb_start();
 
-    locked_package_install_order(&packages)?;
+    locked_package_install_order(&packages).map_err(InstallLockedPackagesError::Other)?;
 
     let locked_names = packages
         .iter()
         .map(|p| p.package.clone())
         .collect::<BTreeSet<_>>();
-    let installed_packages = installed_packages_async()
+    let installed_packages = installed_packages()
         .await
+        .map_err(InstallLockedPackagesError::from)?
         .into_iter()
         .map(|p| p.package)
         .collect::<BTreeSet<_>>();
@@ -2224,10 +2270,15 @@ async fn install_locked_packages(
         return Ok(());
     }
 
-    let r_version = Arc::new(r_version_async().await?);
+    let r_version = Arc::new(
+        query_r_version()
+            .await
+            .map_err(InstallLockedPackagesError::from)?,
+    );
     let r_minor = Arc::new(
         r_minor_version(r_version.as_str())
-            .ok_or_else(|| format!("failed to parse R minor version from {r_version}"))?,
+            .ok_or_else(|| format!("failed to parse R minor version from {r_version}"))
+            .map_err(InstallLockedPackagesError::Other)?,
     );
     let repositories = Arc::new(repositories);
     let client = Arc::new(client);
@@ -2280,9 +2331,14 @@ async fn install_locked_packages(
         let install_pool = Arc::clone(&install_pool);
         install_tasks.spawn(
             async move {
-                let prepared_artifact = prepared_rx.await.map_err(|_| {
-                    format!("{package_name} artifact preparation task ended without a result")
-                })??;
+                let prepared_artifact = prepared_rx
+                    .await
+                    .map_err(|_| {
+                        InstallLockedPackagesError::Other(format!(
+                            "{package_name} artifact preparation task ended without a result"
+                        ))
+                    })?
+                    .map_err(InstallLockedPackagesError::Other)?;
 
                 // Keep package spans out of the progress UI while blocked on dependency installs.
                 wait_for_locked_package_dependencies(
@@ -2291,16 +2347,19 @@ async fn install_locked_packages(
                     Arc::clone(&install_installed_packages),
                     install_installed_rx,
                 )
-                .await?;
+                .await
+                .map_err(InstallLockedPackagesError::Other)?;
 
-                let _install_permit = install_pool
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| "install pool closed before package installation".to_string())?;
-                let _shared_permit = install_shared_pool
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| "sync work pool closed before package installation".to_string())?;
+                let _install_permit = install_pool.acquire_owned().await.map_err(|_| {
+                    InstallLockedPackagesError::Other(
+                        "install pool closed before package installation".to_string(),
+                    )
+                })?;
+                let _shared_permit = install_shared_pool.acquire_owned().await.map_err(|_| {
+                    InstallLockedPackagesError::Other(
+                        "sync work pool closed before package installation".to_string(),
+                    )
+                })?;
 
                 let installed =
                     install_prepared_locked_package(package, cache_key, prepared_artifact).await?;
@@ -2310,7 +2369,7 @@ async fn install_locked_packages(
                 }
                 let _ = install_installed_tx.send(());
 
-                Ok::<_, String>(installed)
+                Ok::<_, InstallLockedPackagesError>(installed)
             }
             .instrument(sync_span.clone()),
         );
@@ -2319,7 +2378,9 @@ async fn install_locked_packages(
     sync_span.record("running", install_tasks.len() as u64);
 
     while let Some(result) = install_tasks.join_next().await {
-        result.map_err(|error| format!("install task failed to join: {error}"))??;
+        result.map_err(|error| {
+            InstallLockedPackagesError::Other(format!("install task failed to join: {error}"))
+        })??;
         completed += 1;
         sync_span.record("completed", completed);
         sync_span.record("running", install_tasks.len() as u64);
@@ -2589,7 +2650,7 @@ async fn install_prepared_locked_package(
     package: LockedPackage,
     cache_key: CompiledPackageCacheKey,
     prepared_artifact: Option<(PathBuf, String)>,
-) -> Result<String, String> {
+) -> Result<String, InstallLockedPackagesError> {
     let span = tracing::info_span!(
         "install_package",
         package = %package.package,
@@ -2616,14 +2677,16 @@ async fn install_prepared_locked_package_inner(
     cache_key: CompiledPackageCacheKey,
     prepared_artifact: Option<(PathBuf, String)>,
     span: tracing::Span,
-) -> Result<String, String> {
+) -> Result<String, InstallLockedPackagesError> {
     let project_library = project_library_path();
 
     match prepared_artifact {
         None => {
             span.record("artifact_kind", "compiled-cache");
             record_package_stage(&span, &package, "restoring from cache");
-            cache::restore(&cache_key, &project_library).await?;
+            cache::restore(&cache_key, &project_library)
+                .await
+                .map_err(InstallLockedPackagesError::Other)?;
             record_package_stage(&span, &package, "restored from cache");
             Ok(package.package)
         }
@@ -2650,7 +2713,7 @@ async fn install_downloaded_locked_package(
     install_type: String,
     project_library: PathBuf,
     span: tracing::Span,
-) -> Result<String, String> {
+) -> Result<String, InstallLockedPackagesError> {
     record_package_stage(&span, &package, "installing");
 
     let temp_library = build_temp_library_path(&package.package, &unique_build_token());
@@ -2663,21 +2726,29 @@ async fn install_downloaded_locked_package(
         &temp_library,
     )
     .await
-    .map_err(|failure| install_failure_message(&package.package, &package.version, &failure))?;
+    .map_err(InstallLockedPackagesError::from)?;
 
     let built_package_path = temp_library.join(&package.package);
 
     record_package_stage(&span, &package, "storing cache");
-    cache::store(&key, &built_package_path).await?;
+    cache::store(&key, &built_package_path)
+        .await
+        .map_err(InstallLockedPackagesError::Other)?;
 
     record_package_stage(&span, &package, "restoring project library");
-    cache::restore(&key, &project_library).await?;
+    cache::restore(&key, &project_library)
+        .await
+        .map_err(InstallLockedPackagesError::Other)?;
 
     record_package_stage(&span, &package, "cleaning up");
     if let Some(temp_root) = temp_library.parent() {
         tokio::fs::remove_dir_all(temp_root)
             .await
-            .map_err(|error| format!("failed to clean temporary build directory: {error}"))?;
+            .map_err(|error| {
+                InstallLockedPackagesError::Other(format!(
+                    "failed to clean temporary build directory: {error}"
+                ))
+            })?;
     }
 
     record_package_stage(&span, &package, "done");
@@ -2785,14 +2856,6 @@ fn macos_binary_target() -> Result<String, String> {
             "unsupported macOS architecture for binary packages: {arch}"
         )),
     }
-}
-
-fn install_failure_message(package: &str, version: &str, failure: &InstallFailure) -> String {
-    format!(
-        "failed to install {package}@{version}: {} (log: {})",
-        failure.summary,
-        failure.log_path.display()
-    )
 }
 
 fn unique_build_token() -> String {

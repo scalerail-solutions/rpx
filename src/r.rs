@@ -4,6 +4,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use miette::Diagnostic;
+use thiserror::Error;
 use tokio::{process::Command, sync::OnceCell};
 
 use crate::project::project_library_path;
@@ -14,18 +16,57 @@ pub struct InstalledPackage {
     pub version: String,
 }
 
-#[derive(Debug)]
-pub struct InstallFailure {
-    pub exit_code: Option<i32>,
-    pub log_path: PathBuf,
-    pub summary: String,
+#[derive(Debug, Error, Diagnostic)]
+pub enum RscriptError {
+    #[error("failed to run Rscript while {operation}: {source}")]
+    #[diagnostic(code(rpx::r::launch_failed))]
+    LaunchFailed {
+        operation: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("Rscript failed while {operation}: {summary}")]
+    #[diagnostic(code(rpx::r::failed))]
+    Failed { operation: String, summary: String },
+
+    #[error("Rscript failed while {operation}: {summary}")]
+    #[diagnostic(
+        code(rpx::r::failed),
+        help("Inspect the full R output at {log_path:?}.")
+    )]
+    FailedWithLog {
+        operation: String,
+        summary: String,
+        log_path: PathBuf,
+    },
+
+    #[error("Rscript returned invalid output while {operation}: {details}")]
+    #[diagnostic(code(rpx::r::invalid_output))]
+    InvalidOutput { operation: String, details: String },
+
+    #[error("failed to write Rscript output log at {}: {source}", path.display())]
+    #[diagnostic(code(rpx::r::install_log_write_failed))]
+    InstallLogWriteFailed {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("{label} path is not valid UTF-8: {}", path.display())]
+    #[diagnostic(code(rpx::r::non_utf8_path))]
+    NonUtf8Path { label: &'static str, path: PathBuf },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeInfo {
-    pub version: String,
-    pub platform: String,
-    pub pkg_type: String,
+#[derive(Debug, Error, Diagnostic)]
+pub enum RLibraryError {
+    #[error("failed to remove package directory {}: {source}", path.display())]
+    #[diagnostic(code(rpx::r::library_remove_failed))]
+    PackageRemoveFailed {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 pub(crate) trait RVirtualEnv {
@@ -48,13 +89,19 @@ pub async fn install_local_package(
     version: &str,
     pkg_type: &str,
     target_library: &Path,
-) -> Result<(), InstallFailure> {
+) -> Result<(), RscriptError> {
     let artifact_path = artifact_path
         .to_str()
-        .expect("artifact path should be valid utf-8");
+        .ok_or_else(|| RscriptError::NonUtf8Path {
+            label: "artifact",
+            path: artifact_path.to_path_buf(),
+        })?;
     let target_library = target_library
         .to_str()
-        .expect("target library path should be valid utf-8");
+        .ok_or_else(|| RscriptError::NonUtf8Path {
+            label: "target library",
+            path: target_library.to_path_buf(),
+        })?;
 
     let expression = concat!(
         "install.packages('%ARTIFACT%', repos = NULL, type = '%TYPE%', lib = '%LIB%');",
@@ -69,12 +116,8 @@ pub async fn install_local_package(
     .replace("%PACKAGE%", &escape_r_string(package))
     .replace("%VERSION%", &escape_r_string(version));
 
-    let output = Command::with_venv("Rscript")
-        .arg("-e")
-        .arg(expression)
-        .output()
-        .await
-        .expect("failed to run Rscript");
+    let operation = format!("install package {package}@{version}");
+    let output = rscript_output(&operation, expression, true).await?;
 
     if output.status.success() {
         return Ok(());
@@ -92,22 +135,28 @@ pub async fn install_local_package(
     contents.push_str("# stderr\n");
     contents.push_str(&String::from_utf8_lossy(&output.stderr));
 
-    fs::write(&log_path, contents).expect("failed to write install log");
+    fs::write(&log_path, contents).map_err(|source| RscriptError::InstallLogWriteFailed {
+        path: log_path.clone(),
+        source,
+    })?;
 
-    let summary = summarize_install_output(&output.stdout, &output.stderr);
+    let summary = summarize_rscript_output(&output.stdout, &output.stderr);
 
-    Err(InstallFailure {
-        exit_code: output.status.code(),
+    Err(RscriptError::FailedWithLog {
+        operation,
         log_path,
         summary,
     })
 }
 
-pub async fn base_packages() -> Vec<String> {
-    BASE_PACKAGES.get_or_init(fetch_base_packages).await.clone()
+pub async fn base_packages() -> Result<Vec<String>, RscriptError> {
+    Ok(BASE_PACKAGES
+        .get_or_try_init(fetch_base_packages)
+        .await?
+        .clone())
 }
 
-pub async fn installed_packages_async() -> Vec<InstalledPackage> {
+pub async fn installed_packages() -> Result<Vec<InstalledPackage>, RscriptError> {
     let expression = concat!(
         "packages <- installed.packages(lib.loc = .libPaths()[1]);",
         "if (nrow(packages) == 0) quit(save = 'no', status = 0);",
@@ -115,72 +164,54 @@ pub async fn installed_packages_async() -> Vec<InstalledPackage> {
         "sep = '\t', row.names = FALSE, col.names = TRUE, quote = FALSE)"
     );
 
-    let output = Command::with_venv("Rscript")
-        .arg("-e")
-        .arg(expression)
-        .output()
-        .await
-        .expect("failed to run Rscript");
-
-    crate::exit_with_status(output.status.code());
-
-    parse_installed_packages(&String::from_utf8_lossy(&output.stdout))
+    let operation = "list installed packages";
+    let output = rscript_output(operation, expression, true).await?;
+    rscript_success(operation, &output)?;
+    parse_installed_packages(&String::from_utf8_lossy(&output.stdout), operation)
 }
 
-pub async fn installed_packages() -> Vec<InstalledPackage> {
-    let expression = concat!(
-        "packages <- installed.packages(lib.loc = .libPaths()[1]);",
-        "if (nrow(packages) == 0) quit(save = 'no', status = 0);",
-        "write.table(packages[, c('Package', 'Version'), drop = FALSE], ",
-        "sep = '\t', row.names = FALSE, col.names = TRUE, quote = FALSE)"
-    );
-
-    let output = Command::with_venv("Rscript")
-        .arg("-e")
-        .arg(expression)
-        .output()
-        .await
-        .expect("failed to run Rscript");
-
-    crate::exit_with_status(output.status.code());
-
-    parse_installed_packages(&String::from_utf8_lossy(&output.stdout))
-}
-
-pub fn remove_packages_from_venv(packages: &[String]) -> Result<(), String> {
-    let _ = packages
+pub fn remove_packages_from_venv(packages: &[String]) -> Result<(), RLibraryError> {
+    packages
         .iter()
-        .try_for_each(|p| remove_package_from_venv(&p));
-
-    Ok(())
+        .try_for_each(|package| remove_package_from_venv(package))
 }
 
-pub fn remove_package_from_venv(package: &str) -> Result<(), String> {
+pub fn remove_package_from_venv(package: &str) -> Result<(), RLibraryError> {
     let package_dir = project_library_path().join(package);
 
     if !package_dir.exists() {
         return Ok(());
     }
 
-    std::fs::remove_dir_all(&package_dir).map_err(|error| {
-        format!(
-            "failed to remove package directory {}: {error}",
-            package_dir.display()
-        )
+    std::fs::remove_dir_all(&package_dir).map_err(|source| RLibraryError::PackageRemoveFailed {
+        path: package_dir,
+        source,
     })
 }
 
-fn parse_installed_packages(output: &str) -> Vec<InstalledPackage> {
+fn parse_installed_packages(
+    output: &str,
+    operation: &str,
+) -> Result<Vec<InstalledPackage>, RscriptError> {
     output
         .lines()
         .skip(1)
         .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| {
+        .map(|line| {
             let mut parts = line.split('\t');
-            let package = parts.next()?.trim().to_string();
-            let version = parts.next()?.trim().to_string();
+            let package = parts.next().map(str::trim).filter(|part| !part.is_empty());
+            let version = parts.next().map(str::trim).filter(|part| !part.is_empty());
 
-            Some(InstalledPackage { package, version })
+            match (package, version, parts.next()) {
+                (Some(package), Some(version), None) => Ok(InstalledPackage {
+                    package: package.to_string(),
+                    version: version.to_string(),
+                }),
+                _ => Err(RscriptError::InvalidOutput {
+                    operation: operation.to_string(),
+                    details: format!("expected tab-separated package and version, got {line:?}"),
+                }),
+            }
         })
         .collect()
 }
@@ -189,77 +220,73 @@ fn escape_r_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
-pub async fn r_version_async() -> Result<String, String> {
-    let output = tokio::process::Command::new("Rscript")
-        .arg("-e")
-        .arg("cat(as.character(getRversion()))")
-        .output()
-        .await
-        .map_err(|error| format!("failed to run Rscript: {error}"))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "failed to inspect R version: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
+pub async fn r_version() -> Result<String, RscriptError> {
+    let operation = "query R version";
+    let output = rscript_output(operation, "cat(as.character(getRversion()))", false).await?;
+    rscript_success(operation, &output)?;
 
     let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
     if version.is_empty() {
-        return Err("failed to inspect R version: Rscript returned empty output".to_string());
+        return Err(RscriptError::InvalidOutput {
+            operation: operation.to_string(),
+            details: "Rscript returned empty output".to_string(),
+        });
     }
 
     Ok(version)
 }
-pub async fn fetch_runtime_info() -> RuntimeInfo {
-    let output = Command::with_venv("Rscript")
-        .arg("-e")
-        .arg("cat(as.character(getRversion()), '\t', R.version$platform, '\t', .Platform$pkgType, sep = '')")
-        .output()
-        .await
-        .expect("failed to run Rscript");
 
-    crate::exit_with_status(output.status.code());
+async fn fetch_base_packages() -> Result<Vec<String>, RscriptError> {
+    let operation = "list R base packages";
+    let output = rscript_output(
+        operation,
+        "writeLines(rownames(installed.packages(priority = 'base')))",
+        true,
+    )
+    .await?;
+    rscript_success(operation, &output)?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut parts = stdout.trim().splitn(3, '\t');
-
-    RuntimeInfo {
-        version: parts
-            .next()
-            .expect("R version should be present")
-            .to_string(),
-        platform: parts
-            .next()
-            .expect("R platform should be present")
-            .to_string(),
-        pkg_type: parts
-            .next()
-            .expect("R package type should be present")
-            .to_string(),
-    }
-}
-
-async fn fetch_base_packages() -> Vec<String> {
-    let output = Command::with_venv("Rscript")
-        .arg("-e")
-        .arg("writeLines(rownames(installed.packages(priority = 'base')))")
-        .output()
-        .await
-        .expect("failed to run Rscript");
-
-    crate::exit_with_status(output.status.code());
-
-    String::from_utf8_lossy(&output.stdout)
+    Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(ToString::to_string)
-        .collect()
+        .collect())
 }
 
-fn summarize_install_output(stdout: &[u8], stderr: &[u8]) -> String {
+async fn rscript_output(
+    operation: &str,
+    expression: impl AsRef<str>,
+    with_venv: bool,
+) -> Result<std::process::Output, RscriptError> {
+    let mut command = if with_venv {
+        Command::with_venv("Rscript")
+    } else {
+        Command::new("Rscript")
+    };
+    command.arg("-e").arg(expression.as_ref());
+    command
+        .output()
+        .await
+        .map_err(|source| RscriptError::LaunchFailed {
+            operation: operation.to_string(),
+            source,
+        })
+}
+
+fn rscript_success(operation: &str, output: &std::process::Output) -> Result<(), RscriptError> {
+    if output.status.success() {
+        return Ok(());
+    }
+
+    Err(RscriptError::Failed {
+        operation: operation.to_string(),
+        summary: summarize_rscript_output(&output.stdout, &output.stderr),
+    })
+}
+
+fn summarize_rscript_output(stdout: &[u8], stderr: &[u8]) -> String {
     let combined = [
         String::from_utf8_lossy(stderr),
         String::from_utf8_lossy(stdout),
