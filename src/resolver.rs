@@ -431,11 +431,7 @@ fn relation_package_range(
         VersionConstraint::GreaterThanEqual => Ranges::higher_than(bound),
         VersionConstraint::LessThan => Ranges::strictly_lower_than(bound),
         VersionConstraint::LessThanEqual => Ranges::lower_than(bound),
-        VersionConstraint::NotEqual => {
-            return Err(ResolverError(
-                "not-equal dependency constraints are not supported".to_string(),
-            ));
-        }
+        VersionConstraint::NotEqual => Ranges::singleton(bound).complement(),
     })
 }
 
