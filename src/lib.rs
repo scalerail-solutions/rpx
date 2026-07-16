@@ -1107,6 +1107,18 @@ fn roots_from_description(description: &RDescription) -> BTreeSet<Relation> {
                 .into_iter()
                 .flat_map(|relations| relations.iter()),
         )
+        .chain(
+            description
+                .linking_to()
+                .into_iter()
+                .flat_map(|relations| relations.iter()),
+        )
+        .chain(
+            description
+                .suggests()
+                .into_iter()
+                .flat_map(|relations| relations.iter()),
+        )
         .filter(|relation| relation.name() != "R")
         .collect()
 }
@@ -2882,9 +2894,10 @@ fn locked_install_order(lockfile: &Lockfile) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        LockfileCompatibilityError, locked_install_order, package_not_found_help,
-        pinned_package_relations, remove_packages_from_description_dependencies,
-        roots_from_description, validate_lockfile_compatibility,
+        LockfileCompatibilityError, locked_dependencies_from_description, locked_install_order,
+        package_not_found_help, pinned_package_relations,
+        remove_packages_from_description_dependencies, roots_from_description,
+        validate_lockfile_compatibility,
     };
     use crate::lockfile::{
         LOCKFILE_REVISION, LOCKFILE_VERSION, LockedDependency, LockedPackage, LockedR,
@@ -2895,7 +2908,7 @@ mod tests {
 
     #[test]
     fn builds_root_relations_from_description_constraints() {
-        let description: RDescription = "Package: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\nImports: cli (>= 3.6.0), digest\nDepends: R (>= 4.2), jsonlite (== 1.8.9)\n"
+        let description: RDescription = "Package: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\nImports: cli (>= 3.6.0), digest\nDepends: R (>= 4.2), jsonlite (== 1.8.9)\nLinkingTo: cpp11\nSuggests: testthat (>= 3.0.0)\nEnhances: shiny\n"
             .parse()
             .expect("description should parse");
 
@@ -2906,8 +2919,30 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "cli (>= 3.6.0)".to_string(),
+                "cpp11".to_string(),
                 "digest".to_string(),
                 "jsonlite (== 1.8.9)".to_string(),
+                "testthat (>= 3.0.0)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn locks_only_hard_dependencies_of_selected_packages() {
+        let description: RDescription = "Package: suggestedpkg\nVersion: 0.1.0\nTitle: Suggested Package\nDescription: Test package for unit tests.\nLicense: MIT\nDepends: hardDepends\nImports: hardImports\nLinkingTo: hardLinking\nSuggests: nestedSuggestion\nEnhances: enhancedPackage\n"
+            .parse()
+            .expect("description should parse");
+
+        assert_eq!(
+            locked_dependencies_from_description(&description)
+                .expect("dependencies should serialize")
+                .into_iter()
+                .map(|dependency| (dependency.package, dependency.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                ("hardDepends".to_string(), "Depends".to_string()),
+                ("hardImports".to_string(), "Imports".to_string()),
+                ("hardLinking".to_string(), "LinkingTo".to_string()),
             ]
         );
     }
@@ -2949,8 +2984,13 @@ Enhances: removeMe, keepEnhances
         remove_packages_from_description_dependencies(&mut description, &packages);
 
         assert_eq!(
-            description.depends().unwrap().to_string(),
-            "R (>= 4.2), keepDepends"
+            description
+                .depends()
+                .unwrap()
+                .iter()
+                .map(|relation| relation.name())
+                .collect::<Vec<_>>(),
+            vec!["R".to_string(), "keepDepends".to_string()]
         );
         assert_eq!(description.imports().unwrap().to_string(), "keepImports");
         assert_eq!(description.linking_to().unwrap().to_string(), "keepLinking");

@@ -162,6 +162,7 @@ fn title_from_package_name(package_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{sanitize_package_name, title_from_package_name};
+    use r_description::lossless::{RDescription, Relations};
 
     #[test]
     fn sanitizes_directory_name_to_package_name() {
@@ -184,6 +185,20 @@ mod tests {
         assert_eq!(
             title_from_package_name("my.package.name"),
             "My Package Name"
+        );
+    }
+
+    #[test]
+    fn serializes_empty_dependency_fields_as_parseable_description() {
+        let mut description: RDescription = "Package: testpkg\nVersion: 0.1.0\nTitle: Test Package\nDescription: Test package for unit tests.\nLicense: MIT\nImports: digest\n"
+            .parse()
+            .expect("description should parse");
+        description.set_imports(Relations::default());
+
+        let contents = description.to_string();
+        assert!(
+            contents.parse::<RDescription>().is_ok(),
+            "serialized DESCRIPTION should parse:\n{contents}"
         );
     }
 }
