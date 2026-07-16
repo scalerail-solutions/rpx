@@ -99,6 +99,44 @@ fn runs_rpx_add_inside_custom_r_image() {
 }
 
 #[test]
+fn constrained_add_replaces_default_dependency_bounds() {
+    let container = start_container();
+    let project_path = "/tmp/rpx-project-add-constraint";
+    create_package_project(&container, project_path);
+
+    let add_command = format!("cd {project_path} && rpx add digest");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &add_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+
+    let constrain_command = format!("cd {project_path} && rpx add 'digest@>=0.6.37'");
+    let (exit_code, stdout, stderr) = run_shell_command(&container, &constrain_command);
+    assert_eq!(exit_code, 0, "stdout was: {stdout}\nstderr was: {stderr}");
+    assert!(
+        stdout.contains("Added digest (>= 0.6.37)"),
+        "stdout was: {stdout}\nstderr was: {stderr}"
+    );
+
+    let description =
+        parsed_description(&read_project_file(&container, project_path, "DESCRIPTION"));
+    let digest_relations = description
+        .imports()
+        .into_iter()
+        .flat_map(|relations| relations.iter())
+        .filter(|relation| relation.name() == "digest")
+        .map(|relation| relation.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(digest_relations, vec!["digest (>= 0.6.37)"]);
+    assert!(
+        !relation_names(description.depends()).contains(&"digest".to_string())
+            && !relation_names(description.linking_to()).contains(&"digest".to_string())
+            && !relation_names(description.suggests()).contains(&"digest".to_string())
+            && !relation_names(description.enhances()).contains(&"digest".to_string()),
+        "DESCRIPTION was: {}",
+        read_project_file(&container, project_path, "DESCRIPTION")
+    );
+}
+
+#[test]
 fn records_base_package_as_runtime_requirement() {
     let container = start_container();
     let project_path = "/tmp/rpx-project-add-base-package";

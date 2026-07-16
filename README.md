@@ -46,6 +46,17 @@ This uses semver because the major version is the common place to signal breakin
 
 For `0.x` packages, `rpx` records the selected version as the lower bound and `< 1.0.0` as the upper bound.
 
+To set a constraint yourself, use `PACKAGE@OPERATORVERSION`. For example, this writes
+`digest (>= 0.6.37)` to `Imports`:
+
+```bash
+rpx add 'digest@>=0.6.37'
+```
+
+Supported operators are `<`, `<=`, `==`, `!=`, `>=`, and `>`. A constrained add replaces every
+existing relation for that package in `DESCRIPTION` before adding the requested relation to
+`Imports`.
+
 ## Install
 
 `rpx` requires R to be installed and available on `PATH`. Before using `rpx`, confirm that `Rscript` works in your shell.

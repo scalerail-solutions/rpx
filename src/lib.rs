@@ -160,6 +160,13 @@ enum AddError {
     #[error("package not found in configured repositories: {packages}")]
     #[diagnostic(code(rpx::add::package_not_found), help("{help}"))]
     PackageNotFound { packages: String, help: String },
+
+    #[error("invalid package constraint {package}: {details}")]
+    #[diagnostic(
+        code(rpx::add::invalid_constraint),
+        help("Use PACKAGE@OPERATORVERSION, for example digest@>=0.6.37.")
+    )]
+    InvalidConstraint { package: String, details: String },
 }
 
 impl From<SyncError> for RpxError {
@@ -462,6 +469,10 @@ async fn cmd_add(
     packages: &[String],
     repository_preference: DefaultRepositoryPreference,
 ) -> RpxResult<()> {
+    let packages = packages
+        .iter()
+        .map(|package| parse_add_package(package))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut description = read_description()?;
     let current_lockfile = read_current_project_lockfile_optional(&description)?;
     let client = http::client();
@@ -474,11 +485,23 @@ async fn cmd_add(
         roots_from_lockfile_or_description(current_lockfile.as_ref(), &description)?;
     let new_packages = packages
         .iter()
-        .filter(|package| !roots_contain_package(&desired_roots, package))
-        .cloned()
+        .filter(|package| package.relation.is_none())
+        .filter(|package| !roots_contain_package(&desired_roots, &package.name))
+        .map(|package| package.name.clone())
         .collect::<Vec<_>>();
-    let added_relations = add_relations_for_packages(&client, &repositories, &new_packages).await?;
+    let mut added_relations =
+        add_relations_for_packages(&client, &repositories, &new_packages).await?;
     desired_roots.extend(added_relations.iter().cloned());
+
+    for package in &packages {
+        let Some(relation) = &package.relation else {
+            continue;
+        };
+
+        desired_roots.retain(|existing| existing.name() != relation.name());
+        desired_roots.insert(relation.clone());
+        added_relations.insert(relation.clone());
+    }
 
     let preferred_versions = preferred_versions_from_lockfile(
         current_lockfile.as_ref(),
@@ -500,7 +523,14 @@ async fn cmd_add(
     write_description(&description)?;
     write_project_lockfile(&lockfile)?;
     let _ = sync_from_lockfile(false, false).await?;
-    status(format_args!("Added {}", packages.join(", ")));
+    status(format_args!(
+        "Added {}",
+        packages
+            .iter()
+            .map(|package| package.display())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
     Ok(())
 }
 
@@ -1144,6 +1174,72 @@ fn roots_contain_package(roots: &BTreeSet<Relation>, package: &str) -> bool {
     roots.iter().any(|relation| relation.name() == package)
 }
 
+#[derive(Debug)]
+struct AddPackage {
+    name: String,
+    relation: Option<Relation>,
+}
+
+impl AddPackage {
+    fn display(&self) -> String {
+        self.relation
+            .as_ref()
+            .map_or_else(|| self.name.clone(), ToString::to_string)
+    }
+}
+
+fn parse_add_package(package: &str) -> Result<AddPackage, AddError> {
+    if package.is_empty() || package.chars().any(char::is_whitespace) {
+        return Err(invalid_add_constraint(
+            package,
+            "package specifications cannot contain whitespace",
+        ));
+    }
+
+    let Some((name, constraint)) = package.split_once('@') else {
+        return Ok(AddPackage {
+            name: package.to_string(),
+            relation: None,
+        });
+    };
+    if name.is_empty() {
+        return Err(invalid_add_constraint(package, "package name is missing"));
+    }
+
+    let (operator, version) = [">=", "<=", "==", "!=", ">", "<"]
+        .into_iter()
+        .find_map(|operator| {
+            constraint
+                .strip_prefix(operator)
+                .map(|version| (operator, version))
+        })
+        .ok_or_else(|| {
+            invalid_add_constraint(package, "version constraint operator is missing or invalid")
+        })?;
+    if version.is_empty() {
+        return Err(invalid_add_constraint(package, "version is missing"));
+    }
+
+    let operator = operator
+        .parse::<VersionConstraint>()
+        .map_err(|details| invalid_add_constraint(package, &details))?;
+    let version = version
+        .parse::<Version>()
+        .map_err(|details| invalid_add_constraint(package, &details))?;
+
+    Ok(AddPackage {
+        name: name.to_string(),
+        relation: Some(Relation::new(name, Some((operator, version)))),
+    })
+}
+
+fn invalid_add_constraint(package: &str, details: impl Into<String>) -> AddError {
+    AddError::InvalidConstraint {
+        package: package.to_string(),
+        details: details.into(),
+    }
+}
+
 async fn add_relations_for_packages(
     client: &http::HttpClient,
     repositories: &[PackageRepository],
@@ -1396,6 +1492,12 @@ fn apply_added_packages_to_description(
     description: &mut RDescription,
     added_relations: &BTreeSet<Relation>,
 ) -> RpxResult<()> {
+    let added_packages = added_relations
+        .iter()
+        .map(|relation| relation.name())
+        .collect::<BTreeSet<_>>();
+    remove_packages_from_description_dependencies(description, &added_packages);
+
     let mut imports = description.imports().unwrap_or_default();
     let mut imports_changed = false;
 
@@ -2894,16 +2996,19 @@ fn locked_install_order(lockfile: &Lockfile) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        LockfileCompatibilityError, locked_dependencies_from_description, locked_install_order,
-        package_not_found_help, pinned_package_relations,
-        remove_packages_from_description_dependencies, roots_from_description,
-        validate_lockfile_compatibility,
+        LockfileCompatibilityError, apply_added_packages_to_description,
+        locked_dependencies_from_description, locked_install_order, package_not_found_help,
+        parse_add_package, pinned_package_relations, remove_packages_from_description_dependencies,
+        roots_from_description, validate_lockfile_compatibility,
     };
     use crate::lockfile::{
         LOCKFILE_REVISION, LOCKFILE_VERSION, LockedDependency, LockedPackage, LockedR,
         LockedSystemRequirements, Lockfile,
     };
-    use r_description::lossless::RDescription;
+    use r_description::{
+        VersionConstraint,
+        lossless::{RDescription, Relation},
+    };
     use std::collections::{BTreeMap, BTreeSet};
 
     #[test]
@@ -2962,6 +3067,68 @@ mod tests {
                 "digest (< 2.0.0)".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn parses_explicit_add_constraint() {
+        let package = parse_add_package("dplyr@>=1.0.0").expect("constraint should parse");
+
+        assert_eq!(package.name, "dplyr");
+        assert_eq!(
+            package
+                .relation
+                .expect("relation should be present")
+                .to_string(),
+            "dplyr (>= 1.0.0)"
+        );
+        assert_eq!(
+            parse_add_package("dplyr@!=1.0.0")
+                .expect("constraint should parse")
+                .relation
+                .expect("relation should be present")
+                .to_string(),
+            "dplyr (!= 1.0.0)"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_explicit_add_constraint() {
+        assert!(parse_add_package("dplyr@=1.0.0").is_err());
+        assert!(parse_add_package("dplyr@>=").is_err());
+        assert!(parse_add_package("dplyr@>= 1.0.0").is_err());
+    }
+
+    #[test]
+    fn constrained_add_replaces_existing_dependency_relations() {
+        let mut description: RDescription = "Package: testpkg
+Version: 0.1.0
+Title: Test Package
+Description: Test package for unit tests.
+License: MIT
+Depends: dplyr (>= 1.0.0), keepDepends
+Imports: dplyr (< 2.0.0), keepImports
+LinkingTo: dplyr, keepLinking
+Suggests: dplyr, keepSuggests
+Enhances: dplyr, keepEnhances
+"
+        .parse()
+        .expect("description should parse");
+        let relation = Relation::new(
+            "dplyr",
+            Some((VersionConstraint::Equal, "1.0.0".parse().unwrap())),
+        );
+
+        apply_added_packages_to_description(&mut description, &BTreeSet::from([relation]))
+            .expect("description should update");
+
+        assert_eq!(description.depends().unwrap().to_string(), "keepDepends");
+        assert_eq!(
+            description.imports().unwrap().to_string(),
+            "keepImports,\ndplyr (== 1.0.0)"
+        );
+        assert_eq!(description.linking_to().unwrap().to_string(), "keepLinking");
+        assert_eq!(description.suggests().unwrap().to_string(), "keepSuggests");
+        assert_eq!(description.enhances().unwrap().to_string(), "keepEnhances");
     }
 
     #[test]
